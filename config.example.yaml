@@ -1,0 +1,28 @@
+server:
+  port: 8080
+  usage_file: usage.csv
+  interaction_dir: interactions
+  interaction_retention: 500
+  debug_log: true
+  request_timeout_seconds: 300
+
+providers:
+  openai:
+    enabled: true
+    protocol: openai
+    base_url: https://onlycode.shop/v1
+    api_key: ${OPENAI_API_KEY}
+    models: gpt-*, chatgpt-*, o*, text-embedding-*
+    fallbacks: deepseek
+  deepseek:
+    enabled: true
+    protocol: openai
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_API_KEY}
+    models: deepseek*
+  anthropic:
+    enabled: true
+    protocol: anthropic
+    base_url: https://onlycode.shop
+    api_key: ${ANTHROPIC_API_KEY}
+    models: claude*
