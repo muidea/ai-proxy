@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoadConfigFileAndEnv(t *testing.T) {
@@ -17,6 +18,7 @@ server:
   usage_file: test-usage.csv
   interaction_dir: test-interactions
   debug_log: false
+  stream_idle_timeout_seconds: 900
 providers:
   deepseek:
     base_url: https://api.deepseek.com
@@ -51,6 +53,9 @@ providers:
 	}
 	if cfg.DebugLog {
 		t.Fatalf("debug log should be disabled by config")
+	}
+	if cfg.StreamIdleTimeout != 900*time.Second {
+		t.Fatalf("stream idle timeout = %s", cfg.StreamIdleTimeout)
 	}
 }
 
@@ -101,5 +106,28 @@ providers:
 	}
 	if cfg.InteractionRetention != 321 {
 		t.Fatalf("interaction retention = %d", cfg.InteractionRetention)
+	}
+}
+
+func TestLoadStreamIdleTimeoutCanBeDisabledFromEnv(t *testing.T) {
+	t.Setenv("AI_PROXY_STREAM_IDLE_TIMEOUT_SECONDS", "0")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  stream_idle_timeout_seconds: 120
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StreamIdleTimeout != 0 {
+		t.Fatalf("stream idle timeout = %s", cfg.StreamIdleTimeout)
 	}
 }

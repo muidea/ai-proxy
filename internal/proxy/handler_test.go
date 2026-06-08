@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -113,6 +114,53 @@ func TestOpenAICompatibleStreamingUsage(t *testing.T) {
 	assertFileContains(t, filepath.Join(interactionDir, "response.json"), `"cached_tokens": 2`)
 	assertFileContains(t, filepath.Join(interactionDir, "metadata.json"), `"response_path": "response.sse"`)
 	assertFileContains(t, filepath.Join(interactionDir, "metadata.json"), `"full_response_path": "response.json"`)
+}
+
+func TestOpenAIStreamingReadErrorLogsRoundAndMetadata(t *testing.T) {
+	var logBuffer strings.Builder
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	log.SetOutput(&logBuffer)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	}()
+
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: &failingReadCloser{
+				chunks: [][]byte{[]byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")},
+				err:    errors.New("context deadline exceeded"),
+			},
+		}, nil
+	})
+
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	handler := testHandler("https://upstream.test", usageFile, "openai")
+	handler.client.Transport = transport
+	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	response := newResponseRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "[ai-proxy][STREAM WARN] round=000001") {
+		t.Fatalf("expected stream warning with round id, got: %s", logs)
+	}
+	if !strings.Contains(logs, "read upstream stream: context deadline exceeded") {
+		t.Fatalf("expected upstream read error, got: %s", logs)
+	}
+	if !strings.Contains(logs, "[ai-proxy][WARN] provider=openai model=gpt-test round=000001") {
+		t.Fatalf("expected final warning with round id, got: %s", logs)
+	}
+	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
+	assertFileContains(t, filepath.Join(interactionDir, "metadata.json"), `"error": "read upstream stream: context deadline exceeded"`)
 }
 
 func TestAnthropicBufferedConversion(t *testing.T) {
@@ -500,6 +548,9 @@ func TestProviderExceptionLogsAreProminent(t *testing.T) {
 	}
 	if !strings.Contains(logs, "[ai-proxy][ERROR] provider=openai") {
 		t.Fatalf("expected summary error log, got: %s", logs)
+	}
+	if !strings.Contains(logs, "round=000001") {
+		t.Fatalf("expected round id in logs, got: %s", logs)
 	}
 }
 
@@ -967,6 +1018,24 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+type failingReadCloser struct {
+	chunks [][]byte
+	err    error
+}
+
+func (r *failingReadCloser) Read(p []byte) (int, error) {
+	if len(r.chunks) > 0 {
+		chunk := r.chunks[0]
+		r.chunks = r.chunks[1:]
+		return copy(p, chunk), nil
+	}
+	return 0, r.err
+}
+
+func (r *failingReadCloser) Close() error {
+	return nil
 }
 
 func jsonResponse(body string) *http.Response {

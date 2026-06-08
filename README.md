@@ -42,7 +42,8 @@ make run
 - `AI_PROXY_INTERACTION_DIR`: 交互归档目录，默认 `interactions`。
 - `AI_PROXY_INTERACTION_RETENTION`: 保留的交互归档轮数，默认 `500`。
 - `AI_PROXY_DEBUG_LOG`: 是否输出调试日志，默认 `true`。
-- `AI_PROXY_REQUEST_TIMEOUT_SECONDS`: 单次上游请求超时时间，默认 `300`。
+- `AI_PROXY_REQUEST_TIMEOUT_SECONDS`: 非流式请求总超时、流式请求等待上游响应头的超时时间，默认 `300`。
+- `AI_PROXY_STREAM_IDLE_TIMEOUT_SECONDS`: 流式响应读取空闲超时，默认 `300`；设为 `0` 可禁用。该值不是流式请求总时长限制，只在连续没有收到 SSE 数据时触发。
 - `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`: provider API Key。
 - `AI_PROXY_<PROVIDER>_API_KEY`, `<PROVIDER>_API_KEY`: 设置内置 provider API Key，例如 `AI_PROXY_OPENAI_API_KEY`、`DEEPSEEK_API_KEY`。
 - `AI_PROXY_<PROVIDER>_BASE_URL`, `<PROVIDER>_BASE_URL`: 覆盖内置 provider Base URL。
@@ -173,3 +174,4 @@ interactions/
 非流式响应通常写入 `response.json`；流式响应会同时写入原始 `response.sse` 和整理后的完整 `response.json`。OpenAI-compatible SSE 会合并 `delta` 为完整 `chat.completion`；Anthropic SSE 会合并为完整 Messages 响应。`request.meta.json` 记录客户端方法、路径、查询参数、来源地址、User-Agent、Content-Length 和脱敏后的请求头；`upstream_request.json` 与 `upstream_response.json` 记录最终一次上游请求/响应；`fallback_attempts.json` 记录每次尝试的 provider、协议、状态码/错误、耗时和是否为 fallback；`metadata.json` 汇总最终 provider、model、耗时、HTTP 状态、token 统计、缓存读写 token 和缓存命中率，流式响应会额外记录 `full_response_path`。
 
 调试日志默认输出到终端，包含每轮 round id、客户端请求摘要、provider/model 选择、上游请求、上游响应和最终 token 摘要。`Authorization`、`X-API-Key`、`Cookie` 等敏感头会显示为 `<redacted>`。
+最终 token 摘要也会带 `round`，并在流式读取中断、客户端写入失败等场景附带 `error`；对应错误也会写入该轮 `metadata.json`，便于并发请求交错时追踪完整生命周期。

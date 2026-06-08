@@ -16,6 +16,7 @@ type Config struct {
 	InteractionRetention int
 	DebugLog             bool
 	RequestTimeout       time.Duration
+	StreamIdleTimeout    time.Duration
 	Providers            map[string]Provider
 }
 
@@ -37,6 +38,7 @@ func Load(path string) (Config, error) {
 		InteractionRetention: 500,
 		DebugLog:             true,
 		RequestTimeout:       5 * time.Minute,
+		StreamIdleTimeout:    5 * time.Minute,
 		Providers:            map[string]Provider{},
 	}
 
@@ -130,6 +132,8 @@ func setTopLevel(cfg *Config, key, value string) {
 		if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
 			cfg.RequestTimeout = time.Duration(seconds) * time.Second
 		}
+	case "stream_idle_timeout_seconds":
+		cfg.StreamIdleTimeout = parseNonNegativeSeconds(value, cfg.StreamIdleTimeout)
 	}
 }
 
@@ -151,6 +155,8 @@ func setServer(cfg *Config, key, value string) {
 		if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
 			cfg.RequestTimeout = time.Duration(seconds) * time.Second
 		}
+	case "stream_idle_timeout_seconds":
+		cfg.StreamIdleTimeout = parseNonNegativeSeconds(value, cfg.StreamIdleTimeout)
 	}
 }
 
@@ -205,6 +211,9 @@ func applyEnv(cfg *Config) {
 		if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
 			cfg.RequestTimeout = time.Duration(seconds) * time.Second
 		}
+	}
+	if value := os.Getenv("AI_PROXY_STREAM_IDLE_TIMEOUT_SECONDS"); value != "" {
+		cfg.StreamIdleTimeout = parseNonNegativeSeconds(value, cfg.StreamIdleTimeout)
 	}
 
 	applyProviderEnv(cfg, "openai", "https://api.openai.com")
@@ -392,6 +401,14 @@ func parsePositiveInt(value string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func parseNonNegativeSeconds(value string, fallback time.Duration) time.Duration {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return time.Duration(parsed) * time.Second
 }
 
 func parseList(value string) []string {

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,8 +44,12 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 		return
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, provider.BaseURL+"/v1/messages", bytes.NewReader(encoded))
+	ctx, cancel := h.upstreamContext(r.Context(), stream)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, provider.BaseURL+"/v1/messages", bytes.NewReader(encoded))
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		h.writeArchivedError(w, round, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -62,11 +67,17 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 	upstreamStart := time.Now()
 	resp, err := h.client.Do(req)
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		h.archiveAndLogUpstreamResponse(round, providerName, provider, nil, time.Since(upstreamStart), err)
 		h.writeArchivedError(w, round, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 		return
 	}
 	h.archiveAndLogUpstreamResponse(round, providerName, provider, resp, time.Since(upstreamStart), nil)
+	if cancel != nil {
+		defer cancel()
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
@@ -82,12 +93,13 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 		if err := round.WriteResponse(responsePath, responseBody); err != nil {
 			log.Printf("archive anthropic error response: %v", err)
 		}
-		h.recordAndPrint(providerName, model, stream, resp.StatusCode, time.Since(start), tokenUsage{})
-		h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, time.Since(start), tokenUsage{}, responsePath, "", "")
+		duration := time.Since(start)
+		h.recordAndPrint(round, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, "")
+		h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, responsePath, "", "")
 		return
 	}
 	if stream {
-		h.handleAnthropicStream(w, resp, round, start, providerName, model, body)
+		h.handleAnthropicStream(w, resp, round, start, providerName, model, body, cancel)
 		return
 	}
 	h.handleAnthropicBuffered(w, resp, round, start, providerName, model, body)
@@ -160,8 +172,9 @@ func (h *Handler) handleAnthropicBuffered(w http.ResponseWriter, resp *http.Resp
 	if err := round.WriteResponse("response.json", openAIBody); err != nil {
 		log.Printf("archive anthropic response: %v", err)
 	}
-	h.recordAndPrint(providerName, model, false, http.StatusOK, time.Since(start), usage)
-	h.writeArchiveMetadata(round, providerName, model, false, http.StatusOK, time.Since(start), usage, "response.json", "", "")
+	duration := time.Since(start)
+	h.recordAndPrint(round, providerName, model, false, http.StatusOK, duration, usage, "")
+	h.writeArchiveMetadata(round, providerName, model, false, http.StatusOK, duration, usage, "response.json", "", "")
 }
 
 func convertAnthropicResponse(body []byte, fallbackModel string) ([]byte, tokenUsage, error) {
@@ -221,7 +234,7 @@ func convertAnthropicResponse(body []byte, fallbackModel string) ([]byte, tokenU
 	return encoded, usage, err
 }
 
-func (h *Handler) handleAnthropicStream(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any) {
+func (h *Handler) handleAnthropicStream(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any, cancel context.CancelFunc) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -243,33 +256,46 @@ func (h *Handler) handleAnthropicStream(w http.ResponseWriter, resp *http.Respon
 	var content strings.Builder
 	finishReason := "stop"
 	roleSent := false
+	idleTimer, stopIdleTimer := h.startStreamIdleTimer(cancel)
+	defer stopIdleTimer()
+	streamErr := ""
 
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			resetStreamIdleTimer(idleTimer, h.cfg.StreamIdleTimeout)
 			text := strings.TrimSpace(string(line))
 			if strings.HasPrefix(text, "data:") {
 				payload := strings.TrimSpace(strings.TrimPrefix(text, "data:"))
 				if payload != "" {
 					events := anthropicStreamEvents(payload, &id, &currentModel, &usage, &content, &finishReason, &roleSent, created)
 					for _, event := range events {
-						_, _ = w.Write(event)
+						if _, writeErr := w.Write(event); writeErr != nil {
+							streamErr = h.logStreamIssue(round, providerName, model, "write anthropic stream client", writeErr)
+							break
+						}
 						if archiveWriter != nil {
 							if _, writeErr := archiveWriter.Write(event); writeErr != nil {
-								log.Printf("write anthropic archive stream: %v", writeErr)
+								h.logStreamIssue(round, providerName, model, "write anthropic archive stream", writeErr)
 							}
 						}
 						if flusher != nil {
 							flusher.Flush()
 						}
 					}
+					if streamErr != "" {
+						break
+					}
 				}
 			}
 		}
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("read anthropic stream: %v", err)
+				streamErr = h.logStreamIssue(round, providerName, model, "read anthropic stream", err, idleTimer)
 			}
+			break
+		}
+		if streamErr != "" {
 			break
 		}
 	}
@@ -303,8 +329,9 @@ func (h *Handler) handleAnthropicStream(w http.ResponseWriter, resp *http.Respon
 	} else if err := round.WriteResponse("response.json", append(fullResponse, '\n')); err != nil {
 		log.Printf("archive anthropic stream full response: %v", err)
 	}
-	h.recordAndPrint(providerName, model, true, http.StatusOK, time.Since(start), usage)
-	h.writeArchiveMetadata(round, providerName, model, true, http.StatusOK, time.Since(start), usage, "response.sse", "", "response.json")
+	duration := time.Since(start)
+	h.recordAndPrint(round, providerName, model, true, http.StatusOK, duration, usage, streamErr)
+	h.writeArchiveMetadata(round, providerName, model, true, http.StatusOK, duration, usage, "response.sse", streamErr, "response.json")
 }
 
 func anthropicStreamEvents(payload string, id, model *string, usage *tokenUsage, content *strings.Builder, finishReason *string, roleSent *bool, created int64) [][]byte {
