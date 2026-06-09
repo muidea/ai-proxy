@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -161,6 +162,49 @@ func TestOpenAIStreamingReadErrorLogsRoundAndMetadata(t *testing.T) {
 	}
 	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
 	assertFileContains(t, filepath.Join(interactionDir, "metadata.json"), `"error": "read upstream stream: context deadline exceeded"`)
+}
+
+func TestOpenAIStreamingClientCancelIsIdentified(t *testing.T) {
+	var logBuffer strings.Builder
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	log.SetOutput(&logBuffer)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	}()
+
+	var cancel context.CancelFunc
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: &failingReadCloser{
+				chunks:    [][]byte{[]byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")},
+				beforeErr: cancel,
+				err:       context.Canceled,
+			},
+		}, nil
+	})
+
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	handler := testHandler("https://upstream.test", usageFile, "openai")
+	handler.client.Transport = transport
+	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	ctx, cancelFunc := context.WithCancel(request.Context())
+	cancel = cancelFunc
+	request = request.WithContext(ctx)
+	response := newResponseRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	logs := logBuffer.String()
+	if !strings.Contains(logs, `message="read upstream stream: client canceled downstream request"`) {
+		t.Fatalf("expected client cancel log, got: %s", logs)
+	}
+	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
+	assertFileContains(t, filepath.Join(interactionDir, "metadata.json"), `"error": "read upstream stream: client canceled downstream request"`)
 }
 
 func TestAnthropicBufferedConversion(t *testing.T) {
@@ -347,6 +391,88 @@ func TestAmbiguousOpenAIProvidersRequireExplicitProvider(t *testing.T) {
 	if got := records[1][9]; got != "400" {
 		t.Fatalf("http status = %s", got)
 	}
+}
+
+func TestDefaultProviderHandlesUnknownOpenAIModel(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "openai.test" {
+			t.Fatalf("unexpected host: %s", r.URL.Host)
+		}
+		return jsonResponse(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`), nil
+	})
+
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		ListenAddr:      ":0",
+		UsageFile:       usageFile,
+		InteractionDir:  filepath.Join(filepath.Dir(usageFile), "interactions"),
+		DefaultProvider: "openai",
+		Providers: map[string]config.Provider{
+			"openai":   {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "openai-key"},
+			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key"},
+		},
+	}
+	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder)
+	handler.client.Transport = transport
+	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"healthcheck","messages":[{"role":"user","content":"hi"}]}`)
+	response := newResponseRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
+	assertFileContains(t, filepath.Join(interactionDir, "upstream_request.json"), `"provider": "openai"`)
+	records := readUsageCSV(t, usageFile)
+	if got := records[1][1]; got != "openai" {
+		t.Fatalf("provider = %s", got)
+	}
+}
+
+func TestDefaultProviderHandlesOpenAIModelsEndpoint(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() != "https://openai.test/v1/models" {
+			t.Fatalf("unexpected url: %s", r.URL.String())
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer openai-key" {
+			t.Fatalf("unexpected authorization: %s", got)
+		}
+		return jsonResponse(`{"object":"list","data":[]}`), nil
+	})
+
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		ListenAddr:      ":0",
+		UsageFile:       usageFile,
+		InteractionDir:  filepath.Join(filepath.Dir(usageFile), "interactions"),
+		DefaultProvider: "openai",
+		Providers: map[string]config.Provider{
+			"openai":   {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "openai-key"},
+			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key"},
+		},
+	}
+	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder)
+	handler.client.Transport = transport
+	request := newRequest(http.MethodGet, "/v1/models", "")
+	response := newResponseRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
+	assertFileContains(t, filepath.Join(interactionDir, "upstream_request.json"), `"provider": "openai"`)
+	assertFileContains(t, filepath.Join(interactionDir, "response.json"), `"object":"list"`)
 }
 
 func TestOpenAICompatibleProviderSelectionByBuiltInModelFamily(t *testing.T) {
@@ -1021,8 +1147,9 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 type failingReadCloser struct {
-	chunks [][]byte
-	err    error
+	chunks    [][]byte
+	beforeErr func()
+	err       error
 }
 
 func (r *failingReadCloser) Read(p []byte) (int, error) {
@@ -1030,6 +1157,10 @@ func (r *failingReadCloser) Read(p []byte) (int, error) {
 		chunk := r.chunks[0]
 		r.chunks = r.chunks[1:]
 		return copy(p, chunk), nil
+	}
+	if r.beforeErr != nil {
+		r.beforeErr()
+		r.beforeErr = nil
 	}
 	return 0, r.err
 }

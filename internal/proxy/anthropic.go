@@ -99,7 +99,7 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 		return
 	}
 	if stream {
-		h.handleAnthropicStream(w, resp, round, start, providerName, model, body, cancel)
+		h.handleAnthropicStream(w, resp, round, start, providerName, model, body, r.Context(), cancel)
 		return
 	}
 	h.handleAnthropicBuffered(w, resp, round, start, providerName, model, body)
@@ -234,7 +234,7 @@ func convertAnthropicResponse(body []byte, fallbackModel string) ([]byte, tokenU
 	return encoded, usage, err
 }
 
-func (h *Handler) handleAnthropicStream(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any, cancel context.CancelFunc) {
+func (h *Handler) handleAnthropicStream(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any, requestContext context.Context, cancel context.CancelFunc) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -271,12 +271,12 @@ func (h *Handler) handleAnthropicStream(w http.ResponseWriter, resp *http.Respon
 					events := anthropicStreamEvents(payload, &id, &currentModel, &usage, &content, &finishReason, &roleSent, created)
 					for _, event := range events {
 						if _, writeErr := w.Write(event); writeErr != nil {
-							streamErr = h.logStreamIssue(round, providerName, model, "write anthropic stream client", writeErr)
+							streamErr = h.logStreamIssue(round, providerName, model, "write anthropic stream client", writeErr, requestContext, nil)
 							break
 						}
 						if archiveWriter != nil {
 							if _, writeErr := archiveWriter.Write(event); writeErr != nil {
-								h.logStreamIssue(round, providerName, model, "write anthropic archive stream", writeErr)
+								h.logStreamIssue(round, providerName, model, "write anthropic archive stream", writeErr, nil, nil)
 							}
 						}
 						if flusher != nil {
@@ -291,7 +291,7 @@ func (h *Handler) handleAnthropicStream(w http.ResponseWriter, resp *http.Respon
 		}
 		if err != nil {
 			if err != io.EOF {
-				streamErr = h.logStreamIssue(round, providerName, model, "read anthropic stream", err, idleTimer)
+				streamErr = h.logStreamIssue(round, providerName, model, "read anthropic stream", err, requestContext, idleTimer)
 			}
 			break
 		}

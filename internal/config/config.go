@@ -17,6 +17,7 @@ type Config struct {
 	DebugLog             bool
 	RequestTimeout       time.Duration
 	StreamIdleTimeout    time.Duration
+	DefaultProvider      string
 	Providers            map[string]Provider
 }
 
@@ -61,6 +62,9 @@ func Load(path string) (Config, error) {
 	}
 	if !hasEnabledProvider(cfg.Providers) {
 		return Config{}, fmt.Errorf("no enabled providers configured")
+	}
+	if err := validateDefaultProvider(cfg); err != nil {
+		return Config{}, err
 	}
 	return cfg, nil
 }
@@ -134,6 +138,8 @@ func setTopLevel(cfg *Config, key, value string) {
 		}
 	case "stream_idle_timeout_seconds":
 		cfg.StreamIdleTimeout = parseNonNegativeSeconds(value, cfg.StreamIdleTimeout)
+	case "default_provider":
+		cfg.DefaultProvider = value
 	}
 }
 
@@ -157,6 +163,8 @@ func setServer(cfg *Config, key, value string) {
 		}
 	case "stream_idle_timeout_seconds":
 		cfg.StreamIdleTimeout = parseNonNegativeSeconds(value, cfg.StreamIdleTimeout)
+	case "default_provider":
+		cfg.DefaultProvider = value
 	}
 }
 
@@ -214,6 +222,9 @@ func applyEnv(cfg *Config) {
 	}
 	if value := os.Getenv("AI_PROXY_STREAM_IDLE_TIMEOUT_SECONDS"); value != "" {
 		cfg.StreamIdleTimeout = parseNonNegativeSeconds(value, cfg.StreamIdleTimeout)
+	}
+	if value := os.Getenv("AI_PROXY_DEFAULT_PROVIDER"); value != "" {
+		cfg.DefaultProvider = value
 	}
 
 	applyProviderEnv(cfg, "openai", "https://api.openai.com")
@@ -289,6 +300,7 @@ func ensureKnownProviders(cfg *Config) {
 }
 
 func normalize(cfg *Config) {
+	cfg.DefaultProvider = strings.ToLower(strings.TrimSpace(cfg.DefaultProvider))
 	normalized := make(map[string]Provider, len(cfg.Providers))
 	for name, provider := range cfg.Providers {
 		key := strings.ToLower(name)
@@ -312,6 +324,20 @@ func hasEnabledProvider(providers map[string]Provider) bool {
 		}
 	}
 	return false
+}
+
+func validateDefaultProvider(cfg Config) error {
+	if cfg.DefaultProvider == "" {
+		return nil
+	}
+	provider, ok := cfg.Providers[cfg.DefaultProvider]
+	if !ok {
+		return fmt.Errorf("default_provider %q is not configured", cfg.DefaultProvider)
+	}
+	if provider.Disabled {
+		return fmt.Errorf("default_provider %q is disabled", cfg.DefaultProvider)
+	}
+	return nil
 }
 
 func stripComment(line string) string {

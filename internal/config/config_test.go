@@ -25,6 +25,7 @@ providers:
     api_key: ${OPENAI_API_KEY}
     models: deepseek*
     fallbacks: openai, custom
+default_provider: deepseek
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -56,6 +57,9 @@ providers:
 	}
 	if cfg.StreamIdleTimeout != 900*time.Second {
 		t.Fatalf("stream idle timeout = %s", cfg.StreamIdleTimeout)
+	}
+	if cfg.DefaultProvider != "deepseek" {
+		t.Fatalf("default provider = %s", cfg.DefaultProvider)
 	}
 }
 
@@ -129,5 +133,76 @@ providers:
 	}
 	if cfg.StreamIdleTimeout != 0 {
 		t.Fatalf("stream idle timeout = %s", cfg.StreamIdleTimeout)
+	}
+}
+
+func TestLoadDefaultProviderFromEnv(t *testing.T) {
+	t.Setenv("AI_PROXY_DEFAULT_PROVIDER", "DEEPSEEK")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+default_provider: openai
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+  deepseek:
+    base_url: https://api.deepseek.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DefaultProvider != "deepseek" {
+		t.Fatalf("default provider = %s", cfg.DefaultProvider)
+	}
+}
+
+func TestLoadRejectsInvalidDefaultProvider(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+default_provider: missing
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected invalid default provider error")
+	}
+	if got := err.Error(); got != `default_provider "missing" is not configured` {
+		t.Fatalf("error = %q", got)
+	}
+}
+
+func TestLoadRejectsDisabledDefaultProvider(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+default_provider: deepseek
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+  deepseek:
+    base_url: https://api.deepseek.com
+    api_key: test
+    enabled: false
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected disabled default provider error")
+	}
+	if got := err.Error(); got != `default_provider "deepseek" is disabled` {
+		t.Fatalf("error = %q", got)
 	}
 }

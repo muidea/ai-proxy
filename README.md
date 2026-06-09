@@ -44,6 +44,7 @@ make run
 - `AI_PROXY_DEBUG_LOG`: 是否输出调试日志，默认 `true`。
 - `AI_PROXY_REQUEST_TIMEOUT_SECONDS`: 非流式请求总超时、流式请求等待上游响应头的超时时间，默认 `300`。
 - `AI_PROXY_STREAM_IDLE_TIMEOUT_SECONDS`: 流式响应读取空闲超时，默认 `300`；设为 `0` 可禁用。该值不是流式请求总时长限制，只在连续没有收到 SSE 数据时触发。
+- `AI_PROXY_DEFAULT_PROVIDER`: 默认 provider 名称；当请求没有显式 provider、模型规则无法唯一匹配、或 `/v1/models` 这类请求没有模型时使用。
 - `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`: provider API Key。
 - `AI_PROXY_<PROVIDER>_API_KEY`, `<PROVIDER>_API_KEY`: 设置内置 provider API Key，例如 `AI_PROXY_OPENAI_API_KEY`、`DEEPSEEK_API_KEY`。
 - `AI_PROXY_<PROVIDER>_BASE_URL`, `<PROVIDER>_BASE_URL`: 覆盖内置 provider Base URL。
@@ -60,15 +61,16 @@ make run
 
 转发到上游前会把模型名改写为 `deepseek-chat`。
 
-没有全局默认 provider。代理会按请求解析 provider：
+代理会按请求解析 provider：
 
 - 显式选择优先：`X-AI-Provider`、`?provider=`、`provider/model`。
 - 请求体带 `model` 时，会优先按 provider 的 `models` 模型匹配规则自动选择；支持精确模型名和后缀 `*` 前缀匹配，例如 `deepseek*`、`gpt-*`、`kimi-*`。
+- `default_provider` 可配置兜底 provider；它必须指向一个已启用的 provider，否则启动时报配置错误。兜底只在无法通过显式选择或模型规则唯一推断时使用。
 - provider 可通过 `enabled: false` 禁用；禁用后不会参与自动匹配，显式选择该 provider 会返回 400。
 - provider 可通过 `fallbacks: provider-a, provider-b` 配置同协议备用上游；网络错误、408、429 和 5xx 会触发 fallback，400/401/403 等客户端或鉴权错误不会切换。禁用、缺失、跨协议或重复的 fallback provider 会被跳过。
 - Anthropic 请求特征：`/v1/messages` 或 `Anthropic-*` 请求头，会选择唯一的 `protocol: anthropic` provider。
 - OpenAI-compatible 请求特征：`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/responses`，会选择唯一的 `protocol: openai` provider。
-- 如果同一协议配置了多个 provider，且模型规则仍无法唯一匹配，代理返回 400，要求客户端指定 provider 或补充 `models` 规则。
+- 如果同一协议配置了多个 provider，且没有可用的 `default_provider` 或模型规则仍无法唯一匹配，代理返回 400，要求客户端指定 provider 或补充 `models` 规则。
 
 如果 `base_url` 已包含 `/v1`，代理会避免重复拼接版本路径。例如 `base_url: https://onlycode.shop/v1` 收到 `/v1/messages?beta=true` 时，上游 URL 会是 `https://onlycode.shop/v1/messages?beta=true`。
 

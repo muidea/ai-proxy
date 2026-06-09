@@ -6,6 +6,7 @@ server:
   debug_log: true
   request_timeout_seconds: 300
   stream_idle_timeout_seconds: 300
+  default_provider: openai
 
 providers:
   openai:

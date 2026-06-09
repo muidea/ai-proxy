@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -123,7 +124,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	defer resp.Body.Close()
 
 	if stream && resp.StatusCode < 400 {
-		h.handleStreamResponse(w, resp, round, start, providerName, model, body, result.Cancel)
+		h.handleStreamResponse(w, resp, round, start, providerName, model, body, r.Context(), result.Cancel)
 		return
 	}
 	h.handleBufferedResponse(w, resp, round, start, providerName, model, stream, body)
@@ -211,7 +212,7 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 	responsePath := responseFileName(resp.Header.Get("Content-Type"), strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "event-stream"))
 	if strings.HasSuffix(responsePath, ".sse") {
-		usage, fullPath, streamErr := h.copyAndArchiveRawStream(w, resp, round, providerName, provider, rawModel, rawBody, result.Cancel)
+		usage, fullPath, streamErr := h.copyAndArchiveRawStream(w, resp, round, providerName, provider, rawModel, rawBody, r.Context(), result.Cancel)
 		duration := time.Since(start)
 		h.recordAndPrint(round, providerName, rawModel, true, resp.StatusCode, duration, usage, streamErr)
 		h.writeArchiveMetadata(round, providerName, rawModel, true, resp.StatusCode, duration, usage, responsePath, streamErr, fullPath)
@@ -220,7 +221,7 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request) {
 	responseBody, err := io.ReadAll(resp.Body)
 	readErrMessage := ""
 	if err != nil {
-		readErrMessage = h.logStreamIssue(round, providerName, rawModel, "read raw response", err)
+		readErrMessage = h.logStreamIssue(round, providerName, rawModel, "read raw response", err, nil, nil)
 	}
 	if len(responseBody) > 0 {
 		_, _ = w.Write(responseBody)
@@ -246,7 +247,7 @@ func (h *Handler) handleBufferedResponse(w http.ResponseWriter, resp *http.Respo
 		_, _ = w.Write(responseBody)
 	}
 	if readErr != nil {
-		readErrMessage = h.logStreamIssue(round, providerName, model, "read upstream response", readErr)
+		readErrMessage = h.logStreamIssue(round, providerName, model, "read upstream response", readErr, nil, nil)
 	}
 
 	usage := tokenUsage{}
@@ -275,7 +276,7 @@ func (h *Handler) handleBufferedResponse(w http.ResponseWriter, resp *http.Respo
 	h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, usage, responsePath, readErrMessage, "")
 }
 
-func (h *Handler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any, cancel context.CancelFunc) {
+func (h *Handler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any, requestContext context.Context, cancel context.CancelFunc) {
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	flusher, _ := w.(http.Flusher)
@@ -298,12 +299,12 @@ func (h *Handler) handleStreamResponse(w http.ResponseWriter, resp *http.Respons
 			resetStreamIdleTimer(idleTimer, h.cfg.StreamIdleTimeout)
 			accumulator.TrackSSELine(line)
 			if _, writeErr := w.Write(line); writeErr != nil {
-				streamErr = h.logStreamIssue(round, providerName, model, "write client stream", writeErr)
+				streamErr = h.logStreamIssue(round, providerName, model, "write client stream", writeErr, requestContext, nil)
 				break
 			}
 			if archiveWriter != nil {
 				if _, writeErr := archiveWriter.Write(line); writeErr != nil {
-					h.logStreamIssue(round, providerName, model, "write archive stream", writeErr)
+					h.logStreamIssue(round, providerName, model, "write archive stream", writeErr, nil, nil)
 				}
 			}
 			if flusher != nil {
@@ -312,7 +313,7 @@ func (h *Handler) handleStreamResponse(w http.ResponseWriter, resp *http.Respons
 		}
 		if err != nil {
 			if err != io.EOF {
-				streamErr = h.logStreamIssue(round, providerName, model, "read upstream stream", err, idleTimer)
+				streamErr = h.logStreamIssue(round, providerName, model, "read upstream stream", err, requestContext, idleTimer)
 			}
 			break
 		}
@@ -367,7 +368,7 @@ func parseRawRequestBody(body []byte) (map[string]any, string, bool) {
 	return payload, model, stream
 }
 
-func (h *Handler) copyAndArchiveRawStream(w http.ResponseWriter, resp *http.Response, round *archive.Round, providerName string, provider config.Provider, model string, requestBody map[string]any, cancel context.CancelFunc) (tokenUsage, string, string) {
+func (h *Handler) copyAndArchiveRawStream(w http.ResponseWriter, resp *http.Response, round *archive.Round, providerName string, provider config.Provider, model string, requestBody map[string]any, requestContext context.Context, cancel context.CancelFunc) (tokenUsage, string, string) {
 	archiveWriter, err := round.CreateResponseWriter("response.sse")
 	if err != nil {
 		log.Printf("archive raw stream response: %v", err)
@@ -398,12 +399,12 @@ func (h *Handler) copyAndArchiveRawStream(w http.ResponseWriter, resp *http.Resp
 				anthropicAccumulator.TrackSSELine(line)
 			}
 			if _, writeErr := w.Write(line); writeErr != nil {
-				streamErr = h.logStreamIssue(round, providerName, model, "write raw stream client", writeErr)
+				streamErr = h.logStreamIssue(round, providerName, model, "write raw stream client", writeErr, requestContext, nil)
 				break
 			}
 			if archiveWriter != nil {
 				if _, writeErr := archiveWriter.Write(line); writeErr != nil {
-					h.logStreamIssue(round, providerName, model, "write raw stream archive", writeErr)
+					h.logStreamIssue(round, providerName, model, "write raw stream archive", writeErr, nil, nil)
 				}
 			}
 			if flusher, ok := w.(http.Flusher); ok {
@@ -412,7 +413,7 @@ func (h *Handler) copyAndArchiveRawStream(w http.ResponseWriter, resp *http.Resp
 		}
 		if err != nil {
 			if err != io.EOF {
-				streamErr = h.logStreamIssue(round, providerName, model, "read raw stream", err, idleTimer)
+				streamErr = h.logStreamIssue(round, providerName, model, "read raw stream", err, requestContext, idleTimer)
 			}
 			break
 		}
@@ -644,6 +645,9 @@ func (h *Handler) resolveProviderName(r *http.Request, model string) (string, er
 	if protocol != "" {
 		return h.providerForProtocolAndModel(protocol, model)
 	}
+	if name, ok, err := h.defaultProviderForProtocol(""); ok || err != nil {
+		return name, err
+	}
 	if h.enabledProviderCount() == 1 {
 		for name, provider := range h.cfg.Providers {
 			if provider.Disabled {
@@ -670,7 +674,7 @@ func inferredProtocol(r *http.Request) string {
 	if r.URL.Path == "/v1/messages" || hasHeaderPrefix(r.Header, "Anthropic-") {
 		return "anthropic"
 	}
-	if r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/completions" || r.URL.Path == "/v1/embeddings" || r.URL.Path == "/v1/responses" {
+	if r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/completions" || r.URL.Path == "/v1/embeddings" || r.URL.Path == "/v1/responses" || r.URL.Path == "/v1/models" {
 		return "openai"
 	}
 	return ""
@@ -692,11 +696,17 @@ func (h *Handler) providerForProtocolAndModel(protocol, model string) (string, e
 			return name, err
 		}
 	}
+	if name, ok, err := h.defaultProviderForProtocol(protocol); ok || err != nil {
+		return name, err
+	}
 	return h.uniqueProviderForProtocol(protocol)
 }
 
 func (h *Handler) providerForModel(protocol, model string) (string, error) {
 	if name, ok, err := h.findProviderByModel(protocol, model); ok || err != nil {
+		return name, err
+	}
+	if name, ok, err := h.defaultProviderForProtocol(protocol); ok || err != nil {
 		return name, err
 	}
 	return "", fmt.Errorf("provider is ambiguous for model %q; set X-AI-Provider, ?provider=, provider/model, or provider models patterns", model)
@@ -783,6 +793,9 @@ func (h *Handler) uniqueProviderForProtocol(protocol string) (string, error) {
 	if len(matches) == 1 {
 		return matches[0], nil
 	}
+	if name, ok, err := h.defaultProviderForProtocol(protocol); ok || err != nil {
+		return name, err
+	}
 	if len(matches) == 0 && h.enabledProviderCount() == 1 {
 		for name, provider := range h.cfg.Providers {
 			if provider.Disabled {
@@ -795,6 +808,24 @@ func (h *Handler) uniqueProviderForProtocol(protocol string) (string, error) {
 		return "", fmt.Errorf("no provider configured for protocol %q; set X-AI-Provider or add a provider with protocol: %s", protocol, protocol)
 	}
 	return "", fmt.Errorf("multiple providers configured for protocol %q; set X-AI-Provider, ?provider=, provider/model, or provider models patterns", protocol)
+}
+
+func (h *Handler) defaultProviderForProtocol(protocol string) (string, bool, error) {
+	name := strings.ToLower(strings.TrimSpace(h.cfg.DefaultProvider))
+	if name == "" {
+		return "", false, nil
+	}
+	provider, ok := h.cfg.Providers[name]
+	if !ok {
+		return "", false, fmt.Errorf("default_provider %q is not configured", name)
+	}
+	if provider.Disabled {
+		return "", false, fmt.Errorf("default_provider %q is disabled", name)
+	}
+	if protocol != "" && provider.Protocol != protocol {
+		return "", false, fmt.Errorf("default_provider %q uses protocol %q, but request requires protocol %q; set X-AI-Provider, ?provider=, or provider/model", name, provider.Protocol, protocol)
+	}
+	return name, true, nil
 }
 
 func (h *Handler) enabledProviderCount() int {
@@ -983,13 +1014,17 @@ func resetStreamIdleTimer(idle *streamIdleTimer, timeout time.Duration) {
 	idle.timer.Reset(idle.timeout)
 }
 
-func (h *Handler) logStreamIssue(round *archive.Round, provider, model, operation string, err error, idleTimers ...*streamIdleTimer) string {
+func (h *Handler) logStreamIssue(round *archive.Round, provider, model, operation string, err error, requestContext context.Context, idleTimer *streamIdleTimer) string {
 	if err == nil {
 		return ""
 	}
 	message := fmt.Sprintf("%s: %v", operation, err)
-	if len(idleTimers) > 0 && idleTimers[0] != nil && idleTimers[0].expired.Load() {
-		message = fmt.Sprintf("%s: stream idle timeout exceeded after %s", operation, idleTimers[0].timeout.Truncate(time.Millisecond))
+	if idleTimer != nil && idleTimer.expired.Load() {
+		message = fmt.Sprintf("%s: stream idle timeout exceeded after %s", operation, idleTimer.timeout.Truncate(time.Millisecond))
+	} else if requestContext != nil && errors.Is(requestContext.Err(), context.Canceled) {
+		message = fmt.Sprintf("%s: client canceled downstream request", operation)
+	} else if requestContext != nil && errors.Is(requestContext.Err(), context.DeadlineExceeded) {
+		message = fmt.Sprintf("%s: downstream request deadline exceeded", operation)
 	}
 	log.Printf("\033[33m[ai-proxy][STREAM WARN] round=%06d provider=%s model=%s message=%q\033[0m",
 		roundID(round),
