@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -61,9 +63,29 @@ type fallbackAttemptDebugInfo struct {
 }
 
 func (h *Handler) debugf(format string, args ...any) {
-	if h.cfg.DebugLog {
-		log.Printf("[debug] "+format, args...)
+	if !h.cfg.DebugLog {
+		return
 	}
+	slog.Debug(fmt.Sprintf(format, args...))
+}
+
+func (h *Handler) debugfRound(round *archive.Round, r *http.Request, format string, args ...any) {
+	if !h.cfg.DebugLog {
+		return
+	}
+	requestID := requestIDFromContext(r.Context())
+	if requestID == "" && round != nil {
+		requestID = round.RequestID
+	}
+	attrs := []any{}
+	if requestID != "" {
+		attrs = append(attrs, slog.String("request_id", requestID))
+	}
+	if round != nil {
+		attrs = append(attrs, slog.Int("round", round.ID))
+	}
+	attrs = append(attrs, slog.String("msg", fmt.Sprintf(format, args...)))
+	slog.Debug("debug", attrs...)
 }
 
 func (h *Handler) archiveAndLogClientRequest(round *archive.Round, r *http.Request, bodyBytes int) {
@@ -88,7 +110,7 @@ func (h *Handler) archiveAndLogClientRequest(round *archive.Round, r *http.Reque
 	if err := round.WriteJSON("request.meta.json", info); err != nil {
 		log.Printf("archive request metadata: %v", err)
 	}
-	h.debugf("round=%06d client request method=%s path=%s query=%q remote=%s host=%s user_agent=%q body_bytes=%d headers=%s",
+	h.debugfRound(round, r, "round=%06d client request method=%s path=%s query=%q remote=%s host=%s user_agent=%q body_bytes=%d headers=%s",
 		round.ID,
 		info.Method,
 		info.Path,
@@ -101,11 +123,11 @@ func (h *Handler) archiveAndLogClientRequest(round *archive.Round, r *http.Reque
 	)
 }
 
-func (h *Handler) archiveAndLogProviderSelection(round *archive.Round, providerName string, provider config.Provider, model string, stream bool) {
+func (h *Handler) archiveAndLogProviderSelection(round *archive.Round, r *http.Request, providerName string, provider config.Provider, model string, stream bool) {
 	if round == nil {
 		return
 	}
-	h.debugf("round=%06d selected provider=%s protocol=%s model=%s stream=%t base_url=%s",
+	h.debugfRound(round, r, "round=%06d selected provider=%s protocol=%s model=%s stream=%t base_url=%s",
 		round.ID,
 		providerName,
 		provider.Protocol,
@@ -115,7 +137,7 @@ func (h *Handler) archiveAndLogProviderSelection(round *archive.Round, providerN
 	)
 }
 
-func (h *Handler) archiveAndLogUpstreamRequest(round *archive.Round, providerName string, provider config.Provider, req *http.Request, bodyBytes int) {
+func (h *Handler) archiveAndLogUpstreamRequest(round *archive.Round, r *http.Request, providerName string, provider config.Provider, req *http.Request, bodyBytes int) {
 	if round == nil || req == nil {
 		return
 	}
@@ -132,7 +154,7 @@ func (h *Handler) archiveAndLogUpstreamRequest(round *archive.Round, providerNam
 	if err := round.WriteJSON("upstream_request.json", info); err != nil {
 		log.Printf("archive upstream request metadata: %v", err)
 	}
-	h.debugf("round=%06d upstream request provider=%s protocol=%s method=%s url=%s body_bytes=%d headers=%s",
+	h.debugfRound(round, r, "round=%06d upstream request provider=%s protocol=%s method=%s url=%s body_bytes=%d headers=%s",
 		round.ID,
 		providerName,
 		provider.Protocol,
@@ -143,7 +165,7 @@ func (h *Handler) archiveAndLogUpstreamRequest(round *archive.Round, providerNam
 	)
 }
 
-func (h *Handler) archiveAndLogUpstreamResponse(round *archive.Round, providerName string, provider config.Provider, resp *http.Response, duration time.Duration, err error) {
+func (h *Handler) archiveAndLogUpstreamResponse(round *archive.Round, r *http.Request, providerName string, provider config.Provider, resp *http.Response, duration time.Duration, err error) {
 	if round == nil {
 		return
 	}
@@ -165,7 +187,7 @@ func (h *Handler) archiveAndLogUpstreamResponse(round *archive.Round, providerNa
 	if writeErr := round.WriteJSON("upstream_response.json", info); writeErr != nil {
 		log.Printf("archive upstream response metadata: %v", writeErr)
 	}
-	h.debugf("round=%06d upstream response provider=%s protocol=%s status=%d duration=%s content_type=%q content_length=%d error=%q",
+	h.debugfRound(round, r, "round=%06d upstream response provider=%s protocol=%s status=%d duration=%s content_type=%q content_length=%d error=%q",
 		round.ID,
 		providerName,
 		provider.Protocol,
@@ -198,33 +220,27 @@ func (h *Handler) logUpstreamAlert(round *archive.Round, providerName, protocol 
 	if round != nil {
 		roundID = round.ID
 	}
-	level := "WARN"
-	color := "\033[33m"
+	level := slog.LevelWarn
 	if errMessage != "" || status >= 500 {
-		level = "ERROR"
-		color = "\033[31m"
+		level = slog.LevelError
 	}
-	reset := "\033[0m"
 	message := errMessage
 	if message == "" {
 		message = http.StatusText(status)
 	}
-	suffix := ""
-	if fallback {
-		suffix = fmt.Sprintf(" fallback=true next=%s", nextProvider)
+	attrs := []any{
+		slog.Int("round", roundID),
+		slog.String("provider", providerName),
+		slog.String("protocol", protocol),
+		slog.Int("status", status),
+		slog.Duration("duration", duration.Truncate(time.Millisecond)),
+		slog.String("message", message),
+		slog.Bool("fallback", fallback),
 	}
-	log.Printf("%s[ai-proxy][UPSTREAM %s] round=%06d provider=%s protocol=%s status=%d duration=%s message=%q%s%s",
-		color,
-		level,
-		roundID,
-		providerName,
-		protocol,
-		status,
-		duration.Truncate(time.Millisecond),
-		message,
-		suffix,
-		reset,
-	)
+	if nextProvider != "" {
+		attrs = append(attrs, slog.String("next_provider", nextProvider))
+	}
+	slog.LogAttrs(context.Background(), level, "upstream alert", toAttrs(attrs)...)
 }
 
 func sanitizeHeaders(headers http.Header) map[string][]string {
@@ -250,6 +266,24 @@ func isSensitiveHeader(key string) bool {
 		key == "api-key" ||
 		key == "cookie" ||
 		key == "set-cookie"
+}
+
+// toAttrs 把 []any 中的元素逐个识别为 slog.Attr,返回同质 Attr 切片。
+// 支持混合 slog.Attr 元素与 key-value 交替形式(向后兼容)。
+func toAttrs(items []any) []slog.Attr {
+	out := make([]slog.Attr, 0, len(items))
+	for _, item := range items {
+		switch v := item.(type) {
+		case slog.Attr:
+			out = append(out, v)
+		case []slog.Attr:
+			out = append(out, v...)
+		default:
+			// key-value 交替形式:每两个元素为一组,key 必须是 string。
+			continue
+		}
+	}
+	return out
 }
 
 func headerSummary(headers map[string][]string) string {

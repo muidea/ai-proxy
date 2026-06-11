@@ -7,6 +7,23 @@ server:
   request_timeout_seconds: 300
   stream_idle_timeout_seconds: 300
   default_provider: openai
+  # 可观测性端点(/metrics, /stats)访问控制。默认仅 loopback 可访问,
+  # 在受信内网可以设为 true 开放给 Prometheus / TUI 拉取。
+  metrics_remote_access: false
+  # 可选:白名单 CIDR 列表(逗号分隔),仅在 metrics_remote_access=true 时生效。
+  # 默认空表示允许所有非 loopback 来源(若 remote_access=true)。
+  metrics_allowed_cidrs:
+  # SLO 阈值:任一字段保持 0 即禁用对应规则。
+  # slo_cache_hit_rate_min: 单 provider 最低缓存命中率(0~1),样本不足 10 跳过。
+  # slo_upstream_error_rate_max: 单 provider 最高上游错误率(0~1)。
+  # slo_p99_latency_max_ms: 单 provider p99 延迟上限(毫秒)。
+  # slo_check_interval_seconds: 后台巡检周期,0 表示禁用周期检查。
+  # slo_violation_webhook: 命中 SLO 时异步 POST 的 URL(可选,目前仅打 stderr)。
+  slo_cache_hit_rate_min: 0.2
+  slo_upstream_error_rate_max: 0.05
+  slo_p99_latency_max_ms: 30000
+  slo_check_interval_seconds: 60
+  slo_violation_webhook:
 
 providers:
   openai:

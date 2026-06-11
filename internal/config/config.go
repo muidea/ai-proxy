@@ -18,7 +18,24 @@ type Config struct {
 	RequestTimeout       time.Duration
 	StreamIdleTimeout    time.Duration
 	DefaultProvider      string
+	MetricsRemoteAccess  bool
+	MetricsAllowedCIDRs  []string
+	SLO                  SLOConfig
 	Providers            map[string]Provider
+}
+
+// SLOConfig 描述可观测性层面的服务等级目标。
+type SLOConfig struct {
+	// CacheHitRateMin 是单 provider 缓存命中率的最低要求(0~1)。
+	CacheHitRateMin float64
+	// UpstreamErrorRateMax 是单 provider 上游错误率上限(0~1)。
+	UpstreamErrorRateMax float64
+	// P99LatencyMaxMS 是单 provider p99 延迟上限(毫秒)。
+	P99LatencyMaxMS float64
+	// CheckIntervalSeconds 是后台巡检周期;0 表示禁用周期检查。
+	CheckIntervalSeconds int
+	// ViolationWebhook 是可选 webhook URL,命中 SLO 时异步 POST。
+	ViolationWebhook string
 }
 
 type Provider struct {
@@ -140,6 +157,20 @@ func setTopLevel(cfg *Config, key, value string) {
 		cfg.StreamIdleTimeout = parseNonNegativeSeconds(value, cfg.StreamIdleTimeout)
 	case "default_provider":
 		cfg.DefaultProvider = value
+	case "metrics_remote_access":
+		cfg.MetricsRemoteAccess = parseBool(value, cfg.MetricsRemoteAccess)
+	case "metrics_allowed_cidrs":
+		cfg.MetricsAllowedCIDRs = parseList(value)
+	case "slo_cache_hit_rate_min":
+		cfg.SLO.CacheHitRateMin = parseFloat(value, cfg.SLO.CacheHitRateMin)
+	case "slo_upstream_error_rate_max":
+		cfg.SLO.UpstreamErrorRateMax = parseFloat(value, cfg.SLO.UpstreamErrorRateMax)
+	case "slo_p99_latency_max_ms":
+		cfg.SLO.P99LatencyMaxMS = parseFloat(value, cfg.SLO.P99LatencyMaxMS)
+	case "slo_check_interval_seconds":
+		cfg.SLO.CheckIntervalSeconds = parsePositiveInt(value, cfg.SLO.CheckIntervalSeconds)
+	case "slo_violation_webhook":
+		cfg.SLO.ViolationWebhook = value
 	}
 }
 
@@ -165,6 +196,20 @@ func setServer(cfg *Config, key, value string) {
 		cfg.StreamIdleTimeout = parseNonNegativeSeconds(value, cfg.StreamIdleTimeout)
 	case "default_provider":
 		cfg.DefaultProvider = value
+	case "metrics_remote_access":
+		cfg.MetricsRemoteAccess = parseBool(value, cfg.MetricsRemoteAccess)
+	case "metrics_allowed_cidrs":
+		cfg.MetricsAllowedCIDRs = parseList(value)
+	case "slo_cache_hit_rate_min":
+		cfg.SLO.CacheHitRateMin = parseFloat(value, cfg.SLO.CacheHitRateMin)
+	case "slo_upstream_error_rate_max":
+		cfg.SLO.UpstreamErrorRateMax = parseFloat(value, cfg.SLO.UpstreamErrorRateMax)
+	case "slo_p99_latency_max_ms":
+		cfg.SLO.P99LatencyMaxMS = parseFloat(value, cfg.SLO.P99LatencyMaxMS)
+	case "slo_check_interval_seconds":
+		cfg.SLO.CheckIntervalSeconds = parsePositiveInt(value, cfg.SLO.CheckIntervalSeconds)
+	case "slo_violation_webhook":
+		cfg.SLO.ViolationWebhook = value
 	}
 }
 
@@ -225,6 +270,12 @@ func applyEnv(cfg *Config) {
 	}
 	if value := os.Getenv("AI_PROXY_DEFAULT_PROVIDER"); value != "" {
 		cfg.DefaultProvider = value
+	}
+	if value := os.Getenv("AI_PROXY_METRICS_REMOTE_ACCESS"); value != "" {
+		cfg.MetricsRemoteAccess = parseBool(value, cfg.MetricsRemoteAccess)
+	}
+	if value := os.Getenv("AI_PROXY_METRICS_ALLOWED_CIDRS"); value != "" {
+		cfg.MetricsAllowedCIDRs = parseList(value)
 	}
 
 	applyProviderEnv(cfg, "openai", "https://api.openai.com")
@@ -424,6 +475,14 @@ func parseBool(value string, fallback bool) bool {
 func parsePositiveInt(value string, fallback int) int {
 	parsed, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func parseFloat(value string, fallback float64) float64 {
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil {
 		return fallback
 	}
 	return parsed

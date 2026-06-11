@@ -51,6 +51,8 @@ make run
 - `AI_PROXY_<PROVIDER>_MODELS`, `<PROVIDER>_MODELS`: 覆盖内置 provider 模型匹配规则，例如 `deepseek*,gpt-*`。
 - `AI_PROXY_<PROVIDER>_FALLBACKS`, `<PROVIDER>_FALLBACKS`: 覆盖内置 provider fallback 列表。
 - `AI_PROXY_<PROVIDER>_ENABLED`, `<PROVIDER>_ENABLED`: 启用或禁用内置 provider。
+- `AI_PROXY_METRICS_REMOTE_ACCESS`: 设为 `true` 开放 `/metrics` 与 `/stats` 端点的非 loopback 访问。
+- `AI_PROXY_METRICS_ALLOWED_CIDRS`: 逗号分隔的 CIDR 白名单(预留,P0 阶段未启用)。
 - `API_KEY`, `API_BASE_URL`: 创建名为 `custom` 的通用 provider；当只配置这一个 provider 时会自动使用。
 
 请求时可以用 `X-AI-Provider` 头、`?provider=deepseek` 查询参数，或 `model` 前缀选择 provider：
@@ -118,6 +120,54 @@ http://127.0.0.1:8080/v1
 ```bash
 curl http://127.0.0.1:8080/healthz
 ```
+
+可观测性端点（默认仅 loopback 访问；可通过 `metrics_remote_access: true` 放开）：
+
+```bash
+# Prometheus 文本格式
+curl http://127.0.0.1:8080/metrics
+
+# 实时聚合 JSON（p50/p75/p90/p95/p99 延迟、cache 命中率、provider 错误分布等）
+curl http://127.0.0.1:8080/stats
+```
+
+`/stats` 字段参考：
+
+```json
+{
+  "uptime_seconds": 1234,
+  "requests": {
+    "total": 493,
+    "by_provider": {"aiapi-Deepseek": 107, "deepseek-v4-flash": 119, ...},
+    "by_status": {"2xx": 400, "5xx": 50, "4xx": 43}
+  },
+  "cache": {
+    "by_provider": {
+      "deepseek-v4-flash": {"hit": 102, "miss": 17, "hit_rate": 0.8571, "avg_cached_tokens": 11416}
+    }
+  },
+  "latency_ms": {
+    "openai/gpt-4": {"p50": 1234, "p75": 2000, "p90": 3500, "p95": 4567, "p99": 8901}
+  },
+  "errors": {
+    "upstream_5xx": 50,
+    "upstream_timeout": 12,
+    "upstream_rate_limit": 8,
+    "fallback_triggered": 30,
+    "upstream_by_status_code": {"502": 30, "504": 12, "429": 8}
+  }
+}
+```
+
+`/metrics` 暴露的指标名（均以 `ai_proxy_` 为前缀）：
+
+- `ai_proxy_requests_total{provider,model,route,status}` — 请求计数
+- `ai_proxy_request_duration_seconds_{sum,count}{provider,model,route,status}` — 累计耗时
+- `ai_proxy_input_tokens_total{provider,model}` / `ai_proxy_output_tokens_total{provider,model}` — token 用量
+- `ai_proxy_cached_input_tokens_total{provider,model}` / `ai_proxy_cache_creation_input_tokens_total{provider,model}`
+- `ai_proxy_cache_hit_rate{provider,model}` — 缓存命中率
+- `ai_proxy_upstream_errors_total{provider,status_code}` — upstream 错误分布
+- `ai_proxy_fallback_attempts_total{from_provider,to_provider,reason}` — fallback 触发计数
 
 ## 构建单二进制
 

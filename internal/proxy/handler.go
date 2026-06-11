@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"ai-proxy/internal/archive"
 	"ai-proxy/internal/config"
+	"ai-proxy/internal/metrics"
 	"ai-proxy/internal/stats"
 )
 
@@ -24,14 +26,18 @@ type Handler struct {
 	cfg                 config.Config
 	recorder            stats.Recorder
 	interactionRecorder *archive.Recorder
+	metricsRegistry     *metrics.Registry
+	driftTracker        *FingerprintDriftTracker
 	client              *http.Client
 }
 
-func NewHandler(cfg config.Config, recorder stats.Recorder, interactionRecorder *archive.Recorder) *Handler {
+func NewHandler(cfg config.Config, recorder stats.Recorder, interactionRecorder *archive.Recorder, metricsRegistry *metrics.Registry) *Handler {
 	return &Handler{
 		cfg:                 cfg,
 		recorder:            recorder,
 		interactionRecorder: interactionRecorder,
+		metricsRegistry:     metricsRegistry,
+		driftTracker:        NewFingerprintDriftTracker(2),
 		client:              newHTTPClient(cfg.RequestTimeout),
 	}
 }
@@ -49,6 +55,9 @@ func newHTTPClient(requestTimeout time.Duration) *http.Client {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	requestID := ensureRequestID(r)
+	r = attachRequestID(w, r, requestID)
+
 	if r.URL.Path == "/healthz" {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
@@ -59,13 +68,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/v1/chat/completions" && r.Method == http.MethodPost {
-		h.handleChatCompletions(w, r)
+		h.handleChatCompletions(w, r, requestID)
 		return
 	}
-	h.forwardRaw(w, r)
+	h.forwardRaw(w, r, requestID)
 }
 
-func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, requestID string) {
 	start := time.Now()
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -79,6 +88,11 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "start interaction archive failed", http.StatusInternalServerError)
 		return
 	}
+	round.SetRequestID(requestID)
+	if len(bodyBytes) > 0 {
+		stableHash, fingerprint := ComputeRequestFingerprint(bodyBytes)
+		round.SetFingerprint(stableHash, fingerprint)
+	}
 	if err := round.WriteRequest(bodyBytes); err != nil {
 		log.Printf("archive request: %v", err)
 	}
@@ -86,7 +100,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	var body map[string]any
 	if err := json.Unmarshal(bodyBytes, &body); err != nil {
-		h.writeArchivedError(w, round, start, "", "", false, http.StatusBadRequest, "invalid JSON request body")
+		h.writeArchivedError(w, round, r, start, "", "", false, http.StatusBadRequest, "invalid JSON request body")
 		return
 	}
 
@@ -94,16 +108,16 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	stream, _ := body["stream"].(bool)
 	providerName, err := h.resolveProviderName(r, model)
 	if err != nil {
-		h.writeArchivedError(w, round, start, "", model, stream, http.StatusBadRequest, err.Error())
+		h.writeArchivedError(w, round, r, start, "", model, stream, http.StatusBadRequest, err.Error())
 		return
 	}
 	provider, ok := h.cfg.Providers[providerName]
 	if !ok {
-		h.writeArchivedError(w, round, start, providerName, model, stream, http.StatusBadRequest, fmt.Sprintf("provider %q is not configured", providerName))
+		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadRequest, fmt.Sprintf("provider %q is not configured", providerName))
 		return
 	}
 	bodyBytes, model = rewriteModelPrefix(bodyBytes, body, model, providerName, h.cfg.Providers)
-	h.archiveAndLogProviderSelection(round, providerName, provider, model, stream)
+	h.archiveAndLogProviderSelection(round, r, providerName, provider, model, stream)
 
 	if provider.Protocol == "anthropic" {
 		h.handleAnthropicChatCompletions(w, r, round, start, providerName, provider, body, model, stream)
@@ -112,7 +126,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	result, err := h.doUpstreamWithFallback(r, round, providerName, provider, bodyBytes, len(bodyBytes), stream)
 	if err != nil {
-		h.writeArchivedError(w, round, start, providerName, model, stream, http.StatusBadGateway, err.Error())
+		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 		return
 	}
 	resp := result.Response
@@ -124,10 +138,10 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	defer resp.Body.Close()
 
 	if stream && resp.StatusCode < 400 {
-		h.handleStreamResponse(w, resp, round, start, providerName, model, body, r.Context(), result.Cancel)
+		h.handleStreamResponse(w, resp, round, start, providerName, model, body, r.Context(), result.Cancel, r)
 		return
 	}
-	h.handleBufferedResponse(w, resp, round, start, providerName, model, stream, body)
+	h.handleBufferedResponse(w, resp, round, start, providerName, model, stream, body, r)
 }
 
 func (h *Handler) startRound() (*archive.Round, error) {
@@ -137,7 +151,7 @@ func (h *Handler) startRound() (*archive.Round, error) {
 	return h.interactionRecorder.Start()
 }
 
-func (h *Handler) writeArchivedError(w http.ResponseWriter, round *archive.Round, start time.Time, provider, model string, stream bool, status int, message string) {
+func (h *Handler) writeArchivedError(w http.ResponseWriter, round *archive.Round, r *http.Request, start time.Time, provider, model string, stream bool, status int, message string) {
 	http.Error(w, message, status)
 	responseBody := []byte(message + "\n")
 	if err := round.WriteResponse("response.txt", responseBody); err != nil {
@@ -145,11 +159,11 @@ func (h *Handler) writeArchivedError(w http.ResponseWriter, round *archive.Round
 	}
 	duration := time.Since(start)
 	usage := tokenUsage{}
-	h.recordAndPrint(round, provider, model, stream, status, duration, usage, message)
+	h.recordAndPrint(round, r, provider, model, stream, status, duration, usage, message)
 	h.writeArchiveMetadata(round, provider, model, stream, status, duration, usage, "response.txt", message, "")
 }
 
-func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID string) {
 	start := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -163,21 +177,22 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "start interaction archive failed", http.StatusInternalServerError)
 		return
 	}
+	round.SetRequestID(requestID)
 	if err := round.WriteRequest(body); err != nil {
 		log.Printf("archive raw request: %v", err)
 	}
 	h.archiveAndLogClientRequest(round, r, len(body))
 	providerName, err := h.resolveProviderName(r, rawModel)
 	if err != nil {
-		h.writeArchivedError(w, round, start, "", rawModel, rawStream, http.StatusBadRequest, err.Error())
+		h.writeArchivedError(w, round, r, start, "", rawModel, rawStream, http.StatusBadRequest, err.Error())
 		return
 	}
 	provider, ok := h.cfg.Providers[providerName]
 	if !ok {
-		h.writeArchivedError(w, round, start, providerName, rawModel, rawStream, http.StatusBadRequest, fmt.Sprintf("provider %q is not configured", providerName))
+		h.writeArchivedError(w, round, r, start, providerName, rawModel, rawStream, http.StatusBadRequest, fmt.Sprintf("provider %q is not configured", providerName))
 		return
 	}
-	h.debugf("raw proxy client request method=%s path=%s query=%q provider=%s remote=%s body_bytes=%d headers=%s",
+	h.debugfRound(round, r, "raw proxy client request method=%s path=%s query=%q provider=%s remote=%s body_bytes=%d headers=%s",
 		r.Method,
 		r.URL.Path,
 		r.URL.RawQuery,
@@ -186,11 +201,11 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request) {
 		len(body),
 		headerSummary(sanitizeHeaders(r.Header)),
 	)
-	h.archiveAndLogProviderSelection(round, providerName, provider, rawModel, rawStream)
+	h.archiveAndLogProviderSelection(round, r, providerName, provider, rawModel, rawStream)
 	streamRequest := rawStream || acceptsEventStream(r.Header)
 	result, err := h.doUpstreamWithFallback(r, round, providerName, provider, body, len(body), streamRequest)
 	if err != nil {
-		h.writeArchivedError(w, round, start, providerName, rawModel, rawStream, http.StatusBadGateway, err.Error())
+		h.writeArchivedError(w, round, r, start, providerName, rawModel, rawStream, http.StatusBadGateway, err.Error())
 		return
 	}
 	resp := result.Response
@@ -200,7 +215,7 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request) {
 		defer result.Cancel()
 	}
 	defer resp.Body.Close()
-	h.debugf("raw proxy upstream response provider=%s protocol=%s status=%d upstream_duration=%s total_duration=%s content_type=%q",
+	h.debugfRound(round, r, "raw proxy upstream response provider=%s protocol=%s status=%d upstream_duration=%s total_duration=%s content_type=%q",
 		providerName,
 		provider.Protocol,
 		resp.StatusCode,
@@ -214,7 +229,7 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(responsePath, ".sse") {
 		usage, fullPath, streamErr := h.copyAndArchiveRawStream(w, resp, round, providerName, provider, rawModel, rawBody, r.Context(), result.Cancel)
 		duration := time.Since(start)
-		h.recordAndPrint(round, providerName, rawModel, true, resp.StatusCode, duration, usage, streamErr)
+		h.recordAndPrint(round, r, providerName, rawModel, true, resp.StatusCode, duration, usage, streamErr)
 		h.writeArchiveMetadata(round, providerName, rawModel, true, resp.StatusCode, duration, usage, responsePath, streamErr, fullPath)
 		return
 	}
@@ -234,11 +249,11 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request) {
 		usage = usageFromRawResponse(provider, responseBody, rawBody)
 	}
 	duration := time.Since(start)
-	h.recordAndPrint(round, providerName, rawModel, rawStream, resp.StatusCode, duration, usage, readErrMessage)
+	h.recordAndPrint(round, r, providerName, rawModel, rawStream, resp.StatusCode, duration, usage, readErrMessage)
 	h.writeArchiveMetadata(round, providerName, rawModel, rawStream, resp.StatusCode, duration, usage, responsePath, readErrMessage, "")
 }
 
-func (h *Handler) handleBufferedResponse(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, stream bool, requestBody map[string]any) {
+func (h *Handler) handleBufferedResponse(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, stream bool, requestBody map[string]any, r *http.Request) {
 	responseBody, readErr := io.ReadAll(resp.Body)
 	readErrMessage := ""
 	copyHeader(w.Header(), resp.Header)
@@ -272,11 +287,11 @@ func (h *Handler) handleBufferedResponse(w http.ResponseWriter, resp *http.Respo
 		log.Printf("archive response: %v", err)
 	}
 	duration := time.Since(start)
-	h.recordAndPrint(round, providerName, model, stream, resp.StatusCode, duration, usage, readErrMessage)
+	h.recordAndPrint(round, r, providerName, model, stream, resp.StatusCode, duration, usage, readErrMessage)
 	h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, usage, responsePath, readErrMessage, "")
 }
 
-func (h *Handler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any, requestContext context.Context, cancel context.CancelFunc) {
+func (h *Handler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any, requestContext context.Context, cancel context.CancelFunc, r *http.Request) {
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	flusher, _ := w.(http.Flusher)
@@ -326,7 +341,7 @@ func (h *Handler) handleStreamResponse(w http.ResponseWriter, resp *http.Respons
 		log.Printf("archive stream full response: %v", err)
 	}
 	duration := time.Since(start)
-	h.recordAndPrint(round, providerName, model, true, resp.StatusCode, duration, usage, streamErr)
+	h.recordAndPrint(round, r, providerName, model, true, resp.StatusCode, duration, usage, streamErr)
 	h.writeArchiveMetadata(round, providerName, model, true, resp.StatusCode, duration, usage, "response.sse", streamErr, "response.json")
 }
 
@@ -466,8 +481,8 @@ func (h *Handler) doUpstreamWithFallback(r *http.Request, round *archive.Round, 
 			})
 			continue
 		}
-		h.archiveAndLogUpstreamRequest(round, candidateName, candidate, req, bodyBytes)
-		h.debugf("upstream request provider=%s protocol=%s method=%s url=%s body_bytes=%d",
+		h.archiveAndLogUpstreamRequest(round, r, candidateName, candidate, req, bodyBytes)
+		h.debugfRound(round, r, "upstream request provider=%s protocol=%s method=%s url=%s body_bytes=%d",
 			candidateName,
 			candidate.Protocol,
 			req.Method,
@@ -477,7 +492,7 @@ func (h *Handler) doUpstreamWithFallback(r *http.Request, round *archive.Round, 
 		upstreamStart := time.Now()
 		resp, err := h.client.Do(req)
 		duration := time.Since(upstreamStart)
-		h.archiveAndLogUpstreamResponse(round, candidateName, candidate, resp, duration, err)
+		h.archiveAndLogUpstreamResponse(round, r, candidateName, candidate, resp, duration, err)
 		attempt := fallbackAttemptDebugInfo{
 			Provider:   candidateName,
 			Protocol:   candidate.Protocol,
@@ -486,6 +501,9 @@ func (h *Handler) doUpstreamWithFallback(r *http.Request, round *archive.Round, 
 		}
 		if resp != nil {
 			attempt.Status = resp.StatusCode
+			if resp.StatusCode >= 400 {
+				h.metricsRegistry.RecordUpstreamError(candidateName, resp.StatusCode)
+			}
 		}
 		if err != nil {
 			if cancel != nil {
@@ -494,9 +512,11 @@ func (h *Handler) doUpstreamWithFallback(r *http.Request, round *archive.Round, 
 			lastErr = err
 			attempt.Error = err.Error()
 			attempts = append(attempts, attempt)
+			h.metricsRegistry.RecordUpstreamError(candidateName, -1)
 			if index < len(candidates)-1 {
 				h.logUpstreamAlert(round, candidateName, candidate.Protocol, 0, duration, err.Error(), true, candidates[index+1])
-				h.debugf("upstream fallback provider=%s reason=error error=%q next=%s", candidateName, err.Error(), candidates[index+1])
+				h.debugfRound(round, r, "upstream fallback provider=%s reason=error error=%q next=%s", candidateName, err.Error(), candidates[index+1])
+				h.metricsRegistry.RecordFallbackAttempt(candidateName, candidates[index+1], "error")
 				continue
 			}
 			h.archiveAndLogFallbackAttempts(round, attempts)
@@ -508,7 +528,8 @@ func (h *Handler) doUpstreamWithFallback(r *http.Request, round *archive.Round, 
 			return upstreamResult{ProviderName: candidateName, Provider: candidate, Response: resp, Duration: duration, Cancel: cancel}, nil
 		}
 		h.logUpstreamAlert(round, candidateName, candidate.Protocol, resp.StatusCode, duration, "", true, candidates[index+1])
-		h.debugf("upstream fallback provider=%s status=%d next=%s", candidateName, resp.StatusCode, candidates[index+1])
+		h.debugfRound(round, r, "upstream fallback provider=%s status=%d next=%s", candidateName, resp.StatusCode, candidates[index+1])
+		h.metricsRegistry.RecordFallbackAttempt(candidateName, candidates[index+1], statusBucketForFallback(resp.StatusCode))
 		_ = resp.Body.Close()
 		if cancel != nil {
 			cancel()
@@ -519,6 +540,21 @@ func (h *Handler) doUpstreamWithFallback(r *http.Request, round *archive.Round, 
 		return upstreamResult{}, lastErr
 	}
 	return upstreamResult{}, fmt.Errorf("no fallback providers available")
+}
+
+func statusBucketForFallback(status int) string {
+	switch {
+	case status >= 500:
+		return "5xx"
+	case status == 408:
+		return "timeout"
+	case status == 429:
+		return "rate_limit"
+	case status >= 400:
+		return fmt.Sprintf("%d", status)
+	default:
+		return "other"
+	}
 }
 
 func (h *Handler) fallbackCandidates(providerName string, provider config.Provider) []string {
@@ -882,7 +918,7 @@ func removeHopByHop(header http.Header) {
 	}
 }
 
-func (h *Handler) recordAndPrint(round *archive.Round, provider, model string, stream bool, status int, duration time.Duration, usage tokenUsage, errMessage string) {
+func (h *Handler) recordAndPrint(round *archive.Round, r *http.Request, provider, model string, stream bool, status int, duration time.Duration, usage tokenUsage, errMessage string) {
 	record := stats.Record{
 		Time:                     time.Now(),
 		Provider:                 provider,
@@ -900,14 +936,22 @@ func (h *Handler) recordAndPrint(round *archive.Round, provider, model string, s
 	if err := h.recorder.Append(record); err != nil {
 		log.Printf("append usage record: %v", err)
 	}
+	route := RouteLabel(r)
+	h.metricsRegistry.RecordRequest(provider, model, route, status, duration)
+	h.metricsRegistry.RecordTokens(provider, model, usage.PromptTokens, usage.CompletionTokens, usage.CachedInputTokens, usage.CacheCreationInputTokens)
 	h.printSummary(round, provider, model, stream, status, duration, usage, errMessage)
 }
 
 func (h *Handler) writeArchiveMetadata(round *archive.Round, provider, model string, stream bool, status int, duration time.Duration, usage tokenUsage, responsePath, message, fullResponsePath string) {
+	stableHash, fingerprint, drift, driftCount := h.driftInfo(round)
 	if err := round.WriteMetadata(archive.Metadata{
 		FinishedAt:               time.Now(),
 		Provider:                 provider,
 		Model:                    model,
+		StablePrefixHash:         stableHash,
+		RequestFingerprint:       fingerprint,
+		StablePrefixDrift:        drift,
+		StablePrefixDriftCount:   driftCount,
 		Stream:                   stream,
 		HTTPStatus:               status,
 		DurationMS:               duration.Milliseconds(),
@@ -930,6 +974,21 @@ func (h *Handler) writeArchiveMetadata(round *archive.Round, provider, model str
 	}
 }
 
+// driftInfo 从 round 已记录的稳定 prefix 与 fingerprint 提取漂移信息。
+// Round 不携带 prefix 时返回零值。
+func (h *Handler) driftInfo(round *archive.Round) (stableHash, fingerprint string, drift bool, driftCount int) {
+	if round == nil || h.driftTracker == nil {
+		return "", "", false, 0
+	}
+	stableHash = round.StablePrefixHash
+	fingerprint = round.RequestFingerprint
+	if stableHash == "" {
+		return
+	}
+	drift, driftCount = h.driftTracker.Observe(stableHash)
+	return
+}
+
 func responseFileName(contentType string, stream bool) string {
 	if stream {
 		return "response.sse"
@@ -946,44 +1005,47 @@ func responseFileName(contentType string, stream bool) string {
 }
 
 func (h *Handler) printSummary(round *archive.Round, provider, model string, stream bool, status int, duration time.Duration, usage tokenUsage, errMessage string) {
-	color := "\033[32m"
-	label := "[ai-proxy][OK]"
+	level := slog.LevelInfo
+	label := "ok"
 	if status >= 500 {
-		color = "\033[31m"
-		label = "[ai-proxy][ERROR]"
+		level = slog.LevelError
+		label = "error"
 	} else if status >= 400 || errMessage != "" || usage.Estimated {
-		color = "\033[33m"
+		level = slog.LevelWarn
 		if status >= 400 || errMessage != "" {
-			label = "[ai-proxy][WARN]"
+			label = "warn"
 		} else {
-			label = "[ai-proxy][ESTIMATED]"
+			label = "estimated"
 		}
 	}
-	reset := "\033[0m"
-	total := usage.PromptTokens + usage.CompletionTokens
-	errorSuffix := ""
-	if errMessage != "" {
-		errorSuffix = fmt.Sprintf(" error=%q", errMessage)
+	roundID := roundIDValue(round)
+	attrs := []any{
+		slog.String("label", label),
+		slog.String("provider", provider),
+		slog.String("model", model),
+		slog.Int("round", roundID),
+		slog.Int("status", status),
+		slog.Bool("stream", stream),
+		slog.Duration("duration", duration.Truncate(time.Millisecond)),
+		slog.Int("input_tokens", usage.PromptTokens),
+		slog.Int("output_tokens", usage.CompletionTokens),
+		slog.Int("total_tokens", usage.PromptTokens+usage.CompletionTokens),
+		slog.Int("cached_input_tokens", usage.CachedInputTokens),
+		slog.Int("cache_creation_input_tokens", usage.CacheCreationInputTokens),
+		slog.Float64("cache_hit_rate", usage.CacheHitRate()),
+		slog.Bool("estimated", usage.Estimated),
 	}
-	log.Printf("%s%s provider=%s model=%s round=%06d status=%d stream=%t duration=%s input=%d output=%d total=%d cached_input=%d cache_creation_input=%d cache_hit_rate=%.2f%% estimated=%t%s%s",
-		color,
-		label,
-		provider,
-		model,
-		roundID(round),
-		status,
-		stream,
-		duration.Truncate(time.Millisecond),
-		usage.PromptTokens,
-		usage.CompletionTokens,
-		total,
-		usage.CachedInputTokens,
-		usage.CacheCreationInputTokens,
-		usage.CacheHitRate()*100,
-		usage.Estimated,
-		errorSuffix,
-		reset,
-	)
+	if errMessage != "" {
+		attrs = append(attrs, slog.String("error", errMessage))
+	}
+	slog.LogAttrs(context.Background(), level, "ai-proxy", toAttrs(attrs)...)
+}
+
+func roundIDValue(round *archive.Round) int {
+	if round == nil {
+		return 0
+	}
+	return round.ID
 }
 
 type streamIdleTimer struct {

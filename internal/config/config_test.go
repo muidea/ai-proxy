@@ -206,3 +206,52 @@ providers:
 		t.Fatalf("error = %q", got)
 	}
 }
+
+func TestLoadParsesMetricsFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := `server:
+  port: 9090
+  metrics_remote_access: true
+  metrics_allowed_cidrs: 10.0.0.0/8, 192.168.0.0/16
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ListenAddr != ":9090" {
+		t.Fatalf("listen = %q", cfg.ListenAddr)
+	}
+	if !cfg.MetricsRemoteAccess {
+		t.Fatalf("MetricsRemoteAccess = false, want true")
+	}
+	if len(cfg.MetricsAllowedCIDRs) != 2 {
+		t.Fatalf("cidrs = %v, want 2 entries", cfg.MetricsAllowedCIDRs)
+	}
+}
+
+func TestLoadMetricsRemoteAccessFromEnv(t *testing.T) {
+	t.Setenv("AI_PROXY_METRICS_REMOTE_ACCESS", "true")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.MetricsRemoteAccess {
+		t.Fatalf("MetricsRemoteAccess = false, want true from env")
+	}
+}

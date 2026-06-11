@@ -35,12 +35,12 @@ type anthropicRequest struct {
 func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.Request, round *archive.Round, start time.Time, providerName string, provider config.Provider, body map[string]any, model string, stream bool) {
 	payload, err := buildAnthropicRequest(body, model, stream)
 	if err != nil {
-		h.writeArchivedError(w, round, start, providerName, model, stream, http.StatusBadRequest, err.Error())
+		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadRequest, err.Error())
 		return
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		h.writeArchivedError(w, round, start, providerName, model, stream, http.StatusBadRequest, err.Error())
+		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -50,7 +50,7 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 		if cancel != nil {
 			cancel()
 		}
-		h.writeArchivedError(w, round, start, providerName, model, stream, http.StatusBadGateway, err.Error())
+		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -62,7 +62,7 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 	if provider.APIKey != "" {
 		req.Header.Set("X-API-Key", provider.APIKey)
 	}
-	h.archiveAndLogUpstreamRequest(round, providerName, provider, req, len(encoded))
+	h.archiveAndLogUpstreamRequest(round, r, providerName, provider, req, len(encoded))
 
 	upstreamStart := time.Now()
 	resp, err := h.client.Do(req)
@@ -70,11 +70,11 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 		if cancel != nil {
 			cancel()
 		}
-		h.archiveAndLogUpstreamResponse(round, providerName, provider, nil, time.Since(upstreamStart), err)
-		h.writeArchivedError(w, round, start, providerName, model, stream, http.StatusBadGateway, err.Error())
+		h.archiveAndLogUpstreamResponse(round, r, providerName, provider, nil, time.Since(upstreamStart), err)
+		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 		return
 	}
-	h.archiveAndLogUpstreamResponse(round, providerName, provider, resp, time.Since(upstreamStart), nil)
+	h.archiveAndLogUpstreamResponse(round, r, providerName, provider, resp, time.Since(upstreamStart), nil)
 	if cancel != nil {
 		defer cancel()
 	}
@@ -83,7 +83,7 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 	if resp.StatusCode >= 400 {
 		responseBody, err := io.ReadAll(resp.Body)
 		if err != nil {
-			h.writeArchivedError(w, round, start, providerName, model, stream, http.StatusBadGateway, err.Error())
+			h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 			return
 		}
 		copyHeader(w.Header(), resp.Header)
@@ -94,15 +94,15 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 			log.Printf("archive anthropic error response: %v", err)
 		}
 		duration := time.Since(start)
-		h.recordAndPrint(round, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, "")
+		h.recordAndPrint(round, r, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, "")
 		h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, responsePath, "", "")
 		return
 	}
 	if stream {
-		h.handleAnthropicStream(w, resp, round, start, providerName, model, body, r.Context(), cancel)
+		h.handleAnthropicStream(w, r, resp, round, start, providerName, model, body, r.Context(), cancel)
 		return
 	}
-	h.handleAnthropicBuffered(w, resp, round, start, providerName, model, body)
+	h.handleAnthropicBuffered(w, r, resp, round, start, providerName, model, body)
 }
 
 func buildAnthropicRequest(body map[string]any, model string, stream bool) (anthropicRequest, error) {
@@ -147,15 +147,15 @@ func buildAnthropicRequest(body map[string]any, model string, stream bool) (anth
 	return req, nil
 }
 
-func (h *Handler) handleAnthropicBuffered(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any) {
+func (h *Handler) handleAnthropicBuffered(w http.ResponseWriter, r *http.Request, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		h.writeArchivedError(w, round, start, providerName, model, false, http.StatusBadGateway, err.Error())
+		h.writeArchivedError(w, round, r, start, providerName, model, false, http.StatusBadGateway, err.Error())
 		return
 	}
 	openAIBody, usage, err := convertAnthropicResponse(body, model)
 	if err != nil {
-		h.writeArchivedError(w, round, start, providerName, model, false, http.StatusBadGateway, err.Error())
+		h.writeArchivedError(w, round, r, start, providerName, model, false, http.StatusBadGateway, err.Error())
 		return
 	}
 	if !usage.Known {
@@ -173,7 +173,7 @@ func (h *Handler) handleAnthropicBuffered(w http.ResponseWriter, resp *http.Resp
 		log.Printf("archive anthropic response: %v", err)
 	}
 	duration := time.Since(start)
-	h.recordAndPrint(round, providerName, model, false, http.StatusOK, duration, usage, "")
+	h.recordAndPrint(round, r, providerName, model, false, http.StatusOK, duration, usage, "")
 	h.writeArchiveMetadata(round, providerName, model, false, http.StatusOK, duration, usage, "response.json", "", "")
 }
 
@@ -234,7 +234,7 @@ func convertAnthropicResponse(body []byte, fallbackModel string) ([]byte, tokenU
 	return encoded, usage, err
 }
 
-func (h *Handler) handleAnthropicStream(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any, requestContext context.Context, cancel context.CancelFunc) {
+func (h *Handler) handleAnthropicStream(w http.ResponseWriter, r *http.Request, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any, requestContext context.Context, cancel context.CancelFunc) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -266,7 +266,8 @@ func (h *Handler) handleAnthropicStream(w http.ResponseWriter, resp *http.Respon
 			resetStreamIdleTimer(idleTimer, h.cfg.StreamIdleTimeout)
 			text := strings.TrimSpace(string(line))
 			if strings.HasPrefix(text, "data:") {
-				payload := strings.TrimSpace(strings.TrimPrefix(text, "data:"))
+				rest, _ := strings.CutPrefix(text, "data:")
+				payload := strings.TrimSpace(rest)
 				if payload != "" {
 					events := anthropicStreamEvents(payload, &id, &currentModel, &usage, &content, &finishReason, &roleSent, created)
 					for _, event := range events {
@@ -309,7 +310,7 @@ func (h *Handler) handleAnthropicStream(w http.ResponseWriter, resp *http.Respon
 		usage.Estimated = true
 	}
 	usageChunk := openAIStreamChunk(id, currentModel, created, []any{}, usage)
-	usageEvent := []byte(fmt.Sprintf("data: %s\n\n", usageChunk))
+	usageEvent := fmt.Appendf(nil, "data: %s\n\n", usageChunk)
 	doneEvent := []byte("data: [DONE]\n\n")
 	_, _ = w.Write(usageEvent)
 	_, _ = w.Write(doneEvent)
@@ -330,7 +331,7 @@ func (h *Handler) handleAnthropicStream(w http.ResponseWriter, resp *http.Respon
 		log.Printf("archive anthropic stream full response: %v", err)
 	}
 	duration := time.Since(start)
-	h.recordAndPrint(round, providerName, model, true, http.StatusOK, duration, usage, streamErr)
+	h.recordAndPrint(round, r, providerName, model, true, http.StatusOK, duration, usage, streamErr)
 	h.writeArchiveMetadata(round, providerName, model, true, http.StatusOK, duration, usage, "response.sse", streamErr, "response.json")
 }
 

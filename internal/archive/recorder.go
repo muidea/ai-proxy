@@ -23,18 +23,41 @@ type Recorder struct {
 }
 
 type Round struct {
-	ID        int       `json:"id"`
-	Dir       string    `json:"dir"`
-	StartedAt time.Time `json:"started_at"`
-	recorder  *Recorder
+	ID                 int       `json:"id"`
+	Dir                string    `json:"dir"`
+	StartedAt          time.Time `json:"started_at"`
+	RequestID          string    `json:"request_id,omitempty"`
+	StablePrefixHash   string    `json:"stable_prefix_hash,omitempty"`
+	RequestFingerprint string    `json:"request_fingerprint,omitempty"`
+	recorder           *Recorder
+}
+
+func (r *Round) SetRequestID(id string) {
+	if r == nil {
+		return
+	}
+	r.RequestID = id
+}
+
+func (r *Round) SetFingerprint(stableHash, fingerprint string) {
+	if r == nil {
+		return
+	}
+	r.StablePrefixHash = stableHash
+	r.RequestFingerprint = fingerprint
 }
 
 type Metadata struct {
 	ID                       int       `json:"id"`
 	StartedAt                time.Time `json:"started_at"`
 	FinishedAt               time.Time `json:"finished_at"`
+	RequestID                string    `json:"request_id,omitempty"`
 	Provider                 string    `json:"provider"`
 	Model                    string    `json:"model"`
+	StablePrefixHash         string    `json:"stable_prefix_hash,omitempty"`
+	RequestFingerprint       string    `json:"request_fingerprint,omitempty"`
+	StablePrefixDrift        bool      `json:"stable_prefix_drift,omitempty"`
+	StablePrefixDriftCount   int       `json:"stable_prefix_drift_count,omitempty"`
 	Stream                   bool      `json:"stream"`
 	HTTPStatus               int       `json:"http_status"`
 	DurationMS               int64     `json:"duration_ms"`
@@ -144,6 +167,15 @@ func (r *Round) WriteMetadata(metadata Metadata) error {
 	}
 	metadata.ID = r.ID
 	metadata.StartedAt = r.StartedAt
+	if metadata.RequestID == "" {
+		metadata.RequestID = r.RequestID
+	}
+	if metadata.StablePrefixHash == "" {
+		metadata.StablePrefixHash = r.StablePrefixHash
+	}
+	if metadata.RequestFingerprint == "" {
+		metadata.RequestFingerprint = r.RequestFingerprint
+	}
 	if metadata.FinishedAt.IsZero() {
 		metadata.FinishedAt = time.Now()
 	}
