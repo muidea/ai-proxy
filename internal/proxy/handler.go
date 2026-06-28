@@ -1088,11 +1088,12 @@ func (h *Handler) logStreamIssue(round *archive.Round, provider, model, operatio
 	} else if requestContext != nil && errors.Is(requestContext.Err(), context.DeadlineExceeded) {
 		message = fmt.Sprintf("%s: downstream request deadline exceeded", operation)
 	}
-	log.Printf("\033[33m[ai-proxy][STREAM WARN] round=%06d provider=%s model=%s message=%q\033[0m",
-		roundID(round),
-		provider,
-		model,
-		message,
+	slog.WarnContext(context.Background(), "stream issue",
+		slog.String("event", "STREAM"),
+		slog.Int("round", roundID(round)),
+		slog.String("provider", provider),
+		slog.String("model", model),
+		slog.String("message", message),
 	)
 	return message
 }

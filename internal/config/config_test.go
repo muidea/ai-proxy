@@ -255,3 +255,25 @@ providers:
 		t.Fatalf("MetricsRemoteAccess = false, want true from env")
 	}
 }
+
+func TestLoadLogFormatFromConfigAndEnv(t *testing.T) {
+	t.Setenv("AI_PROXY_LOG_FORMAT", "json")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  log_format: text
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LogFormat != "json" {
+		t.Fatalf("log format = %q, want env override json", cfg.LogFormat)
+	}
+}

@@ -15,6 +15,7 @@ type Config struct {
 	InteractionDir       string
 	InteractionRetention int
 	DebugLog             bool
+	LogFormat            string
 	RequestTimeout       time.Duration
 	StreamIdleTimeout    time.Duration
 	DefaultProvider      string
@@ -55,6 +56,7 @@ func Load(path string) (Config, error) {
 		InteractionDir:       "interactions",
 		InteractionRetention: 500,
 		DebugLog:             true,
+		LogFormat:            "json",
 		RequestTimeout:       5 * time.Minute,
 		StreamIdleTimeout:    5 * time.Minute,
 		Providers:            map[string]Provider{},
@@ -145,6 +147,8 @@ func setTopLevel(cfg *Config, key, value string) {
 		cfg.InteractionRetention = parsePositiveInt(value, cfg.InteractionRetention)
 	case "debug_log":
 		cfg.DebugLog = parseBool(value, cfg.DebugLog)
+	case "log_format":
+		cfg.LogFormat = value
 	case "port":
 		cfg.ListenAddr = addrFromPort(value)
 	case "listen_addr":
@@ -188,6 +192,8 @@ func setServer(cfg *Config, key, value string) {
 		cfg.InteractionRetention = parsePositiveInt(value, cfg.InteractionRetention)
 	case "debug_log":
 		cfg.DebugLog = parseBool(value, cfg.DebugLog)
+	case "log_format":
+		cfg.LogFormat = value
 	case "request_timeout_seconds":
 		if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
 			cfg.RequestTimeout = time.Duration(seconds) * time.Second
@@ -259,6 +265,9 @@ func applyEnv(cfg *Config) {
 	}
 	if value := os.Getenv("AI_PROXY_DEBUG_LOG"); value != "" {
 		cfg.DebugLog = parseBool(value, cfg.DebugLog)
+	}
+	if value := firstEnv("AI_PROXY_LOG_FORMAT", "LOG_FORMAT"); value != "" {
+		cfg.LogFormat = value
 	}
 	if value := os.Getenv("AI_PROXY_REQUEST_TIMEOUT_SECONDS"); value != "" {
 		if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
@@ -351,6 +360,7 @@ func ensureKnownProviders(cfg *Config) {
 }
 
 func normalize(cfg *Config) {
+	cfg.LogFormat = normalizeLogFormat(cfg.LogFormat)
 	cfg.DefaultProvider = strings.ToLower(strings.TrimSpace(cfg.DefaultProvider))
 	normalized := make(map[string]Provider, len(cfg.Providers))
 	for name, provider := range cfg.Providers {
@@ -366,6 +376,15 @@ func normalize(cfg *Config) {
 		normalized[key] = provider
 	}
 	cfg.Providers = normalized
+}
+
+func normalizeLogFormat(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "text":
+		return "text"
+	default:
+		return "json"
+	}
 }
 
 func hasEnabledProvider(providers map[string]Provider) bool {

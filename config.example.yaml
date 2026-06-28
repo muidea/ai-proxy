@@ -4,6 +4,7 @@ server:
   interaction_dir: interactions
   interaction_retention: 500
   debug_log: true
+  log_format: text
   request_timeout_seconds: 300
   stream_idle_timeout_seconds: 300
   default_provider: openai

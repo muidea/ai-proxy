@@ -42,6 +42,7 @@ make run
 - `AI_PROXY_INTERACTION_DIR`: 交互归档目录，默认 `interactions`。
 - `AI_PROXY_INTERACTION_RETENTION`: 保留的交互归档轮数，默认 `500`。
 - `AI_PROXY_DEBUG_LOG`: 是否输出调试日志，默认 `true`。
+- `AI_PROXY_LOG_FORMAT` / `LOG_FORMAT`: 日志格式，`json` 或 `text`；`text` 会按日志等级输出颜色。
 - `AI_PROXY_REQUEST_TIMEOUT_SECONDS`: 非流式请求总超时、流式请求等待上游响应头的超时时间，默认 `300`。
 - `AI_PROXY_STREAM_IDLE_TIMEOUT_SECONDS`: 流式响应读取空闲超时，默认 `300`；设为 `0` 可禁用。该值不是流式请求总时长限制，只在连续没有收到 SSE 数据时触发。
 - `AI_PROXY_DEFAULT_PROVIDER`: 默认 provider 名称；当请求没有显式 provider、模型规则无法唯一匹配、或 `/v1/models` 这类请求没有模型时使用。
@@ -227,3 +228,4 @@ interactions/
 
 调试日志默认输出到终端，包含每轮 round id、客户端请求摘要、provider/model 选择、上游请求、上游响应和最终 token 摘要。`Authorization`、`X-API-Key`、`Cookie` 等敏感头会显示为 `<redacted>`。
 最终 token 摘要也会带 `round`，并在流式读取中断、客户端写入失败等场景附带 `error`；对应错误也会写入该轮 `metadata.json`，便于并发请求交错时追踪完整生命周期。
+默认日志格式为 JSON，便于日志系统采集；在 `server.log_format` 中设置 `text`，或设置 `AI_PROXY_LOG_FORMAT=text` / `LOG_FORMAT=text` 后，会输出人类可读日志，并按 `DEBUG`/`INFO`/`WARN`/`ERROR` 等级分别着色。

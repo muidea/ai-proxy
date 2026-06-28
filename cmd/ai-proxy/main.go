@@ -4,8 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,13 +24,16 @@ func main() {
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		slog.Error("load config", slog.Any("error", err))
+		os.Exit(1)
 	}
+	proxy.ConfigureLogger(cfg.LogFormat, cfg.DebugLog)
 
 	recorder := stats.NewCSVRecorder(cfg.UsageFile)
 	interactionRecorder, err := archive.NewRecorder(cfg.InteractionDir, cfg.InteractionRetention)
 	if err != nil {
-		log.Fatalf("init interaction recorder: %v", err)
+		slog.Error("init interaction recorder", slog.Any("error", err))
+		os.Exit(1)
 	}
 	registry := metrics.NewRegistry()
 	handler := proxy.NewHandler(cfg, recorder, interactionRecorder, registry)
@@ -45,8 +47,13 @@ func main() {
 		P99LatencyMaxMS:      cfg.SLO.P99LatencyMaxMS,
 		CheckInterval:        time.Duration(cfg.SLO.CheckIntervalSeconds) * time.Second,
 	}, cfg.SLO.ViolationWebhook, func(v metrics.SLOViolation) {
-		fmt.Fprintf(os.Stderr, "slo_violation provider=%s rule=%s observed=%v threshold=%v detail=%q\n",
-			v.Provider, v.Rule, v.Observed, v.Threshold, v.Detail)
+		slog.Warn("slo violation",
+			slog.String("provider", v.Provider),
+			slog.String("rule", v.Rule),
+			slog.Float64("observed", v.Observed),
+			slog.Float64("threshold", v.Threshold),
+			slog.String("detail", v.Detail),
+		)
 	})
 	sloCtx, sloCancel := context.WithCancel(context.Background())
 	if cfg.SLO.CheckIntervalSeconds > 0 {
@@ -70,11 +77,11 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		fmt.Printf("ai-proxy listening on %s, usage file: %s, interactions: %s, metrics: %s\n",
-			cfg.ListenAddr,
-			cfg.UsageFile,
-			cfg.InteractionDir,
-			metricsURL(cfg.MetricsRemoteAccess),
+		slog.Info("ai-proxy listening",
+			slog.String("addr", cfg.ListenAddr),
+			slog.String("usage_file", cfg.UsageFile),
+			slog.String("interactions", cfg.InteractionDir),
+			slog.String("metrics", metricsURL(cfg.MetricsRemoteAccess)),
 		)
 		errCh <- server.ListenAndServe()
 	}()
@@ -84,17 +91,19 @@ func main() {
 
 	select {
 	case sig := <-stop:
-		fmt.Printf("received %s, shutting down\n", sig)
+		slog.Info("received signal, shutting down", slog.String("signal", sig.String()))
 	case err := <-errCh:
 		if !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("server error: %v", err)
+			slog.Error("server error", slog.Any("error", err))
+			os.Exit(1)
 		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("shutdown: %v", err)
+		slog.Error("shutdown", slog.Any("error", err))
+		os.Exit(1)
 	}
 }
 
