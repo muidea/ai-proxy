@@ -1032,16 +1032,19 @@ func responseFileName(contentType string, stream bool) string {
 func (h *Handler) printSummary(round *archive.Round, provider, model string, stream bool, status int, duration time.Duration, usage tokenUsage, errMessage string) {
 	level := slog.LevelInfo
 	label := "ok"
+	clientCanceled := isClientCanceledStreamIssue(errMessage)
 	if status >= 500 {
 		level = slog.LevelError
 		label = "error"
-	} else if status >= 400 || errMessage != "" || usage.Estimated {
+	} else if status >= 400 || (errMessage != "" && !clientCanceled) || usage.Estimated {
 		level = slog.LevelWarn
-		if status >= 400 || errMessage != "" {
+		if status >= 400 || (errMessage != "" && !clientCanceled) {
 			label = "warn"
 		} else {
 			label = "estimated"
 		}
+	} else if clientCanceled {
+		label = "canceled"
 	}
 	roundID := roundIDValue(round)
 	attrs := []any{
@@ -1061,7 +1064,11 @@ func (h *Handler) printSummary(round *archive.Round, provider, model string, str
 		slog.Bool("estimated", usage.Estimated),
 	}
 	if errMessage != "" {
-		attrs = append(attrs, slog.String("error", errMessage))
+		key := "error"
+		if clientCanceled {
+			key = "reason"
+		}
+		attrs = append(attrs, slog.String(key, errMessage))
 	}
 	slog.LogAttrs(context.Background(), level, "ai-proxy", toAttrs(attrs)...)
 }
@@ -1106,14 +1113,16 @@ func (h *Handler) logStreamIssue(round *archive.Round, provider, model, operatio
 		return ""
 	}
 	message := fmt.Sprintf("%s: %v", operation, err)
+	level := slog.LevelWarn
 	if idleTimer != nil && idleTimer.expired.Load() {
 		message = fmt.Sprintf("%s: stream idle timeout exceeded after %s", operation, idleTimer.timeout.Truncate(time.Millisecond))
 	} else if requestContext != nil && errors.Is(requestContext.Err(), context.Canceled) {
 		message = fmt.Sprintf("%s: client canceled downstream request", operation)
+		level = slog.LevelInfo
 	} else if requestContext != nil && errors.Is(requestContext.Err(), context.DeadlineExceeded) {
 		message = fmt.Sprintf("%s: downstream request deadline exceeded", operation)
 	}
-	slog.WarnContext(context.Background(), "stream issue",
+	slog.LogAttrs(context.Background(), level, "stream issue",
 		slog.String("event", "STREAM"),
 		slog.Int("round", roundID(round)),
 		slog.String("provider", provider),
@@ -1121,6 +1130,10 @@ func (h *Handler) logStreamIssue(round *archive.Round, provider, model, operatio
 		slog.String("message", message),
 	)
 	return message
+}
+
+func isClientCanceledStreamIssue(message string) bool {
+	return strings.Contains(message, "client canceled downstream request")
 }
 
 func roundID(round *archive.Round) int {
