@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -223,10 +224,10 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID s
 		time.Since(start).Truncate(time.Millisecond),
 		resp.Header.Get("Content-Type"),
 	)
-	copyHeader(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
 	responsePath := responseFileName(resp.Header.Get("Content-Type"), strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "event-stream"))
 	if strings.HasSuffix(responsePath, ".sse") {
+		copyHeader(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
 		usage, fullPath, streamErr := h.copyAndArchiveRawStream(w, resp, round, providerName, provider, rawModel, rawBody, r.Context(), result.Cancel)
 		duration := time.Since(start)
 		h.recordAndPrint(round, r, providerName, rawModel, true, resp.StatusCode, duration, usage, streamErr)
@@ -238,6 +239,9 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID s
 	if err != nil {
 		readErrMessage = h.logStreamIssue(round, providerName, rawModel, "read raw response", err, nil, nil)
 	}
+	responseBody, responseHeader := decodedResponseBodyAndHeader(responseBody, resp.Header)
+	copyHeader(w.Header(), responseHeader)
+	w.WriteHeader(resp.StatusCode)
 	if len(responseBody) > 0 {
 		_, _ = w.Write(responseBody)
 	}
@@ -256,7 +260,8 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID s
 func (h *Handler) handleBufferedResponse(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, stream bool, requestBody map[string]any, r *http.Request) {
 	responseBody, readErr := io.ReadAll(resp.Body)
 	readErrMessage := ""
-	copyHeader(w.Header(), resp.Header)
+	responseBody, responseHeader := decodedResponseBodyAndHeader(responseBody, resp.Header)
+	copyHeader(w.Header(), responseHeader)
 	w.WriteHeader(resp.StatusCode)
 	if len(responseBody) > 0 {
 		_, _ = w.Write(responseBody)
@@ -603,6 +608,7 @@ func (h *Handler) newUpstreamRequest(ctx context.Context, r *http.Request, provi
 	}
 	copyHeader(req.Header, r.Header)
 	removeHopByHop(req.Header)
+	req.Header.Del("Accept-Encoding")
 	req.Header.Del("Content-Length")
 	req.Header.Del("X-AI-Provider")
 	if provider.APIKey != "" {
@@ -901,6 +907,25 @@ func copyHeader(dst, src http.Header) {
 			dst.Add(key, value)
 		}
 	}
+}
+
+func decodedResponseBodyAndHeader(body []byte, header http.Header) ([]byte, http.Header) {
+	decodedHeader := header.Clone()
+	if !strings.EqualFold(strings.TrimSpace(decodedHeader.Get("Content-Encoding")), "gzip") {
+		return body, decodedHeader
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return body, decodedHeader
+	}
+	defer reader.Close()
+	decodedBody, err := io.ReadAll(reader)
+	if err != nil {
+		return body, decodedHeader
+	}
+	decodedHeader.Del("Content-Encoding")
+	decodedHeader.Del("Content-Length")
+	return decodedBody, decodedHeader
 }
 
 func removeHopByHop(header http.Header) {

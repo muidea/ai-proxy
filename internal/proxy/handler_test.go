@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
@@ -70,6 +73,53 @@ func TestOpenAICompatibleBufferedUsage(t *testing.T) {
 	assertFileContains(t, filepath.Join(interactionDir, "metadata.json"), `"response_path": "response.json"`)
 	assertFileContains(t, filepath.Join(interactionDir, "metadata.json"), `"cached_input_tokens": 4`)
 	assertFileContains(t, filepath.Join(interactionDir, "metadata.json"), `"cache_hit_rate": 0.5714285714285714`)
+}
+
+func TestOpenAICompatibleGzipResponseUsage(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got := r.Header.Get("Accept-Encoding"); got != "" {
+			t.Fatalf("accept-encoding should not be forwarded upstream: %s", got)
+		}
+		return gzipJSONResponse(`{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":27575,"completion_tokens":4293,"total_tokens":31868,"prompt_tokens_details":{"cached_tokens":13440},"prompt_cache_hit_tokens":13440,"prompt_cache_miss_tokens":14135}}`)
+	})
+
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	handler := testHandler("https://upstream.test", usageFile, "openai")
+	handler.client.Transport = transport
+	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
+	request.Header.Set("Accept-Encoding", "gzip")
+	response := newResponseRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("content-encoding should be stripped after decode: %s", got)
+	}
+	if !strings.Contains(response.Body.String(), `"usage"`) {
+		t.Fatalf("expected decoded JSON body, got %q", response.Body.String())
+	}
+	records := readUsageCSV(t, usageFile)
+	if got := records[1][3]; got != "27575" {
+		t.Fatalf("input tokens = %s", got)
+	}
+	if got := records[1][4]; got != "4293" {
+		t.Fatalf("output tokens = %s", got)
+	}
+	if got := records[1][8]; got != "false" {
+		t.Fatalf("estimated = %s", got)
+	}
+	if got := records[1][10]; got != "13440" {
+		t.Fatalf("cached input tokens = %s", got)
+	}
+	if got := records[1][12]; got != "0.4874" {
+		t.Fatalf("cache hit rate = %s", got)
+	}
+	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
+	assertFileContains(t, filepath.Join(interactionDir, "response.json"), `"prompt_tokens":27575`)
+	assertFileContains(t, filepath.Join(interactionDir, "metadata.json"), `"cached_input_tokens": 13440`)
 }
 
 func TestOpenAICompatibleStreamingUsage(t *testing.T) {
@@ -1190,6 +1240,26 @@ func (r *failingReadCloser) Close() error {
 
 func jsonResponse(body string) *http.Response {
 	return testResponse(http.StatusOK, "application/json", body)
+}
+
+func gzipJSONResponse(body string) (*http.Response, error) {
+	var buffer bytes.Buffer
+	writer := gzip.NewWriter(&buffer)
+	if _, err := writer.Write([]byte(body)); err != nil {
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type":     []string{"application/json"},
+			"Content-Encoding": []string{"gzip"},
+			"Content-Length":   []string{fmt.Sprintf("%d", buffer.Len())},
+		},
+		Body: io.NopCloser(bytes.NewReader(buffer.Bytes())),
+	}, nil
 }
 
 func sseResponse(body string) *http.Response {
