@@ -5,10 +5,11 @@
 ## 功能
 
 - 标准入站白名单：
-  - OpenAI：`POST /v1/chat/completions`、`/v1/responses`、`/v1/completions`、`/v1/embeddings`，以及 `/v1/models`
+  - OpenAI：`POST /v1/chat/completions`、`/v1/responses`、`/v1/completions`、`/v1/embeddings`，以及 `GET/POST /v1/models`
   - Anthropic：`POST /v1/messages`
   - 其它 `/v1/*` 返回 404
 - **纯 model 路由**：只根据 body 中的 `model` 与各 provider 的 `models` 规则匹配；已禁用 `X-AI-Provider`、`?provider=`、`provider/model` 前缀选择
+- **模型能力目录**：全局 `model_catalog` 配置上下文窗口；`GET /v1/models` 本地返回 `contextWindowTokens` / `maxOutputTokens`（不透传上游）
 - 双向基础协议转换：
   - OpenAI 客户端 → Anthropic 上游：`POST /v1/chat/completions` 命中 `protocol: anthropic` 时转换
   - Anthropic 客户端 → OpenAI 上游：`POST /v1/messages` 命中 `protocol: openai` 时转换
@@ -73,9 +74,47 @@ make run
    - 0 命中 → 使用 `default_provider`（若配置）
    - 1 命中 → 选用
    - >1 命中 → **400**（请保证各 provider 的 `models` 不重叠）
-3. 无 `model`（如 `GET /v1/models`）→ 仅使用 `default_provider`；未配置则 400
+3. 无 `model`（如部分请求）→ 仅使用 `default_provider`；未配置则 400
 
 **已废弃（忽略）：** `X-AI-Provider` 头、`?provider=` 查询参数、`provider/model` 前缀。
+
+### 模型上下文查询（`GET /v1/models`）
+
+在配置中用**全局** `model_catalog` 登记具体模型能力（各 provider 共用，与路由 `providers.*.models` 独立）：
+
+```yaml
+model_catalog:
+  gpt-4o:
+    context_window_tokens: 128000
+    max_output_tokens: 16384
+  claude-sonnet-4-20250514:
+    context_window_tokens: 200000
+    max_output_tokens: 8192
+```
+
+`GET /v1/models`（`POST` 同样）由代理**本地合成** OpenAI-compatible 列表，不再转发上游。示例响应：
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-4o",
+      "object": "model",
+      "created": 0,
+      "owned_by": "openai",
+      "contextWindowTokens": 128000,
+      "maxOutputTokens": 16384
+    }
+  ]
+}
+```
+
+说明：
+
+- 仅 catalog 中登记的模型会出现在列表中；仅有 `gpt-*` 通配不会自动展开
+- `owned_by` 在能唯一匹配到某个 enabled provider 时填 provider 名，否则为 `ai-proxy`
+- `contextWindowTokens` / `maxOutputTokens` 为扩展字段；值为 0 或未配置时省略
 
 其它规则：
 

@@ -23,6 +23,15 @@ type Config struct {
 	MetricsAllowedCIDRs  []string
 	SLO                  SLOConfig
 	Providers            map[string]Provider
+	// ModelCatalog 是全局模型元数据目录,供 GET /v1/models 使用;与 provider 路由解耦。
+	ModelCatalog map[string]ModelInfo
+}
+
+// ModelInfo 描述客户端可查询的模型能力(各 provider 共用同一目录)。
+type ModelInfo struct {
+	ID                  string
+	ContextWindowTokens int
+	MaxOutputTokens     int
 }
 
 // SLOConfig 描述可观测性层面的服务等级目标。
@@ -60,6 +69,7 @@ func Load(path string) (Config, error) {
 		RequestTimeout:       5 * time.Minute,
 		StreamIdleTimeout:    5 * time.Minute,
 		Providers:            map[string]Provider{},
+		ModelCatalog:         map[string]ModelInfo{},
 	}
 
 	if path == "" {
@@ -98,6 +108,7 @@ func loadFile(path string, cfg *Config) error {
 	scanner := bufio.NewScanner(file)
 	section := ""
 	providerName := ""
+	modelName := ""
 	lineNo := 0
 	for scanner.Scan() {
 		lineNo++
@@ -116,17 +127,26 @@ func loadFile(path string, cfg *Config) error {
 		case indent == 0 && !hasValue:
 			section = key
 			providerName = ""
+			modelName = ""
 		case indent == 0:
 			section = ""
 			providerName = ""
+			modelName = ""
 			setTopLevel(cfg, key, expand(value))
 		case section == "server" && indent >= 2:
 			setServer(cfg, key, expand(value))
 		case section == "providers" && indent == 2 && !hasValue:
 			providerName = key
+			modelName = ""
 			ensureProvider(cfg, providerName)
 		case section == "providers" && indent >= 4 && providerName != "":
 			setProvider(cfg, providerName, key, expand(value))
+		case section == "model_catalog" && indent == 2 && !hasValue:
+			modelName = key
+			providerName = ""
+			ensureModelInfo(cfg, modelName)
+		case section == "model_catalog" && indent >= 4 && modelName != "":
+			setModelInfo(cfg, modelName, key, expand(value))
 		default:
 			return fmt.Errorf("%s:%d: unsupported config shape", path, lineNo)
 		}
@@ -245,6 +265,32 @@ func ensureProvider(cfg *Config, name string) Provider {
 	}
 	cfg.Providers[name] = provider
 	return provider
+}
+
+func ensureModelInfo(cfg *Config, id string) ModelInfo {
+	if cfg.ModelCatalog == nil {
+		cfg.ModelCatalog = map[string]ModelInfo{}
+	}
+	info, ok := cfg.ModelCatalog[id]
+	if !ok {
+		info = ModelInfo{ID: id}
+	}
+	if info.ID == "" {
+		info.ID = id
+	}
+	cfg.ModelCatalog[id] = info
+	return info
+}
+
+func setModelInfo(cfg *Config, id, key, value string) {
+	info := ensureModelInfo(cfg, id)
+	switch strings.ToLower(key) {
+	case "context_window_tokens", "contextwindowtokens", "context_window":
+		info.ContextWindowTokens = parseNonNegativeInt(value, info.ContextWindowTokens)
+	case "max_output_tokens", "maxoutputtokens":
+		info.MaxOutputTokens = parseNonNegativeInt(value, info.MaxOutputTokens)
+	}
+	cfg.ModelCatalog[id] = info
 }
 
 func applyEnv(cfg *Config) {
@@ -376,6 +422,30 @@ func normalize(cfg *Config) {
 		normalized[key] = provider
 	}
 	cfg.Providers = normalized
+
+	if cfg.ModelCatalog == nil {
+		cfg.ModelCatalog = map[string]ModelInfo{}
+	}
+	catalog := make(map[string]ModelInfo, len(cfg.ModelCatalog))
+	for name, info := range cfg.ModelCatalog {
+		id := strings.TrimSpace(info.ID)
+		if id == "" {
+			id = strings.TrimSpace(name)
+		}
+		if id == "" {
+			continue
+		}
+		info.ID = id
+		if info.ContextWindowTokens < 0 {
+			info.ContextWindowTokens = 0
+		}
+		if info.MaxOutputTokens < 0 {
+			info.MaxOutputTokens = 0
+		}
+		// 查找键小写;展示 ID 保留配置原文。
+		catalog[strings.ToLower(id)] = info
+	}
+	cfg.ModelCatalog = catalog
 }
 
 func normalizeLogFormat(value string) string {
@@ -494,6 +564,14 @@ func parseBool(value string, fallback bool) bool {
 func parsePositiveInt(value string, fallback int) int {
 	parsed, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func parseNonNegativeInt(value string, fallback int) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed < 0 {
 		return fallback
 	}
 	return parsed

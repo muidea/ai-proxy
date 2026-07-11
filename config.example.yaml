@@ -53,3 +53,16 @@ providers:
     base_url: https://onlycode.shop
     api_key: ${ANTHROPIC_API_KEY}
     models: claude*
+
+# 全局模型目录(各 provider 共用)。GET /v1/models 仅返回此处登记的模型,
+# 并附带 contextWindowTokens / maxOutputTokens。与 providers.*.models 路由规则独立。
+model_catalog:
+  gpt-4o:
+    context_window_tokens: 128000
+    max_output_tokens: 16384
+  deepseek-chat:
+    context_window_tokens: 64000
+    max_output_tokens: 8192
+  claude-sonnet-4-20250514:
+    context_window_tokens: 200000
+    max_output_tokens: 8192

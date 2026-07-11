@@ -90,6 +90,45 @@ providers:
 	}
 }
 
+func TestLoadModelCatalog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+model_catalog:
+  gpt-4o:
+    context_window_tokens: 128000
+    max_output_tokens: 16384
+  DeepSeek-V4-Flash:
+    context_window_tokens: 128000
+    max_output_tokens: 8192
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gpt, ok := cfg.ModelCatalog["gpt-4o"]
+	if !ok {
+		t.Fatalf("missing gpt-4o catalog entry: %#v", cfg.ModelCatalog)
+	}
+	if gpt.ID != "gpt-4o" || gpt.ContextWindowTokens != 128000 || gpt.MaxOutputTokens != 16384 {
+		t.Fatalf("gpt-4o = %#v", gpt)
+	}
+	// 查找键小写,展示 ID 保留配置原文
+	ds, ok := cfg.ModelCatalog["deepseek-v4-flash"]
+	if !ok {
+		t.Fatalf("missing deepseek-v4-flash catalog entry: %#v", cfg.ModelCatalog)
+	}
+	if ds.ID != "DeepSeek-V4-Flash" || ds.ContextWindowTokens != 128000 || ds.MaxOutputTokens != 8192 {
+		t.Fatalf("DeepSeek-V4-Flash = %#v", ds)
+	}
+}
+
 func TestLoadInteractionRetentionFromConfigAndEnv(t *testing.T) {
 	t.Setenv("AI_PROXY_INTERACTION_RETENTION", "321")
 	path := filepath.Join(t.TempDir(), "config.yaml")

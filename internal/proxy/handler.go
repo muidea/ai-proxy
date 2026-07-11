@@ -73,8 +73,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleChatCompletions(w, r, requestID)
 	case r.URL.Path == "/v1/messages" && r.Method == http.MethodPost:
 		h.handleAnthropicMessages(w, r, requestID)
+	case r.URL.Path == "/v1/models" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
+		h.handleModels(w, r, requestID)
 	default:
-		// OpenAI 白名单透传:/v1/responses,/v1/completions,/v1/embeddings,/v1/models
+		// OpenAI 白名单透传:/v1/responses,/v1/completions,/v1/embeddings
 		h.forwardRaw(w, r, requestID)
 	}
 }

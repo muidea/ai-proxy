@@ -546,34 +546,38 @@ func TestDefaultProviderHandlesUnknownOpenAIModel(t *testing.T) {
 	}
 }
 
-func TestDefaultProviderHandlesOpenAIModelsEndpoint(t *testing.T) {
-	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.String() != "https://openai.test/v1/models" {
-			t.Fatalf("unexpected url: %s", r.URL.String())
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer openai-key" {
-			t.Fatalf("unexpected authorization: %s", got)
-		}
-		return jsonResponse(`{"object":"list","data":[]}`), nil
-	})
-
+func TestLocalModelsEndpointReturnsCatalog(t *testing.T) {
 	usageFile := filepath.Join(t.TempDir(), "usage.csv")
 	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Config{
-		ListenAddr:      ":0",
-		UsageFile:       usageFile,
-		InteractionDir:  filepath.Join(filepath.Dir(usageFile), "interactions"),
-		DefaultProvider: "openai",
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
 		Providers: map[string]config.Provider{
-			"openai":   {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "openai-key"},
-			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key"},
+			"openai":   {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "openai-key", Models: []string{"gpt-*"}},
+			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key", Models: []string{"deepseek*"}},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"gpt-4o": {
+				ID:                  "gpt-4o",
+				ContextWindowTokens: 128000,
+				MaxOutputTokens:     16384,
+			},
+			"deepseek-chat": {
+				ID:                  "deepseek-chat",
+				ContextWindowTokens: 64000,
+				MaxOutputTokens:     8192,
+			},
 		},
 	}
 	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
-	handler.client.Transport = transport
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("GET /v1/models should not reach upstream: %s", r.URL.String())
+		return nil, nil
+	})
 	request := newRequest(http.MethodGet, "/v1/models", "")
 	response := newResponseRecorder()
 
@@ -582,8 +586,27 @@ func TestDefaultProviderHandlesOpenAIModelsEndpoint(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["object"] != "list" {
+		t.Fatalf("object = %v", payload["object"])
+	}
+	data, _ := payload["data"].([]any)
+	if len(data) != 2 {
+		t.Fatalf("data len = %d, body = %s", len(data), response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"contextWindowTokens":128000`) && !strings.Contains(response.Body.String(), `"contextWindowTokens": 128000`) {
+		t.Fatalf("expected contextWindowTokens, got: %s", response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"maxOutputTokens":16384`) && !strings.Contains(response.Body.String(), `"maxOutputTokens": 16384`) {
+		t.Fatalf("expected maxOutputTokens, got: %s", response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"owned_by":"openai"`) && !strings.Contains(response.Body.String(), `"owned_by": "openai"`) {
+		t.Fatalf("expected owned_by openai for gpt-4o, got: %s", response.Body.String())
+	}
 	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
-	assertFileContains(t, filepath.Join(interactionDir, "upstream_request.json"), `"provider": "openai"`)
 	assertFileContains(t, filepath.Join(interactionDir, "response.json"), `"object":"list"`)
 }
 
@@ -688,12 +711,12 @@ func TestOpenAICompatibleFallsBackOnRetryableStatus(t *testing.T) {
 		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
 		Providers: map[string]config.Provider{
 			"primary": {Name: "primary", Protocol: "openai", BaseURL: "https://primary.test", APIKey: "primary-key", Models: []string{"gpt-*"}, Fallbacks: []string{"backup"}},
-			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "backup-key", Models: []string{"gpt-*"}},
+			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "backup-key"},
 		},
 	}
 	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
-	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"primary/gpt-test","messages":[{"role":"user","content":"hi"}]}`)
+	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
 	response := newResponseRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -733,12 +756,12 @@ func TestOpenAICompatibleDoesNotFallbackOnClientError(t *testing.T) {
 		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
 		Providers: map[string]config.Provider{
 			"primary": {Name: "primary", Protocol: "openai", BaseURL: "https://primary.test", APIKey: "primary-key", Models: []string{"gpt-*"}, Fallbacks: []string{"backup"}},
-			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "backup-key", Models: []string{"gpt-*"}},
+			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "backup-key"},
 		},
 	}
 	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
-	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"primary/gpt-test","messages":[{"role":"user","content":"hi"}]}`)
+	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
 	response := newResponseRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -833,12 +856,12 @@ func TestFallbackLogsNextProvider(t *testing.T) {
 		DebugLog:       true,
 		Providers: map[string]config.Provider{
 			"primary": {Name: "primary", Protocol: "openai", BaseURL: "https://primary.test", APIKey: "primary-key", Models: []string{"gpt-*"}, Fallbacks: []string{"backup"}},
-			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "backup-key", Models: []string{"gpt-*"}},
+			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "backup-key"},
 		},
 	}
 	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
-	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"primary/gpt-test","messages":[{"role":"user","content":"hi"}]}`)
+	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
 	response := newResponseRecorder()
 
 	handler.ServeHTTP(response, request)
