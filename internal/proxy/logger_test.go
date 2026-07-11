@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestTextLoggerColorsLinesByLevel(t *testing.T) {
+func TestTextLoggerColorsLevelTokenOnly(t *testing.T) {
 	t.Setenv("LOG_FORMAT", "text")
 
 	var out bytes.Buffer
@@ -18,17 +18,17 @@ func TestTextLoggerColorsLinesByLevel(t *testing.T) {
 	logger.ErrorContext(context.Background(), "error message")
 
 	logs := out.String()
-	if !strings.Contains(logs, ansiYellow+"time=") || !strings.Contains(logs, "level=WARN") {
-		t.Fatalf("expected WARN log line to be yellow, got: %q", logs)
+	if !strings.Contains(logs, ansiYellow+"level=WARN"+ansiReset) {
+		t.Fatalf("expected only WARN level token to be yellow, got: %q", logs)
 	}
-	if !strings.Contains(logs, ansiRed+"time=") || !strings.Contains(logs, "level=ERROR") {
-		t.Fatalf("expected ERROR log line to be red, got: %q", logs)
+	if !strings.Contains(logs, ansiRed+"level=ERROR"+ansiReset) {
+		t.Fatalf("expected only ERROR level token to be red, got: %q", logs)
+	}
+	if strings.Contains(logs, ansiYellow+"time=") || strings.Contains(logs, ansiRed+"time=") {
+		t.Fatalf("expected timestamp to remain uncolored, got: %q", logs)
 	}
 	if got := strings.Count(logs, ansiReset); got != 2 {
-		t.Fatalf("expected one reset per colored line, got %d in %q", got, logs)
-	}
-	if strings.Contains(logs, "\n"+ansiReset) {
-		t.Fatalf("expected reset code before line break, got: %q", logs)
+		t.Fatalf("expected one reset per colored level token, got %d in %q", got, logs)
 	}
 }
 

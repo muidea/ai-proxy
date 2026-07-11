@@ -77,37 +77,38 @@ func (w *levelColorWriter) Write(p []byte) (int, error) {
 }
 
 func colorizeLogLine(line []byte) []byte {
-	color := logLevelColor(line)
-	if color == "" {
+	token, color := logLevelToken(line)
+	if token == "" || color == "" {
 		return line
 	}
-	if len(line) > 0 && line[len(line)-1] == '\n' {
-		colored := make([]byte, 0, len(color)+len(line)+len(ansiReset))
-		colored = append(colored, color...)
-		colored = append(colored, line[:len(line)-1]...)
-		colored = append(colored, ansiReset...)
-		colored = append(colored, '\n')
-		return colored
+
+	before, after, found := bytes.Cut(line, []byte(token))
+	if !found {
+		return line
 	}
-	colored := make([]byte, 0, len(color)+len(line)+len(ansiReset))
+
+	// 只给 level=XXX 着色,避免整行颜色干扰阅读。
+	colored := make([]byte, 0, len(line)+len(color)+len(ansiReset))
+	colored = append(colored, before...)
 	colored = append(colored, color...)
-	colored = append(colored, line...)
+	colored = append(colored, token...)
 	colored = append(colored, ansiReset...)
+	colored = append(colored, after...)
 	return colored
 }
 
-func logLevelColor(line []byte) string {
+func logLevelToken(line []byte) (token, color string) {
 	switch {
 	case bytes.Contains(line, []byte("level=DEBUG")):
-		return ansiCyan
+		return "level=DEBUG", ansiCyan
 	case bytes.Contains(line, []byte("level=INFO")):
-		return ansiGreen
+		return "level=INFO", ansiGreen
 	case bytes.Contains(line, []byte("level=WARN")):
-		return ansiYellow
+		return "level=WARN", ansiYellow
 	case bytes.Contains(line, []byte("level=ERROR")):
-		return ansiRed
+		return "level=ERROR", ansiRed
 	default:
-		return ""
+		return "", ""
 	}
 }
 
