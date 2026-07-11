@@ -330,7 +330,7 @@ func TestAnthropicBufferedConversion(t *testing.T) {
 	}
 }
 
-func TestRawProxyAvoidsDuplicateV1AndArchives(t *testing.T) {
+func TestAnthropicNativeAvoidsDuplicateV1AndArchives(t *testing.T) {
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path != "/v1/messages" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
@@ -338,14 +338,30 @@ func TestRawProxyAvoidsDuplicateV1AndArchives(t *testing.T) {
 		if got := r.URL.RawQuery; got != "beta=true" {
 			t.Fatalf("unexpected query: %s", got)
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
-			t.Fatalf("unexpected authorization: %s", got)
+		if got := r.Header.Get("X-API-Key"); got != "test-key" {
+			t.Fatalf("unexpected x-api-key: %s", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("authorization should not be forwarded: %s", got)
 		}
 		return testResponse(http.StatusNotFound, "application/json", `{"error":"not found"}`), nil
 	})
 
 	usageFile := filepath.Join(t.TempDir(), "usage.csv")
-	handler := testHandler("https://upstream.test/v1", usageFile, "openai")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		DebugLog:       true,
+		Providers: map[string]config.Provider{
+			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://upstream.test/v1", APIKey: "test-key"},
+		},
+	}
+	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
 	request := newRequest(http.MethodPost, "/v1/messages?beta=true", `{"model":"claude-test","messages":[{"role":"user","content":"hi"}]}`)
 	request.Header.Set("Anthropic-Version", "2023-06-01")
@@ -419,7 +435,7 @@ func TestAnthropicRawRequestInfersAnthropicProvider(t *testing.T) {
 	}
 }
 
-func TestAmbiguousOpenAIProvidersRequireExplicitProvider(t *testing.T) {
+func TestUnmatchedModelWithoutDefaultProviderReturns400(t *testing.T) {
 	usageFile := filepath.Join(t.TempDir(), "usage.csv")
 	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
 	if err != nil {
@@ -447,12 +463,45 @@ func TestAmbiguousOpenAIProvidersRequireExplicitProvider(t *testing.T) {
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), "multiple providers configured") {
+	if !strings.Contains(response.Body.String(), "no provider matches model") {
 		t.Fatalf("unexpected body: %s", response.Body.String())
 	}
 	records := readUsageCSV(t, usageFile)
 	if got := records[1][9]; got != "400" {
 		t.Fatalf("http status = %s", got)
+	}
+}
+
+func TestMultipleProvidersMatchingSameModelReturns400(t *testing.T) {
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		Providers: map[string]config.Provider{
+			"primary": {Name: "primary", Protocol: "openai", BaseURL: "https://primary.test", APIKey: "k1", Models: []string{"shared-*"}},
+			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "k2", Models: []string{"shared-*"}},
+		},
+	}
+	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("request should not reach upstream")
+		return nil, nil
+	})
+	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"shared-model","messages":[{"role":"user","content":"hi"}]}`)
+	response := newResponseRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "multiple providers match model") {
+		t.Fatalf("unexpected body: %s", response.Body.String())
 	}
 }
 
@@ -847,9 +896,9 @@ func TestRawProxyUsesBodyModelToResolveProvider(t *testing.T) {
 	}
 }
 
-func TestRawMessagesUsesBodyModelBeforeEndpointProtocol(t *testing.T) {
+func TestAnthropicMessagesConvertsToOpenAIChat(t *testing.T) {
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.String() != "https://openai.test/v1/messages" {
+		if r.URL.String() != "https://openai.test/v1/chat/completions" {
 			t.Fatalf("unexpected url: %s", r.URL.String())
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer openai-key" {
@@ -858,7 +907,14 @@ func TestRawMessagesUsesBodyModelBeforeEndpointProtocol(t *testing.T) {
 		if got := r.Header.Get("X-API-Key"); got != "" {
 			t.Fatalf("x-api-key should not be forwarded to openai provider: %s", got)
 		}
-		return jsonResponse(`{"ok":true}`), nil
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["model"] != "gpt-5.4" {
+			t.Fatalf("model = %v", payload["model"])
+		}
+		return jsonResponse(`{"id":"chatcmpl-1","model":"gpt-5.4","choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`), nil
 	})
 
 	usageFile := filepath.Join(t.TempDir(), "usage.csv")
@@ -877,7 +933,7 @@ func TestRawMessagesUsesBodyModelBeforeEndpointProtocol(t *testing.T) {
 	}
 	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
-	request := newRequest(http.MethodPost, "/v1/messages", `{"model":"gpt-5.4","input":"hi"}`)
+	request := newRequest(http.MethodPost, "/v1/messages", `{"model":"gpt-5.4","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)
 	response := newResponseRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -885,15 +941,22 @@ func TestRawMessagesUsesBodyModelBeforeEndpointProtocol(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
+	if !strings.Contains(response.Body.String(), `"type":"message"`) && !strings.Contains(response.Body.String(), `"type": "message"`) {
+		t.Fatalf("expected anthropic message response, got: %s", response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "hello") {
+		t.Fatalf("expected converted content, got: %s", response.Body.String())
+	}
 	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
 	assertFileContains(t, filepath.Join(interactionDir, "upstream_request.json"), `"provider": "openai"`)
+	assertFileContains(t, filepath.Join(interactionDir, "upstream_request.json"), `/v1/chat/completions`)
 	records := readUsageCSV(t, usageFile)
 	if got := records[1][1]; got != "openai" {
 		t.Fatalf("provider = %s", got)
 	}
 }
 
-func TestOpenAIResponsesEndpointUsesOpenAIProtocolWithoutModel(t *testing.T) {
+func TestOpenAIResponsesEndpointUsesDefaultProviderWithoutModel(t *testing.T) {
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.String() != "https://openai.test/v1/responses" {
 			t.Fatalf("unexpected url: %s", r.URL.String())
@@ -910,9 +973,10 @@ func TestOpenAIResponsesEndpointUsesOpenAIProtocolWithoutModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.Config{
-		ListenAddr:     ":0",
-		UsageFile:      usageFile,
-		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		ListenAddr:      ":0",
+		UsageFile:       usageFile,
+		InteractionDir:  filepath.Join(filepath.Dir(usageFile), "interactions"),
+		DefaultProvider: "openai",
 		Providers: map[string]config.Provider{
 			"openai":    {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "openai-key"},
 			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://anthropic.test", APIKey: "anthropic-key"},
@@ -937,20 +1001,7 @@ func TestOpenAIResponsesEndpointUsesOpenAIProtocolWithoutModel(t *testing.T) {
 	}
 }
 
-func TestOpenAIResponsesEndpointScopesModelMatchingToOpenAIProtocol(t *testing.T) {
-	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.String() != "https://deepseek.test/v1/responses" {
-			t.Fatalf("unexpected url: %s", r.URL.String())
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer deepseek-key" {
-			t.Fatalf("unexpected authorization: %s", got)
-		}
-		if got := r.Header.Get("X-API-Key"); got != "" {
-			t.Fatalf("x-api-key should not be forwarded to openai provider: %s", got)
-		}
-		return jsonResponse(`{"id":"resp_1","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`), nil
-	})
-
+func TestOpenAIResponsesRejectsAnthropicProvider(t *testing.T) {
 	usageFile := filepath.Join(t.TempDir(), "usage.csv")
 	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
 	if err != nil {
@@ -961,13 +1012,65 @@ func TestOpenAIResponsesEndpointScopesModelMatchingToOpenAIProtocol(t *testing.T
 		UsageFile:      usageFile,
 		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
 		Providers: map[string]config.Provider{
-			"deepseek":  {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key", Models: []string{"deepseek*"}},
-			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://anthropic.test", APIKey: "anthropic-key", Models: []string{"deepseek*"}},
+			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://anthropic.test", APIKey: "anthropic-key", Models: []string{"claude*"}},
+		},
+	}
+	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("request should not reach upstream")
+		return nil, nil
+	})
+	request := newRequest(http.MethodPost, "/v1/responses", `{"model":"claude-test","input":"hi"}`)
+	response := newResponseRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "only POST /v1/chat/completions supports OpenAI->Anthropic conversion") {
+		t.Fatalf("unexpected body: %s", response.Body.String())
+	}
+}
+
+func TestUnsupportedInboundPathReturns404(t *testing.T) {
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	handler := testHandler("https://upstream.test", usageFile, "openai")
+	request := newRequest(http.MethodPost, "/v1/unknown", `{"model":"gpt-test"}`)
+	response := newResponseRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestExplicitProviderHeaderIsIgnored(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "deepseek.test" {
+			t.Fatalf("unexpected host: %s", r.URL.Host)
+		}
+		return jsonResponse(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`), nil
+	})
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		Providers: map[string]config.Provider{
+			"openai":   {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "openai-key"},
+			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key"},
 		},
 	}
 	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
-	request := newRequest(http.MethodPost, "/v1/responses", `{"model":"deepseek-v4-flash","input":"hi"}`)
+	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}`)
+	request.Header.Set("X-AI-Provider", "openai")
 	response := newResponseRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -975,10 +1078,8 @@ func TestOpenAIResponsesEndpointScopesModelMatchingToOpenAIProtocol(t *testing.T
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	records := readUsageCSV(t, usageFile)
-	if got := records[1][1]; got != "deepseek" {
-		t.Fatalf("provider = %s", got)
-	}
+	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
+	assertFileContains(t, filepath.Join(interactionDir, "upstream_request.json"), `"provider": "deepseek"`)
 }
 
 func TestRawOpenAIStreamArchivesFullResponse(t *testing.T) {
@@ -1100,9 +1201,10 @@ func TestDisabledProviderIsSkippedForModelSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.Config{
-		ListenAddr:     ":0",
-		UsageFile:      usageFile,
-		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		ListenAddr:      ":0",
+		UsageFile:       usageFile,
+		InteractionDir:  filepath.Join(filepath.Dir(usageFile), "interactions"),
+		DefaultProvider: "openai",
 		Providers: map[string]config.Provider{
 			"openai":   {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "openai-key"},
 			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key", Disabled: true},
@@ -1122,7 +1224,7 @@ func TestDisabledProviderIsSkippedForModelSelection(t *testing.T) {
 	assertFileContains(t, filepath.Join(interactionDir, "upstream_request.json"), `"provider": "openai"`)
 }
 
-func TestDisabledProviderCannotBeExplicitlySelected(t *testing.T) {
+func TestDisabledProviderIsNotMatchedByModel(t *testing.T) {
 	usageFile := filepath.Join(t.TempDir(), "usage.csv")
 	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
 	if err != nil {
@@ -1137,7 +1239,7 @@ func TestDisabledProviderCannotBeExplicitlySelected(t *testing.T) {
 		},
 	}
 	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
-	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"deepseek/deepseek-chat","messages":[{"role":"user","content":"hi"}]}`)
+	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}`)
 	response := newResponseRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -1145,7 +1247,7 @@ func TestDisabledProviderCannotBeExplicitlySelected(t *testing.T) {
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), "provider \"deepseek\" is disabled") {
+	if !strings.Contains(response.Body.String(), "no provider matches model") {
 		t.Fatalf("unexpected body: %s", response.Body.String())
 	}
 }
@@ -1155,12 +1257,32 @@ func TestBuildUpstreamURLAvoidsDuplicateV1(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := buildUpstreamURL("https://onlycode.shop/v1", incoming.URL)
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name string
+		base string
+		want string
+	}{
+		{
+			name: "root v1 base",
+			base: "https://onlycode.shop/v1",
+			want: "https://onlycode.shop/v1/messages?beta=true",
+		},
+		{
+			name: "nested v1 base",
+			base: "https://api.krill-ai.com/codex/v1",
+			want: "https://api.krill-ai.com/codex/v1/messages?beta=true",
+		},
 	}
-	if want := "https://onlycode.shop/v1/messages?beta=true"; got != want {
-		t.Fatalf("url = %s, want %s", got, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := buildUpstreamURL(tt.base, incoming.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("url = %s, want %s", got, tt.want)
+			}
+		})
 	}
 }
 

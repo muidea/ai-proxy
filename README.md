@@ -1,21 +1,23 @@
 # ai-proxy
 
-轻量级本地 LLM API 网关。它接收 OpenAI-compatible `/v1/*` 请求，按 provider/model 规则转发到配置的上游，并在请求结束后把模型、耗时、token 用量和缓存命中统计追加到 `usage.csv`，同时按轮次归档请求和响应内容。
+轻量级本地 LLM API 网关。客户端只访问统一标准入站 path（OpenAI 与 Anthropic），代理**仅按请求 `model`** 匹配上游 provider，并在需要时做基础协议转换。请求结束后把模型、耗时、token 用量和缓存命中统计追加到 `usage.csv`，同时按轮次归档请求和响应内容。
 
 ## 功能
 
-- `POST /v1/chat/completions` OpenAI-compatible 转发。
-- 支持 OpenAI-compatible `/v1/responses` 端点直通转发。
-- 支持流式 SSE 转发，客户端可以边收边显示。
-- 非流式响应优先读取 `usage` 字段；缺失时按字符数做轻量估算。
-- 流式响应优先读取结束前的 `usage` 事件；缺失时按输入/输出字符数估算。
-- 记录缓存使用量和缓存命中率，支持 OpenAI-compatible `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`，以及 Anthropic `cache_read_input_tokens` / `cache_creation_input_tokens`。
-- 上游 4xx/5xx 错误状态码和错误体透传给客户端。
-- CSV 追加写入并发安全。
-- 每轮 `/v1/*` 交互归档到独立序号目录，例如 `interactions/000001/`。
-- 支持 OpenAI-compatible 上游，例如 OpenAI、DeepSeek。
-- 支持 Anthropic Messages API 的基础协议转换。
-- 支持同协议 provider fallback，适合主上游限流或 5xx 时切换备用上游。
+- 标准入站白名单：
+  - OpenAI：`POST /v1/chat/completions`、`/v1/responses`、`/v1/completions`、`/v1/embeddings`，以及 `/v1/models`
+  - Anthropic：`POST /v1/messages`
+  - 其它 `/v1/*` 返回 404
+- **纯 model 路由**：只根据 body 中的 `model` 与各 provider 的 `models` 规则匹配；已禁用 `X-AI-Provider`、`?provider=`、`provider/model` 前缀选择
+- 双向基础协议转换：
+  - OpenAI 客户端 → Anthropic 上游：`POST /v1/chat/completions` 命中 `protocol: anthropic` 时转换
+  - Anthropic 客户端 → OpenAI 上游：`POST /v1/messages` 命中 `protocol: openai` 时转换
+- 支持流式 SSE 转发，客户端可以边收边显示
+- 非流式/流式优先读取上游 `usage`；缺失时按字符数轻量估算
+- 记录缓存使用量和缓存命中率（OpenAI cached_tokens / Anthropic cache_*_input_tokens）
+- 上游 4xx/5xx 错误状态码和错误体透传
+- CSV 追加写入并发安全；每轮交互归档到 `interactions/{round_id}/`
+- 同协议 provider fallback（网络错误 / 408 / 429 / 5xx）
 
 ## 配置
 
@@ -45,7 +47,7 @@ make run
 - `AI_PROXY_LOG_FORMAT` / `LOG_FORMAT`: 日志格式，`json` 或 `text`；`text` 会按日志等级给 `level=` 字段着色。
 - `AI_PROXY_REQUEST_TIMEOUT_SECONDS`: 非流式请求总超时、流式请求等待上游响应头的超时时间，默认 `300`。
 - `AI_PROXY_STREAM_IDLE_TIMEOUT_SECONDS`: 流式响应读取空闲超时，默认 `300`；设为 `0` 可禁用。该值不是流式请求总时长限制，只在连续没有收到 SSE 数据时触发。
-- `AI_PROXY_DEFAULT_PROVIDER`: 默认 provider 名称；当请求没有显式 provider、模型规则无法唯一匹配、或 `/v1/models` 这类请求没有模型时使用。
+- `AI_PROXY_DEFAULT_PROVIDER`: 默认 provider 名称；当请求无 `model`、或 `models` 规则未命中时使用。
 - `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`: provider API Key。
 - `AI_PROXY_<PROVIDER>_API_KEY`, `<PROVIDER>_API_KEY`: 设置内置 provider API Key，例如 `AI_PROXY_OPENAI_API_KEY`、`DEEPSEEK_API_KEY`。
 - `AI_PROXY_<PROVIDER>_BASE_URL`, `<PROVIDER>_BASE_URL`: 覆盖内置 provider Base URL。
@@ -54,32 +56,46 @@ make run
 - `AI_PROXY_<PROVIDER>_ENABLED`, `<PROVIDER>_ENABLED`: 启用或禁用内置 provider。
 - `AI_PROXY_METRICS_REMOTE_ACCESS`: 设为 `true` 开放 `/metrics` 与 `/stats` 端点的非 loopback 访问。
 - `AI_PROXY_METRICS_ALLOWED_CIDRS`: 逗号分隔的 CIDR 白名单(预留,P0 阶段未启用)。
-- `API_KEY`, `API_BASE_URL`: 创建名为 `custom` 的通用 provider；当只配置这一个 provider 时会自动使用。
+- `API_KEY`, `API_BASE_URL`: 创建名为 `custom` 的通用 provider。
 
-请求时可以用 `X-AI-Provider` 头、`?provider=deepseek` 查询参数，或 `model` 前缀选择 provider：
+### Provider 路由（仅 model）
+
+客户端应发送**裸模型名**，例如：
 
 ```json
-{"model":"deepseek/deepseek-chat","messages":[{"role":"user","content":"hi"}]}
+{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}
 ```
 
-转发到上游前会把模型名改写为 `deepseek-chat`。
+路由规则：
 
-代理会按请求解析 provider：
+1. 从请求 body 读取 `model`
+2. 在所有 **enabled** provider 的 `models` 中匹配（精确名或 `*` 前缀，如 `gpt-*`、`deepseek*`）
+   - 0 命中 → 使用 `default_provider`（若配置）
+   - 1 命中 → 选用
+   - >1 命中 → **400**（请保证各 provider 的 `models` 不重叠）
+3. 无 `model`（如 `GET /v1/models`）→ 仅使用 `default_provider`；未配置则 400
 
-- 显式选择优先：`X-AI-Provider`、`?provider=`、`provider/model`。
-- 请求体带 `model` 时，会优先按 provider 的 `models` 模型匹配规则自动选择；支持精确模型名和后缀 `*` 前缀匹配，例如 `deepseek*`、`gpt-*`、`kimi-*`。
-- `default_provider` 可配置兜底 provider；它必须指向一个已启用的 provider，否则启动时报配置错误。兜底只在无法通过显式选择或模型规则唯一推断时使用。
-- provider 可通过 `enabled: false` 禁用；禁用后不会参与自动匹配，显式选择该 provider 会返回 400。
-- provider 可通过 `fallbacks: provider-a, provider-b` 配置同协议备用上游；网络错误、408、429 和 5xx 会触发 fallback，400/401/403 等客户端或鉴权错误不会切换。禁用、缺失、跨协议或重复的 fallback provider 会被跳过。
-- Anthropic 请求特征：`/v1/messages` 或 `Anthropic-*` 请求头，会选择唯一的 `protocol: anthropic` provider。
-- OpenAI-compatible 请求特征：`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/responses`，会选择唯一的 `protocol: openai` provider。
-- 如果同一协议配置了多个 provider，且没有可用的 `default_provider` 或模型规则仍无法唯一匹配，代理返回 400，要求客户端指定 provider 或补充 `models` 规则。
+**已废弃（忽略）：** `X-AI-Provider` 头、`?provider=` 查询参数、`provider/model` 前缀。
 
-如果 `base_url` 已包含 `/v1`，代理会避免重复拼接版本路径。例如 `base_url: https://onlycode.shop/v1` 收到 `/v1/messages?beta=true` 时，上游 URL 会是 `https://onlycode.shop/v1/messages?beta=true`。
+其它规则：
 
-fallback 尝试会归档到每轮交互目录的 `fallback_attempts.json`，最终 `usage.csv` 和 `metadata.json` 记录实际返回给客户端的 provider。流式响应只有在尚未向客户端写出响应前才会 fallback；一旦开始输出 SSE，就不会中途切换 provider。
+- `default_provider` 必须指向已启用 provider，否则启动时报配置错误
+- `enabled: false` 的 provider 不参与 model 匹配
+- `fallbacks` 仅切换**同协议**备用上游；触发条件为网络错误、408、429、5xx；400/401/403 不切换
+- 协议转换：
+  | 入站 path | 命中 provider.protocol | 行为 |
+  |---|---|---|
+  | OpenAI 路径 | openai | 直通 |
+  | `/v1/messages` | anthropic | 直通 |
+  | `/v1/chat/completions` | anthropic | OpenAI→Anthropic 基础转换（含 fallback） |
+  | `/v1/messages` | openai | Anthropic→OpenAI 基础转换（含 fallback） |
+  | 其它 OpenAI 路径 | anthropic | 400（不支持该端点转换） |
 
-一个带 fallback 的 provider 示例：
+如果 `base_url` 已包含 `/v1`（含嵌套如 `.../codex/v1`），代理会避免重复拼接版本路径。
+
+fallback 尝试归档到 `fallback_attempts.json`；`usage.csv` / `metadata.json` 记录实际返回的 provider。流式响应仅在写出首包 SSE 前可 fallback。
+
+一个带 fallback 的 provider 示例（注意 `models` 互不重叠）：
 
 ```yaml
 providers:
@@ -95,7 +111,19 @@ providers:
     protocol: openai
     base_url: https://backup.example/v1
     api_key: ${BACKUP_OPENAI_API_KEY}
-    models: gpt-*
+    models: backup-gpt-*
+  deepseek:
+    enabled: true
+    protocol: openai
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_API_KEY}
+    models: deepseek*
+  anthropic:
+    enabled: true
+    protocol: anthropic
+    base_url: https://api.anthropic.com
+    api_key: ${ANTHROPIC_API_KEY}
+    models: claude*
 ```
 
 ## 运行
@@ -110,11 +138,18 @@ make run
 AI_PROXY_CONFIG=config.yaml make run
 ```
 
-客户端把 OpenAI-compatible base URL 改成：
+客户端接入：
 
 ```text
-http://127.0.0.1:8080/v1
+# OpenAI-compatible 客户端
+API_BASE_URL=http://127.0.0.1:8080/v1
+
+# Anthropic 客户端
+ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+# 或 ANTHROPIC_API_URL=http://127.0.0.1:8080
 ```
+
+只需发送裸模型名；代理按 `models` 规则选上游，必要时自动做 OpenAI ↔ Anthropic 基础协议转换。
 
 健康检查：
 

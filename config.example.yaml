@@ -26,10 +26,16 @@ server:
   slo_check_interval_seconds: 60
   slo_violation_webhook:
 
+# 路由仅按 models 匹配 body.model；请保证各 provider 的 models 互不重叠。
+# 客户端使用标准 path:
+#   OpenAI:  POST /v1/chat/completions|/v1/responses|/v1/completions|/v1/embeddings, GET/POST /v1/models
+#   Anthropic: POST /v1/messages
+# 已禁用 X-AI-Provider / ?provider= / provider/model 显式选择。
 providers:
   openai:
     enabled: true
     protocol: openai
+    # base_url 可带或不带 /v1；代理会按入站 path 智能拼接并去重。
     base_url: https://onlycode.shop/v1
     api_key: ${OPENAI_API_KEY}
     models: gpt-*, chatgpt-*, o*, text-embedding-*
@@ -43,6 +49,7 @@ providers:
   anthropic:
     enabled: true
     protocol: anthropic
+    # 转换与直通均走统一 path join；带/不带 /v1 均可。
     base_url: https://onlycode.shop
     api_key: ${ANTHROPIC_API_KEY}
     models: claude*

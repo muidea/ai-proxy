@@ -9,19 +9,20 @@
 
 ### 2.1 产品目标
 
-*   **本地统一入口**：为 NextChat、LobeChat、ChatBox、IDE Agent 等客户端提供一个本地 `API_BASE_URL`，屏蔽不同上游 provider 的 Base URL、API Key、模型命名和协议差异。
-*   **协议兼容与低侵入接入**：优先兼容 OpenAI-compatible `/v1/*` 请求，覆盖 `/v1/chat/completions`、`/v1/responses` 等常见端点；支持 Anthropic Messages API 的基础协议转换，让客户端尽量只需修改 Base URL 或 provider 选择方式。
-*   **用量与成本可见**：对每个经代理处理的 `/v1/*` 请求记录 provider、model、HTTP 状态、耗时、流式/非流式、输入/输出 token、缓存读写 token、缓存命中率；没有模型或 token 语义的请求保留空模型与 0 token，不能阻塞流水记录。
-*   **问题可追踪**：每个经代理处理的 `/v1/*` 请求生成独立交互归档，保留请求、上游请求、上游响应、最终响应、元数据、fallback 尝试、request_id 和请求指纹，便于复盘异常、并发交错和 prompt 漂移。
-*   **多 provider 路由与韧性**：支持显式 provider、模型前缀、模型匹配规则、默认 provider 和同协议 fallback；在限流、超时、网络错误或 5xx 时可自动切换备用上游，fallback 成功时客户端收到备用上游结果，失败时保留最终一次上游响应语义。
+*   **本地统一入口**：为 NextChat、LobeChat、ChatBox、IDE Agent 等客户端提供一个本地 `API_BASE_URL`，屏蔽不同上游 provider 的 Base URL、API Key 与协议差异。
+*   **标准 path + 纯 model 路由**：客户端只访问 OpenAI/Anthropic 标准入站 path；代理仅按请求 `model` 与 provider `models` 规则匹配上游，不再使用 `X-AI-Provider` / `?provider=` / `provider/model`。
+*   **双向协议兼容**：OpenAI chat ↔ Anthropic messages 提供基础协议转换；其余 OpenAI 端点对 openai provider 直通。
+*   **用量与成本可见**：对每个经代理处理的标准 `/v1/*` 请求记录 provider、model、HTTP 状态、耗时、流式/非流式、输入/输出 token、缓存读写 token、缓存命中率；没有模型或 token 语义的请求保留空模型与 0 token，不能阻塞流水记录。
+*   **问题可追踪**：每个经代理处理的请求生成独立交互归档，保留请求、上游请求、上游响应、最终响应、元数据、fallback 尝试、request_id 和请求指纹，便于复盘异常、并发交错和 prompt 漂移。
+*   **多 provider 路由与韧性**：支持模型匹配规则、默认 provider 和同协议 fallback；在限流、超时、网络错误或 5xx 时可自动切换备用上游。
 *   **轻量本地运维**：采用 Go 单二进制交付，不依赖数据库、中间件或长期驻留外部服务；配置、用量流水和交互归档均使用本地文件。
 *   **可观测性内建**：提供 `/healthz`、`/metrics`、`/stats`、`/stats/stream`，让终端、Prometheus、TUI 或轻量 dashboard 能实时查看请求量、延迟分位数、错误率、fallback 和 cache 命中率。
 
 ### 2.2 范围边界
 
 *   **Provider 配置**：通过 `config.yaml` 与环境变量配置端口、超时、usage 文件、交互归档目录、保留轮数、debug 日志、metrics 访问策略、SLO 阈值和 provider 列表。
-*   **Provider 选择优先级**：支持 `X-AI-Provider`、`?provider=`、`provider/model` 前缀、`models` 匹配规则和 `default_provider` 兜底；无法唯一判断时返回明确 400 错误。
-*   **转发能力**：支持 OpenAI-compatible 非流式与 SSE 流式响应；对不需要特殊转换的 `/v1/*` 端点进行直通转发；对 Anthropic Messages API 进行基础适配。
+*   **Provider 选择**：仅 `models` 匹配 + `default_provider` 兜底；多 provider 命中同一 model 时返回明确 400。
+*   **转发能力**：标准 OpenAI path 与 Anthropic `/v1/messages`；非白名单 path 404；OpenAI chat ↔ Anthropic messages 基础双向转换。
 *   **记录能力**：`usage.csv` 作为结构化流水账，`interactions/{round_id}/` 作为完整交互归档；归档需要脱敏敏感请求头。
 *   **监控能力**：`/metrics` 输出 Prometheus text exposition format，`/stats` 输出 JSON 聚合快照，`/stats/stream` 输出 SSE 快照流；默认仅允许 loopback 访问，可通过 `metrics_remote_access` 显式开放远程访问。
 *   **安全底线**：不在日志、CSV、metadata 或归档 meta 中明文输出 API Key、Authorization、Cookie 等敏感头。
@@ -42,7 +43,7 @@
 *   不实现完整 OpenTelemetry 分布式追踪；当前以轻量 Prometheus、JSON stats、CSV 和本地归档为主。
 *   不在本阶段验收 metrics CIDR 白名单策略；`metrics_allowed_cidrs` 作为预留配置字段，当前 DoD 只覆盖 loopback 默认保护与 `metrics_remote_access` 开关。
 *   不承诺兼容所有上游私有扩展字段；优先保证 OpenAI-compatible 与 Anthropic Messages 的主路径。
-*   不修改用户 prompt 或模型输出内容，除必要的 provider/model 路由改写和协议适配外保持透明转发。
+*   不修改用户 prompt 或模型输出内容，除必要的协议适配外保持透明转发。
 
 ---
 
@@ -53,16 +54,15 @@
 - [ ] `GET /healthz` 返回 200 和 JSON 健康状态。
 - [ ] `POST /v1/chat/completions` 能完成 OpenAI-compatible 非流式转发，客户端收到的状态码、主要响应头和 JSON body 与上游语义一致。
 - [ ] `POST /v1/chat/completions` 在 `stream: true` 时以 SSE 方式转发，客户端能边生成边接收；代理不能等待完整流结束后才向客户端返回，归档层允许增量写入原始流并在流结束后生成整理版响应。
-- [ ] `/v1/responses` 与其他无需特殊处理的 `/v1/*` 端点可以直通转发，并保留查询参数和请求方法语义。
-- [ ] Anthropic Messages API 主路径可通过配置的 `protocol: anthropic` provider 转发或适配，返回内容可被 Anthropic-compatible 客户端消费。
+- [ ] 白名单 OpenAI 端点（`/v1/responses`、`/v1/completions`、`/v1/embeddings`、`/v1/models`）可直通 openai provider；非白名单 `/v1/*` 返回 404。
+- [ ] Anthropic `POST /v1/messages` 可直通 anthropic provider，或在命中 openai provider 时做基础转换；OpenAI chat 命中 anthropic provider 时可做反向基础转换。
 - [ ] 未触发 fallback 的上游 400、401、403、404、429、5xx 等错误能保留原始状态码和错误体透传给客户端；代理自身错误返回明确、可读的 4xx/5xx 信息。
 
 ### 3.2 Provider 路由与 fallback
 
-- [ ] `X-AI-Provider`、`?provider=`、`provider/model` 前缀、`models` 匹配规则、`default_provider` 的优先级行为有测试覆盖和文档说明。
-- [ ] 使用 `provider/model` 前缀选择上游时，转发给上游前会去掉 provider 前缀，仅保留真实模型名。
-- [ ] provider `enabled: false` 后不参与自动匹配，显式选择禁用 provider 时返回 400。
-- [ ] 当多个 provider 均可能匹配且没有明确兜底时，代理返回 400，提示客户端指定 provider 或调整模型规则。
+- [ ] 仅按 `models` 与 `default_provider` 路由；`X-AI-Provider` / `?provider=` / `provider/model` 被忽略；行为有测试覆盖和文档说明。
+- [ ] provider `enabled: false` 后不参与 model 匹配。
+- [ ] 当多个 provider 的 models 同时命中同一 model 时返回 400，提示调整 models 规则。
 - [ ] fallback 仅在网络错误、408、429 和 5xx 等可重试场景触发；401、403、400 等认证或请求错误不触发 fallback。
 - [ ] fallback 只能切换到同协议、已启用、已配置的 provider；每次尝试记录 provider、状态码/错误、耗时和原因。
 - [ ] fallback 成功时，客户端响应、`usage.csv` 和 `metadata.json` 记录实际返回的备用 provider；fallback 全部失败时，客户端收到最终一次上游错误响应，网络级失败则收到明确的代理 502。

@@ -64,15 +64,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 		return
 	}
-	if !strings.HasPrefix(r.URL.Path, "/v1/") {
+	if !isSupportedInbound(r.Method, r.URL.Path) {
 		http.NotFound(w, r)
 		return
 	}
-	if r.URL.Path == "/v1/chat/completions" && r.Method == http.MethodPost {
+	switch {
+	case r.URL.Path == "/v1/chat/completions" && r.Method == http.MethodPost:
 		h.handleChatCompletions(w, r, requestID)
-		return
+	case r.URL.Path == "/v1/messages" && r.Method == http.MethodPost:
+		h.handleAnthropicMessages(w, r, requestID)
+	default:
+		// OpenAI 白名单透传:/v1/responses,/v1/completions,/v1/embeddings,/v1/models
+		h.forwardRaw(w, r, requestID)
 	}
-	h.forwardRaw(w, r, requestID)
+}
+
+// isSupportedInbound 限制客户端只能访问标准 OpenAI / Anthropic path。
+func isSupportedInbound(method, path string) bool {
+	switch path {
+	case "/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/completions", "/v1/embeddings":
+		return method == http.MethodPost
+	case "/v1/models":
+		return method == http.MethodGet || method == http.MethodPost
+	default:
+		return false
+	}
 }
 
 func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, requestID string) {
@@ -117,11 +133,11 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadRequest, fmt.Sprintf("provider %q is not configured", providerName))
 		return
 	}
-	bodyBytes, model = rewriteModelPrefix(bodyBytes, body, model, providerName, h.cfg.Providers)
+	// model 路由仅使用 body.model,不再剥离 provider/model 前缀。
 	h.archiveAndLogProviderSelection(round, r, providerName, provider, model, stream)
 
 	if provider.Protocol == "anthropic" {
-		h.handleAnthropicChatCompletions(w, r, round, start, providerName, provider, body, model, stream)
+		h.handleAnthropicChatCompletions(w, r, round, start, providerName, provider, bodyBytes, body, model, stream)
 		return
 	}
 
@@ -191,6 +207,11 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID s
 	provider, ok := h.cfg.Providers[providerName]
 	if !ok {
 		h.writeArchivedError(w, round, r, start, providerName, rawModel, rawStream, http.StatusBadRequest, fmt.Sprintf("provider %q is not configured", providerName))
+		return
+	}
+	if provider.Protocol == "anthropic" {
+		h.writeArchivedError(w, round, r, start, providerName, rawModel, rawStream, http.StatusBadRequest,
+			fmt.Sprintf("provider %q uses anthropic protocol; only POST /v1/chat/completions supports OpenAI->Anthropic conversion", providerName))
 		return
 	}
 	h.debugfRound(round, r, "raw proxy client request method=%s path=%s query=%q provider=%s remote=%s body_bytes=%d headers=%s",
@@ -466,13 +487,17 @@ type upstreamResult struct {
 }
 
 func (h *Handler) doUpstreamWithFallback(r *http.Request, round *archive.Round, providerName string, provider config.Provider, body []byte, bodyBytes int, stream bool) (upstreamResult, error) {
+	return h.doUpstreamWithFallbackPath(r, round, providerName, provider, body, bodyBytes, stream, r.URL.Path, r.URL.RawQuery, r.Method)
+}
+
+func (h *Handler) doUpstreamWithFallbackPath(r *http.Request, round *archive.Round, providerName string, provider config.Provider, body []byte, bodyBytes int, stream bool, path, rawQuery, method string) (upstreamResult, error) {
 	candidates := h.fallbackCandidates(providerName, provider)
 	attempts := make([]fallbackAttemptDebugInfo, 0, len(candidates))
 	var lastErr error
 	for index, candidateName := range candidates {
 		candidate := h.cfg.Providers[candidateName]
 		ctx, cancel := h.upstreamContext(r.Context(), stream)
-		req, err := h.newUpstreamRequest(ctx, r, candidate, body)
+		req, err := h.newUpstreamRequestForPath(ctx, r, candidate, body, path, rawQuery, method, stream)
 		if err != nil {
 			if cancel != nil {
 				cancel()
@@ -598,11 +623,22 @@ func (h *Handler) upstreamContext(parent context.Context, stream bool) (context.
 }
 
 func (h *Handler) newUpstreamRequest(ctx context.Context, r *http.Request, provider config.Provider, body []byte) (*http.Request, error) {
-	target, err := buildUpstreamURL(provider.BaseURL, r.URL)
+	return h.newUpstreamRequestForPath(ctx, r, provider, body, r.URL.Path, r.URL.RawQuery, r.Method, false)
+}
+
+// newUpstreamRequestForPath 按指定上游 path 构建请求,用于协议转换时改写目标路径。
+func (h *Handler) newUpstreamRequestForPath(ctx context.Context, r *http.Request, provider config.Provider, body []byte, path, rawQuery, method string, stream bool) (*http.Request, error) {
+	incoming := *r.URL
+	incoming.Path = path
+	incoming.RawQuery = rawQuery
+	target, err := buildUpstreamURL(provider.BaseURL, &incoming)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, r.Method, target, bytes.NewReader(body))
+	if method == "" {
+		method = r.Method
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -611,13 +647,25 @@ func (h *Handler) newUpstreamRequest(ctx context.Context, r *http.Request, provi
 	req.Header.Del("Accept-Encoding")
 	req.Header.Del("Content-Length")
 	req.Header.Del("X-AI-Provider")
-	if provider.APIKey != "" {
-		if provider.Protocol == "anthropic" {
+	if len(body) > 0 && req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if provider.Protocol == "anthropic" {
+		if req.Header.Get("Anthropic-Version") == "" {
+			req.Header.Set("Anthropic-Version", "2023-06-01")
+		}
+		if stream {
+			req.Header.Set("Accept", "text/event-stream")
+		} else if req.Header.Get("Accept") == "" {
+			req.Header.Set("Accept", "application/json")
+		}
+		if provider.APIKey != "" {
 			req.Header.Set("X-API-Key", provider.APIKey)
 			req.Header.Del("Authorization")
-		} else {
-			req.Header.Set("Authorization", "Bearer "+provider.APIKey)
 		}
+	} else if provider.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+		req.Header.Del("X-API-Key")
 	}
 	req.ContentLength = int64(len(body))
 	return req, nil
@@ -650,111 +698,32 @@ func joinUpstreamPath(basePath, incomingPath string) string {
 	if incomingPath == "" || incomingPath == "/" {
 		return basePath
 	}
-	if basePath == "/v1" && (incomingPath == "/v1" || strings.HasPrefix(incomingPath, "/v1/")) {
-		return incomingPath
+	if strings.HasSuffix(basePath, "/v1") && (incomingPath == "/v1" || strings.HasPrefix(incomingPath, "/v1/")) {
+		return basePath + strings.TrimPrefix(incomingPath, "/v1")
 	}
 	return basePath + incomingPath
 }
 
-func (h *Handler) resolveProviderName(r *http.Request, model string) (string, error) {
-	if provider := strings.TrimSpace(r.Header.Get("X-AI-Provider")); provider != "" {
-		return h.validateExplicitProvider(strings.ToLower(provider))
-	}
-	if provider := strings.TrimSpace(r.URL.Query().Get("provider")); provider != "" {
-		return h.validateExplicitProvider(strings.ToLower(provider))
-	}
-	if idx := strings.IndexRune(model, '/'); idx > 0 {
-		prefix := strings.ToLower(model[:idx])
-		if _, ok := h.cfg.Providers[prefix]; ok {
-			return h.validateExplicitProvider(prefix)
-		}
-	}
-	protocol := inferredProtocol(r)
+// resolveProviderName 仅按 body.model 的 models 规则匹配 provider。
+// 已禁用 X-AI-Provider / ?provider= / provider/model 显式选择。
+func (h *Handler) resolveProviderName(_ *http.Request, model string) (string, error) {
+	model = strings.TrimSpace(model)
 	if model != "" {
-		if protocol != "" {
-			if name, ok, err := h.findProviderByModel(protocol, model); ok || err != nil {
-				return name, err
-			}
-		}
-		if name, ok, err := h.findProviderByModel("", model); ok || err != nil {
+		if name, ok, err := h.findProviderByModel(model); ok || err != nil {
 			return name, err
 		}
-		if protocol != "" {
-			return h.providerForProtocolAndModel(protocol, model)
-		}
-		return h.providerForModel("", model)
-	}
-	if protocol != "" {
-		return h.providerForProtocolAndModel(protocol, model)
-	}
-	if name, ok, err := h.defaultProviderForProtocol(""); ok || err != nil {
-		return name, err
-	}
-	if h.enabledProviderCount() == 1 {
-		for name, provider := range h.cfg.Providers {
-			if provider.Disabled {
-				continue
-			}
-			return name, nil
-		}
-	}
-	return "", fmt.Errorf("provider is ambiguous; set X-AI-Provider, ?provider=, or use a model prefix like provider/model")
-}
-
-func (h *Handler) validateExplicitProvider(name string) (string, error) {
-	provider, ok := h.cfg.Providers[name]
-	if !ok {
-		return "", fmt.Errorf("provider %q is not configured", name)
-	}
-	if provider.Disabled {
-		return "", fmt.Errorf("provider %q is disabled", name)
-	}
-	return name, nil
-}
-
-func inferredProtocol(r *http.Request) string {
-	if r.URL.Path == "/v1/messages" || hasHeaderPrefix(r.Header, "Anthropic-") {
-		return "anthropic"
-	}
-	if r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/completions" || r.URL.Path == "/v1/embeddings" || r.URL.Path == "/v1/responses" || r.URL.Path == "/v1/models" {
-		return "openai"
-	}
-	return ""
-}
-
-func hasHeaderPrefix(headers http.Header, prefix string) bool {
-	prefix = strings.ToLower(prefix)
-	for key := range headers {
-		if strings.HasPrefix(strings.ToLower(key), prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func (h *Handler) providerForProtocolAndModel(protocol, model string) (string, error) {
-	if model != "" {
-		if name, ok, err := h.findProviderByModel(protocol, model); ok || err != nil {
+		if name, ok, err := h.defaultProvider(); ok || err != nil {
 			return name, err
 		}
+		return "", fmt.Errorf("no provider matches model %q; configure provider models patterns or default_provider", model)
 	}
-	if name, ok, err := h.defaultProviderForProtocol(protocol); ok || err != nil {
+	if name, ok, err := h.defaultProvider(); ok || err != nil {
 		return name, err
 	}
-	return h.uniqueProviderForProtocol(protocol)
+	return "", fmt.Errorf("model is required or set default_provider")
 }
 
-func (h *Handler) providerForModel(protocol, model string) (string, error) {
-	if name, ok, err := h.findProviderByModel(protocol, model); ok || err != nil {
-		return name, err
-	}
-	if name, ok, err := h.defaultProviderForProtocol(protocol); ok || err != nil {
-		return name, err
-	}
-	return "", fmt.Errorf("provider is ambiguous for model %q; set X-AI-Provider, ?provider=, provider/model, or provider models patterns", model)
-}
-
-func (h *Handler) findProviderByModel(protocol, model string) (string, bool, error) {
+func (h *Handler) findProviderByModel(model string) (string, bool, error) {
 	model = strings.ToLower(strings.TrimSpace(model))
 	if model == "" {
 		return "", false, nil
@@ -762,9 +731,6 @@ func (h *Handler) findProviderByModel(protocol, model string) (string, bool, err
 	matches := make([]string, 0, 1)
 	for name, provider := range h.cfg.Providers {
 		if provider.Disabled {
-			continue
-		}
-		if protocol != "" && provider.Protocol != protocol {
 			continue
 		}
 		if providerMatchesModel(name, provider, model) {
@@ -775,7 +741,7 @@ func (h *Handler) findProviderByModel(protocol, model string) (string, bool, err
 		return matches[0], true, nil
 	}
 	if len(matches) > 1 {
-		return "", true, fmt.Errorf("multiple providers match model %q; set X-AI-Provider, ?provider=, or use provider/model", model)
+		return "", true, fmt.Errorf("multiple providers match model %q; disambiguate provider models patterns", model)
 	}
 	return "", false, nil
 }
@@ -822,37 +788,7 @@ func matchModelPattern(model, pattern string) bool {
 	}
 }
 
-func (h *Handler) uniqueProviderForProtocol(protocol string) (string, error) {
-	matches := make([]string, 0, 1)
-	for name, provider := range h.cfg.Providers {
-		if provider.Disabled {
-			continue
-		}
-		if provider.Protocol == protocol {
-			matches = append(matches, name)
-		}
-	}
-	if len(matches) == 1 {
-		return matches[0], nil
-	}
-	if name, ok, err := h.defaultProviderForProtocol(protocol); ok || err != nil {
-		return name, err
-	}
-	if len(matches) == 0 && h.enabledProviderCount() == 1 {
-		for name, provider := range h.cfg.Providers {
-			if provider.Disabled {
-				continue
-			}
-			return name, nil
-		}
-	}
-	if len(matches) == 0 {
-		return "", fmt.Errorf("no provider configured for protocol %q; set X-AI-Provider or add a provider with protocol: %s", protocol, protocol)
-	}
-	return "", fmt.Errorf("multiple providers configured for protocol %q; set X-AI-Provider, ?provider=, provider/model, or provider models patterns", protocol)
-}
-
-func (h *Handler) defaultProviderForProtocol(protocol string) (string, bool, error) {
+func (h *Handler) defaultProvider() (string, bool, error) {
 	name := strings.ToLower(strings.TrimSpace(h.cfg.DefaultProvider))
 	if name == "" {
 		return "", false, nil
@@ -864,41 +800,7 @@ func (h *Handler) defaultProviderForProtocol(protocol string) (string, bool, err
 	if provider.Disabled {
 		return "", false, fmt.Errorf("default_provider %q is disabled", name)
 	}
-	if protocol != "" && provider.Protocol != protocol {
-		return "", false, fmt.Errorf("default_provider %q uses protocol %q, but request requires protocol %q; set X-AI-Provider, ?provider=, or provider/model", name, provider.Protocol, protocol)
-	}
 	return name, true, nil
-}
-
-func (h *Handler) enabledProviderCount() int {
-	count := 0
-	for _, provider := range h.cfg.Providers {
-		if !provider.Disabled {
-			count++
-		}
-	}
-	return count
-}
-
-func rewriteModelPrefix(original []byte, body map[string]any, model, providerName string, providers map[string]config.Provider) ([]byte, string) {
-	idx := strings.IndexRune(model, '/')
-	if idx <= 0 {
-		return original, model
-	}
-	prefix := strings.ToLower(model[:idx])
-	if prefix != providerName {
-		return original, model
-	}
-	if _, ok := providers[prefix]; !ok {
-		return original, model
-	}
-	stripped := model[idx+1:]
-	body["model"] = stripped
-	encoded, err := json.Marshal(body)
-	if err != nil {
-		return original, model
-	}
-	return encoded, stripped
 }
 
 func copyHeader(dst, src http.Header) {
