@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -103,4 +104,17 @@ func TestFingerprintDriftTrackerNilSafe(t *testing.T) {
 		t.Fatalf("nil tracker must not fire")
 	}
 	d.Reset()
+}
+
+func TestFingerprintDriftTrackerConcurrent(t *testing.T) {
+	d := NewFingerprintDriftTracker(2)
+	var wg sync.WaitGroup
+	for i := range 32 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			d.Observe(string(rune('a' + (i % 5))))
+		}(i)
+	}
+	wg.Wait()
 }

@@ -12,13 +12,15 @@ type StreamHandlerOptions struct {
 	Interval time.Duration
 	// AllowRemote 与 /metrics 共享访问策略。
 	AllowRemote bool
+	// AllowedCIDRs 与 /metrics 共享。
+	AllowedCIDRs []string
 }
 
 // StreamHandler 返回挂载 /stats/stream 的 http.Handler,按 Interval 周期
 // 推送 /stats JSON 快照,适合 TUI 实时面板与简易 dashboard 集成。
 func StreamHandler(reg *Registry, opts StreamHandlerOptions) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !authorize(r, HandlerOptions{AllowRemote: opts.AllowRemote}) {
+		if !authorize(r, HandlerOptions{AllowRemote: opts.AllowRemote, AllowedCIDRs: opts.AllowedCIDRs}) {
 			http.Error(w, "stats stream access denied", http.StatusForbidden)
 			return
 		}

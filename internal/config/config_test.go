@@ -3,13 +3,14 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestLoadConfigFileAndEnv(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "env-openai-key")
-	t.Setenv("AI_PROXY_PORT", "18080")
+	t.Setenv("AI_PROXY_LISTEN_ADDR", "127.0.0.1:18080")
 	t.Setenv("AI_PROXY_INTERACTION_RETENTION", "")
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(`
@@ -25,6 +26,12 @@ providers:
     api_key: ${OPENAI_API_KEY}
     models: deepseek*
     fallbacks: openai, custom
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+  custom:
+    base_url: https://custom.example
+    api_key: test
 default_provider: deepseek
 `), 0o644); err != nil {
 		t.Fatal(err)
@@ -34,7 +41,7 @@ default_provider: deepseek
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ListenAddr != ":18080" {
+	if cfg.ListenAddr != "127.0.0.1:18080" {
 		t.Fatalf("listen addr = %s", cfg.ListenAddr)
 	}
 	if cfg.Providers["deepseek"].APIKey != "env-openai-key" {
@@ -249,7 +256,7 @@ providers:
 func TestLoadParsesMetricsFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	body := `server:
-  port: 9090
+  listen_addr: 127.0.0.1:9090
   metrics_remote_access: true
   metrics_allowed_cidrs: 10.0.0.0/8, 192.168.0.0/16
 providers:
@@ -264,7 +271,7 @@ providers:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ListenAddr != ":9090" {
+	if cfg.ListenAddr != "127.0.0.1:9090" {
 		t.Fatalf("listen = %q", cfg.ListenAddr)
 	}
 	if !cfg.MetricsRemoteAccess {
@@ -272,6 +279,148 @@ providers:
 	}
 	if len(cfg.MetricsAllowedCIDRs) != 2 {
 		t.Fatalf("cidrs = %v, want 2 entries", cfg.MetricsAllowedCIDRs)
+	}
+}
+
+func TestLoadRejectsNonLoopbackWithoutInboundKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  listen_addr: 0.0.0.0:8080
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected non-loopback without inbound_api_key to fail")
+	}
+	if !strings.Contains(err.Error(), "inbound_api_key") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestLoadAllowsNonLoopbackWithInboundKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  listen_addr: 0.0.0.0:8080
+  inbound_api_key: secret-key
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.InboundAPIKey != "secret-key" {
+		t.Fatalf("InboundAPIKey = %q", cfg.InboundAPIKey)
+	}
+}
+
+func TestLoadRejectsUnknownKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  typo_key: true
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected unknown key error")
+	}
+	if !strings.Contains(err.Error(), "unknown config key") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestLoadRejectsInvalidBool(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  debug_log: maybe
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected invalid bool error")
+	}
+	if !strings.Contains(err.Error(), "invalid boolean") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestLoadRejectsUnknownProtocol(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  custom:
+    base_url: https://example.com
+    api_key: test
+    protocol: graphql
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected unknown protocol error")
+	}
+	if !strings.Contains(err.Error(), "unknown protocol") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestLoadRejectsMissingFallback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+    fallbacks: missing-provider
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected missing fallback error")
+	}
+	if !strings.Contains(err.Error(), "fallback") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestIsLoopbackListenAddr(t *testing.T) {
+	cases := map[string]bool{
+		"127.0.0.1:8080": true,
+		"[::1]:8080":     true,
+		"localhost:8080": true,
+		":8080":          false,
+		"0.0.0.0:8080":   false,
+		"192.168.1.1:80": false,
+		"":               false,
+	}
+	for addr, want := range cases {
+		if got := IsLoopbackListenAddr(addr); got != want {
+			t.Fatalf("IsLoopbackListenAddr(%q)=%v want %v", addr, got, want)
+		}
 	}
 }
 
@@ -314,5 +463,163 @@ providers:
 	}
 	if cfg.LogFormat != "json" {
 		t.Fatalf("log format = %q, want env override json", cfg.LogFormat)
+	}
+}
+
+func TestLoadRejectsInvalidEnv(t *testing.T) {
+	t.Setenv("AI_PROXY_DEBUG_LOG", "maybe")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected invalid env bool to fail")
+	}
+	if !strings.Contains(err.Error(), "AI_PROXY_DEBUG_LOG") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestLoadRejectsInvalidMaxBodyEnv(t *testing.T) {
+	t.Setenv("AI_PROXY_MAX_REQUEST_BODY_BYTES", "invalid")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected invalid env int to fail")
+	}
+	if !strings.Contains(err.Error(), "AI_PROXY_MAX_REQUEST_BODY_BYTES") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestAddrFromPortUsesLoopback(t *testing.T) {
+	if got := addrFromPort("8080"); got != "127.0.0.1:8080" {
+		t.Fatalf("addrFromPort(8080) = %q", got)
+	}
+	if got := addrFromPort(":9090"); got != "127.0.0.1:9090" {
+		t.Fatalf("addrFromPort(:9090) = %q", got)
+	}
+	if got := addrFromPort("0.0.0.0:8080"); got != "0.0.0.0:8080" {
+		t.Fatalf("addrFromPort full = %q", got)
+	}
+}
+
+func TestLoadRejectsInvalidBaseURL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  bad:
+    base_url: not-a-url
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected invalid base_url error")
+	}
+	if !strings.Contains(err.Error(), "base_url") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestLoadRejectsNonHTTPBaseURL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  bad:
+    base_url: ftp://example.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected scheme error")
+	}
+}
+
+func TestLoadRejectsCaseFoldProviderDuplicate(t *testing.T) {
+	// 通过直接构造 Config 测 normalize:大小写折叠后重复 provider 应启动失败。
+	cfg := Config{
+		ListenAddr: "127.0.0.1:8080",
+		Providers: map[string]Provider{
+			"OpenAI": {Name: "OpenAI", Protocol: "openai", BaseURL: "https://api.openai.com", APIKey: "a"},
+			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://api.openai.com", APIKey: "b"},
+		},
+	}
+	if err := normalize(&cfg); err == nil {
+		t.Fatal("expected case-fold duplicate provider error")
+	}
+}
+
+func TestLoadRejectsCaseFoldModelCatalogDuplicate(t *testing.T) {
+	cfg := Config{
+		ListenAddr: "127.0.0.1:8080",
+		Providers: map[string]Provider{
+			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://api.openai.com", APIKey: "a"},
+		},
+		ModelCatalog: map[string]ModelInfo{
+			"GPT-4o": {ID: "GPT-4o"},
+			"gpt-4o": {ID: "gpt-4o"},
+		},
+	}
+	if err := normalize(&cfg); err == nil {
+		t.Fatal("expected case-fold duplicate model error")
+	}
+}
+
+func TestLoadRejectsInvalidSLOWebhook(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  listen_addr: 127.0.0.1:8080
+  slo_violation_webhook: not-a-url
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected invalid webhook error")
+	}
+	if !strings.Contains(err.Error(), "slo_violation_webhook") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestLoadRejectsNonHTTPWebhook(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  listen_addr: 127.0.0.1:8080
+  slo_violation_webhook: ftp://hooks.example/secret
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected scheme error")
 	}
 }

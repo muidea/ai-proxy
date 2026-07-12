@@ -15,6 +15,8 @@ type openAIStreamAccumulator struct {
 	Content      strings.Builder
 	FinishReason string
 	Usage        tokenUsage
+	maxContent   int // 0 = unlimited
+	truncated    bool
 }
 
 func newOpenAIStreamAccumulator(fallbackModel string) *openAIStreamAccumulator {
@@ -25,6 +27,41 @@ func newOpenAIStreamAccumulator(fallbackModel string) *openAIStreamAccumulator {
 		Created: time.Now().Unix(),
 		Role:    "assistant",
 	}
+}
+
+// SetMaxContent 限制完整响应累积字节;超限后停止写入 content,避免无界内存增长。
+func (a *openAIStreamAccumulator) SetMaxContent(n int64) {
+	if a == nil || n <= 0 {
+		return
+	}
+	if n > int64(^uint(0)>>1) {
+		a.maxContent = int(^uint(0) >> 1)
+		return
+	}
+	a.maxContent = int(n)
+}
+
+func (a *openAIStreamAccumulator) Truncated() bool {
+	return a != nil && a.truncated
+}
+
+func (a *openAIStreamAccumulator) appendContent(text string) {
+	if a == nil || text == "" || a.truncated {
+		return
+	}
+	if a.maxContent > 0 {
+		remaining := a.maxContent - a.Content.Len()
+		if remaining <= 0 {
+			a.truncated = true
+			return
+		}
+		if len(text) > remaining {
+			a.Content.WriteString(text[:remaining])
+			a.truncated = true
+			return
+		}
+	}
+	a.Content.WriteString(text)
 }
 
 func (a *openAIStreamAccumulator) TrackSSELine(line []byte) {
@@ -69,16 +106,16 @@ func (a *openAIStreamAccumulator) TrackDataPayload(payload string) {
 			if role, ok := delta["role"].(string); ok && role != "" {
 				a.Role = role
 			}
-			a.Content.WriteString(flattenValue(delta["content"]))
+			a.appendContent(flattenValue(delta["content"]))
 		}
 		if message, ok := choice["message"].(map[string]any); ok {
 			if role, ok := message["role"].(string); ok && role != "" {
 				a.Role = role
 			}
-			a.Content.WriteString(flattenValue(message["content"]))
+			a.appendContent(flattenValue(message["content"]))
 		}
 		if text, ok := choice["text"].(string); ok {
-			a.Content.WriteString(text)
+			a.appendContent(text)
 		}
 	}
 }
@@ -154,6 +191,8 @@ type anthropicRawStreamAccumulator struct {
 	OutputTokens             int
 	CachedInputTokens        int
 	CacheCreationInputTokens int
+	maxContent               int
+	truncated                bool
 }
 
 func newAnthropicRawStreamAccumulator(fallbackModel string) *anthropicRawStreamAccumulator {
@@ -161,6 +200,40 @@ func newAnthropicRawStreamAccumulator(fallbackModel string) *anthropicRawStreamA
 		ID:    "msg_stream",
 		Model: fallbackModel,
 	}
+}
+
+func (a *anthropicRawStreamAccumulator) SetMaxContent(n int64) {
+	if a == nil || n <= 0 {
+		return
+	}
+	if n > int64(^uint(0)>>1) {
+		a.maxContent = int(^uint(0) >> 1)
+		return
+	}
+	a.maxContent = int(n)
+}
+
+func (a *anthropicRawStreamAccumulator) Truncated() bool {
+	return a != nil && a.truncated
+}
+
+func (a *anthropicRawStreamAccumulator) appendContent(text string) {
+	if a == nil || text == "" || a.truncated {
+		return
+	}
+	if a.maxContent > 0 {
+		remaining := a.maxContent - a.Content.Len()
+		if remaining <= 0 {
+			a.truncated = true
+			return
+		}
+		if len(text) > remaining {
+			a.Content.WriteString(text[:remaining])
+			a.truncated = true
+			return
+		}
+	}
+	a.Content.WriteString(text)
 }
 
 func (a *anthropicRawStreamAccumulator) TrackSSELine(line []byte) {
@@ -195,7 +268,7 @@ func (a *anthropicRawStreamAccumulator) TrackSSELine(line []byte) {
 	case "content_block_delta":
 		if delta, ok := event["delta"].(map[string]any); ok {
 			if text, ok := delta["text"].(string); ok {
-				a.Content.WriteString(text)
+				a.appendContent(text)
 			}
 		}
 	case "message_delta":
@@ -262,4 +335,129 @@ func anthropicUsagePayload(usage tokenUsage) map[string]any {
 		payload["cache_creation_input_tokens"] = usage.CacheCreationInputTokens
 	}
 	return payload
+}
+
+// responsesStreamAccumulator 解析 OpenAI Responses API SSE。
+// 提取 response.output_text.delta 文本与 response.completed 内嵌 usage。
+type responsesStreamAccumulator struct {
+	ID         string
+	Model      string
+	Content    strings.Builder
+	Usage      tokenUsage
+	maxContent int
+	truncated  bool
+	Status     string // completed / failed / incomplete
+}
+
+func newResponsesStreamAccumulator(fallbackModel string) *responsesStreamAccumulator {
+	return &responsesStreamAccumulator{Model: fallbackModel}
+}
+
+func (a *responsesStreamAccumulator) SetMaxContent(n int64) {
+	if a == nil || n <= 0 {
+		return
+	}
+	if n > int64(^uint(0)>>1) {
+		a.maxContent = int(^uint(0) >> 1)
+		return
+	}
+	a.maxContent = int(n)
+}
+
+func (a *responsesStreamAccumulator) Truncated() bool {
+	return a != nil && a.truncated
+}
+
+func (a *responsesStreamAccumulator) appendContent(text string) {
+	if a == nil || text == "" || a.truncated {
+		return
+	}
+	if a.maxContent > 0 {
+		remaining := a.maxContent - a.Content.Len()
+		if remaining <= 0 {
+			a.truncated = true
+			return
+		}
+		if len(text) > remaining {
+			a.Content.WriteString(text[:remaining])
+			a.truncated = true
+			return
+		}
+	}
+	a.Content.WriteString(text)
+}
+
+func (a *responsesStreamAccumulator) TrackSSELine(line []byte) {
+	trimmed := strings.TrimSpace(string(line))
+	if !strings.HasPrefix(trimmed, "data:") {
+		return
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		return
+	}
+	typ, _ := event["type"].(string)
+	switch typ {
+	case "response.created", "response.in_progress":
+		if resp, ok := event["response"].(map[string]any); ok {
+			if id, ok := resp["id"].(string); ok && id != "" {
+				a.ID = id
+			}
+			if model, ok := resp["model"].(string); ok && model != "" {
+				a.Model = model
+			}
+		}
+	case "response.output_text.delta":
+		if delta, ok := event["delta"].(string); ok {
+			a.appendContent(delta)
+		}
+	case "response.completed", "response.failed", "response.incomplete":
+		if resp, ok := event["response"].(map[string]any); ok {
+			if id, ok := resp["id"].(string); ok && id != "" {
+				a.ID = id
+			}
+			if model, ok := resp["model"].(string); ok && model != "" {
+				a.Model = model
+			}
+			if status, ok := resp["status"].(string); ok {
+				a.Status = status
+			} else {
+				a.Status = strings.TrimPrefix(typ, "response.")
+			}
+			if usage, ok := resp["usage"].(map[string]any); ok {
+				if n, ok := numberAsInt(usage["input_tokens"]); ok {
+					a.Usage.PromptTokens = n
+					a.Usage.Known = true
+				}
+				if n, ok := numberAsInt(usage["output_tokens"]); ok {
+					a.Usage.CompletionTokens = n
+					a.Usage.Known = true
+				}
+				// 可选缓存字段
+				if details, ok := usage["input_tokens_details"].(map[string]any); ok {
+					if n, ok := numberAsInt(details["cached_tokens"]); ok {
+						a.Usage.CachedInputTokens = n
+					}
+				}
+			}
+		}
+	}
+}
+
+func (a *responsesStreamAccumulator) FinalizeUsage(requestBody map[string]any) tokenUsage {
+	usage := a.Usage
+	if !usage.Known {
+		usage = tokenUsage{
+			PromptTokens:     estimatePromptTokens(requestBody),
+			CompletionTokens: estimateTokens(a.Content.String()),
+			Estimated:        true,
+			Known:            true,
+		}
+		a.Usage = usage
+	}
+	return usage
 }

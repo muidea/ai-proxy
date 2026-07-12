@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"sync"
 )
 
 // Fingerprint 算法常量。stablePrefixBytes 是输入截取长度。
@@ -85,7 +86,12 @@ func firstNBytes(b []byte, n int) []byte {
 
 // FingerprintDriftTracker 跟踪最近 N 次请求的 stable prefix hash,
 // 命中连续漂移时记一个 stable_prefix_drift 事件。
+//
+// 注意:这是进程级全局序列检测,跨并发请求与不同 model 混合观察;
+// 语义是“近期请求 stable prefix 是否连续变化”,而非单会话/单 model 漂移。
+// 并发安全:所有可变状态由 mu 保护。
 type FingerprintDriftTracker struct {
+	mu        sync.Mutex
 	threshold int
 	prev      string
 	consec    int
@@ -106,6 +112,8 @@ func (d *FingerprintDriftTracker) Observe(hash string) (drift bool, consecutiveD
 	if d == nil {
 		return false, 0
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.prev == "" {
 		d.prev = hash
 		return false, 0
@@ -126,6 +134,8 @@ func (d *FingerprintDriftTracker) Reset() {
 	if d == nil {
 		return
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.prev = ""
 	d.consec = 0
 }

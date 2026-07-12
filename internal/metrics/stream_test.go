@@ -12,7 +12,7 @@ import (
 
 func TestStreamHandlerSendsInitialSnapshot(t *testing.T) {
 	r := NewRegistry()
-	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 50*time.Millisecond)
+	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 50*time.Millisecond, "success")
 	h := StreamHandler(r, StreamHandlerOptions{AllowRemote: true, Interval: 50 * time.Millisecond})
 
 	srv := httptest.NewServer(h)

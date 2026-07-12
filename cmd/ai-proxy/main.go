@@ -11,11 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"ai-proxy/internal/archive"
 	"ai-proxy/internal/config"
-	"ai-proxy/internal/metrics"
 	"ai-proxy/internal/proxy"
-	"ai-proxy/internal/stats"
 )
 
 func main() {
@@ -29,51 +26,12 @@ func main() {
 	}
 	proxy.ConfigureLogger(cfg.LogFormat, cfg.DebugLog)
 
-	recorder := stats.NewCSVRecorder(cfg.UsageFile)
-	interactionRecorder, err := archive.NewRecorder(cfg.InteractionDir, cfg.InteractionRetention)
+	application, err := buildApp(cfg)
 	if err != nil {
-		slog.Error("init interaction recorder", slog.Any("error", err))
+		slog.Error("build app", slog.Any("error", err))
 		os.Exit(1)
 	}
-	registry := metrics.NewRegistry()
-	handler := proxy.NewHandler(cfg, recorder, interactionRecorder, registry)
-	metricsHandler := metrics.Handler(registry, metrics.HandlerOptions{AllowRemote: cfg.MetricsRemoteAccess})
-	streamHandler := metrics.StreamHandler(registry, metrics.StreamHandlerOptions{AllowRemote: cfg.MetricsRemoteAccess})
-
-	// SLO evaluator:周期检查当前聚合是否满足阈值,命中时通过 slog 输出。
-	evaluator := metrics.NewSLOEvaluator(registry, metrics.SLOConfig{
-		CacheHitRateMin:      cfg.SLO.CacheHitRateMin,
-		UpstreamErrorRateMax: cfg.SLO.UpstreamErrorRateMax,
-		P99LatencyMaxMS:      cfg.SLO.P99LatencyMaxMS,
-		CheckInterval:        time.Duration(cfg.SLO.CheckIntervalSeconds) * time.Second,
-	}, cfg.SLO.ViolationWebhook, func(v metrics.SLOViolation) {
-		slog.Warn("slo violation",
-			slog.String("provider", v.Provider),
-			slog.String("rule", v.Rule),
-			slog.Float64("observed", v.Observed),
-			slog.Float64("threshold", v.Threshold),
-			slog.String("detail", v.Detail),
-		)
-	})
-	sloCtx, sloCancel := context.WithCancel(context.Background())
-	if cfg.SLO.CheckIntervalSeconds > 0 {
-		go evaluator.Run(sloCtx)
-	}
-	defer sloCancel()
-
-	mux := http.NewServeMux()
-	// 可观测性端点优先注册,避免被 proxy 兜底逻辑抢走。
-	mux.Handle("/metrics", metricsHandler)
-	mux.Handle("/stats", metricsHandler)
-	mux.Handle("/stats/stream", streamHandler)
-	mux.Handle("/healthz", handler)
-	mux.Handle("/", handler)
-
-	server := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	defer application.Close()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -83,7 +41,7 @@ func main() {
 			slog.String("interactions", cfg.InteractionDir),
 			slog.String("metrics", metricsURL(cfg.MetricsRemoteAccess)),
 		)
-		errCh <- server.ListenAndServe()
+		errCh <- application.server.ListenAndServe()
 	}()
 
 	stop := make(chan os.Signal, 1)
@@ -101,15 +59,8 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
+	if err := application.server.Shutdown(ctx); err != nil {
 		slog.Error("shutdown", slog.Any("error", err))
 		os.Exit(1)
 	}
-}
-
-func metricsURL(remote bool) string {
-	if remote {
-		return "remote-access"
-	}
-	return "loopback-only"
 }

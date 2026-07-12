@@ -105,7 +105,9 @@ func (h *Handler) archiveAndLogClientRequest(round *archive.Round, r *http.Reque
 		ContentLength: r.ContentLength,
 		BodyBytes:     bodyBytes,
 		Headers:       sanitizeHeaders(r.Header),
-		BodyPath:      "request.json",
+	}
+	if round.HasFile("request.json") {
+		info.BodyPath = "request.json"
 	}
 	if err := round.WriteJSON("request.meta.json", info); err != nil {
 		log.Printf("archive request metadata: %v", err)

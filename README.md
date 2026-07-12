@@ -1,3 +1,68 @@
+## usage.csv
+
+`usage_file`（默认 `usage.csv`）为**单进程本地追加文件**：
+
+- 每个 ai-proxy 进程必须使用独立路径；
+- 多副本/多实例**不要**挂载同一 `usage.csv`（否则可能行交错、schema 轮转竞态、备份覆盖）；
+- 需要集中统计时请用 Prometheus `/metrics` 或外部采集，而不是共享 CSV。
+
+## SLO webhook
+
+可选配置 `slo_violation_webhook`：SLO **状态变化**时异步 POST JSON。
+
+载荷 `SLOWebhookPayload`：
+
+```json
+{
+  "at": "...",
+  "instance_id": "a1b2c3d4e5f607081122334455667788",
+  "seq": 1,
+  "entered": [{"provider":"openai","rule":"upstream_error_rate_max","generation":1,"event_id":"a1b2c3d4e5f607081122334455667788|openai|upstream_error_rate_max|1|entered", "...": "..."}],
+  "resolved": []
+}
+```
+
+- **仅状态变化通知**：持续违规不会每个巡检周期重复投递；恢复时发送 `resolved`
+- **评估层 vs 投递层**：`active` 只驱动本地 listener 一次；webhook 失败可延期重投，不重放 listener
+- **顺序与幂等（重启安全）**：
+  - `instance_id`：evaluator **启动时随机生成**，进程重启后变化；**仅在同一 instance 内**比较 `seq`
+  - `seq`：实际投递序号，本 instance 内每次（重）入队递增；对账后重投会 reseq
+  - 每条 violation 的 `event_id`：`instance|provider|rule|generation|state`，**单条状态变化幂等键**；对账裁剪 batch 后剩余条目 ID 不变
+  - 每条 violation 含 `generation`（生命周期代次）；重投前按 generation 对账
+  - **消费者应**：按 `event_id` 幂等去重；按 `(instance_id, seq)` 拒绝倒序（跨 instance 不要比较 seq）
+  - `CheckNow` 经互斥串行；单 worker 串行投递
+  - **listener 禁止重入** `CheckNow`（同步回调，重入会死锁）
+- 本地 listener：`entered` → WARN `slo violation`；`resolved` → INFO `slo recovered`
+- 有界队列（64）+ 单 worker；队列满时丢弃并计数
+- 单次超时 3s；网络/408/425/429/5xx 可重试（最多 3 次 attempt）；429 优先 `Retry-After`（秒或 HTTP-date，上限 30s）
+- 失败不在 worker 内长 sleep：写入 `undelivered`+`NextRetry`，下轮 `CheckNow` flush（上限 32 批）
+- 其他 4xx 视为永久失败；禁用自动重定向；失败写日志（host 脱敏）
+- **shutdown**：`Close()` 取消共享 context，中断在途 HTTP；剩余队列与 `undelivered` **计入** `dropped` 并清空（`queue_length=0`）
+- Prometheus（需挂接 evaluator，进程默认已挂）：
+  - `ai_proxy_slo_webhook_dropped_total`
+  - `ai_proxy_slo_webhook_queue_length`（内存队列 + undelivered）
+  - `ai_proxy_slo_webhook_requests_total{result="ok|error|non_2xx|canceled"}`
+
+## 请求 outcome 枚举
+
+流式首包 HTTP 200 后中途失败时，HTTP 状态无法改写；以 `outcome` 区分真实结果（CSV / Prometheus / metadata 一致）：
+
+| outcome | 含义 | 计入 upstream 错误率 |
+|---------|------|---------------------|
+| `success` | 正常完成 | 否 |
+| `client_canceled` | 客户端取消 | 否 |
+| `idle_timeout` | 流空闲超时 | 是 |
+| `limit_exceeded` | 本地体/流大小限制 | 否 |
+| `upstream_truncated` | 上游中途断流/无终止事件 | 是 |
+| `upstream_failed` | 上游显式失败（如 `response.failed`） | 是 |
+| `incomplete` | 上游未完成（如 `response.incomplete`） | 否 |
+| `client_write` | 写客户端失败 | 否 |
+| `conversion` | 协议转换不支持的能力 | 否 |
+| `protocol` | 上游 SSE/JSON 协议损坏 | 是 |
+| `error` | 其他错误（含非流式 4xx/5xx） | 否（非流式已按状态码计数） |
+
+Prometheus: `ai_proxy_requests_total{...,status,outcome}`；`/stats` 含 `requests.by_outcome`。
+
 # ai-proxy
 
 轻量级本地 LLM API 网关。客户端只访问统一标准入站 path（OpenAI 与 Anthropic），代理**仅按请求 `model`** 匹配上游 provider，并在需要时做基础协议转换。请求结束后把模型、耗时、token 用量和缓存命中统计追加到 `usage.csv`，同时按轮次归档请求和响应内容。
@@ -32,15 +97,19 @@ cp config.example.yaml config.yaml
 
 ```bash
 export OPENAI_API_KEY=sk-...
-export AI_PROXY_PORT=8080
+export AI_PROXY_LISTEN_ADDR=127.0.0.1:8080
 make run
 ```
 
 常用环境变量：
 
 - `AI_PROXY_CONFIG`: 配置文件路径。
-- `AI_PROXY_PORT`: 监听端口。
 - `AI_PROXY_LISTEN_ADDR`: 完整监听地址，例如 `127.0.0.1:8080`。
+- `AI_PROXY_PORT`: 仅修改端口，生成 `127.0.0.1:<port>`（不再绑定全部网卡；若需监听全网卡请显式设置 `AI_PROXY_LISTEN_ADDR=:8080` 并配置 `inbound_api_key`）。
+- `AI_PROXY_INBOUND_API_KEY`: 入站 API Key。监听非 loopback 时**必须**配置；客户端通过 `Authorization: Bearer <key>` 或 `X-API-Key` 提交。
+- `AI_PROXY_MAX_REQUEST_BODY_BYTES` / `AI_PROXY_MAX_UPSTREAM_RESPONSE_BYTES`: 请求体与上游响应大小上限。
+- `AI_PROXY_MAX_STREAM_BYTES` / `AI_PROXY_MAX_SSE_LINE_BYTES`: 流式累计输出与单条 SSE 行上限。
+- `AI_PROXY_ARCHIVE_FULL_CONTENT`: `true|false`，是否落盘完整请求/响应正文。
 - `AI_PROXY_USAGE_FILE`: 用量 CSV 文件路径。
 - `AI_PROXY_INTERACTION_DIR`: 交互归档目录，默认 `interactions`。
 - `AI_PROXY_INTERACTION_RETENTION`: 保留的交互归档轮数，默认 `500`。
@@ -126,13 +195,13 @@ model_catalog:
   |---|---|---|
   | OpenAI 路径 | openai | 直通 |
   | `/v1/messages` | anthropic | 直通 |
-  | `/v1/chat/completions` | anthropic | OpenAI→Anthropic 基础转换（含 fallback） |
-  | `/v1/messages` | openai | Anthropic→OpenAI 基础转换（含 fallback） |
+  | `/v1/chat/completions` | anthropic | OpenAI→Anthropic 文本转换（含 fallback）；tools/多模态/tool_calls 返回 400 |
+  | `/v1/messages` | openai | Anthropic→OpenAI 文本转换（含 fallback）；tools/多模态/tool_use 返回 400 |
   | 其它 OpenAI 路径 | anthropic | 400（不支持该端点转换） |
 
 如果 `base_url` 已包含 `/v1`（含嵌套如 `.../codex/v1`），代理会避免重复拼接版本路径。
 
-fallback 尝试归档到 `fallback_attempts.json`；`usage.csv` / `metadata.json` 记录实际返回的 provider。流式响应仅在写出首包 SSE 前可 fallback。
+fallback 尝试归档到 `fallback_attempts.json`；`usage.csv` / `metadata.json` 记录实际返回的 provider。流式响应在写出首包 SSE 前可 fallback：收到上游 HTTP 2xx 后会先探测首字节，若在首字节前断流/超时则继续切换同协议备用 provider。
 
 一个带 fallback 的 provider 示例（注意 `models` 互不重叠）：
 
@@ -269,7 +338,7 @@ make check
 `usage.csv` 首次写入会生成表头：
 
 ```text
-time,provider,model,input_tokens,output_tokens,total_tokens,duration_ms,stream,estimated,http_status,cached_input_tokens,cache_creation_input_tokens,cache_hit_rate
+time,provider,model,input_tokens,output_tokens,total_tokens,duration_ms,stream,estimated,http_status,outcome,cached_input_tokens,cache_creation_input_tokens,cache_hit_rate
 ```
 
 `cache_hit_rate` 按 `cached_input_tokens / input_tokens` 计算，CSV 中保留 4 位小数。没有上游 `usage` 时，`estimated=true` 表示 token 用量来自本地轻量估算；缓存字段无法估算时记为 `0`。
@@ -298,7 +367,7 @@ interactions/
     metadata.json
 ```
 
-非流式响应通常写入 `response.json`；流式响应会同时写入原始 `response.sse` 和整理后的完整 `response.json`。OpenAI-compatible SSE 会合并 `delta` 为完整 `chat.completion`；Anthropic SSE 会合并为完整 Messages 响应。`request.meta.json` 记录客户端方法、路径、查询参数、来源地址、User-Agent、Content-Length 和脱敏后的请求头；`upstream_request.json` 与 `upstream_response.json` 记录最终一次上游请求/响应；`fallback_attempts.json` 记录每次尝试的 provider、协议、状态码/错误、耗时和是否为 fallback；`metadata.json` 汇总最终 provider、model、耗时、HTTP 状态、token 统计、缓存读写 token 和缓存命中率，流式响应会额外记录 `full_response_path`。
+非流式响应通常写入 `response.json`。流式响应始终写入原始 `response.sse`；其中 Chat Completions / Completions 与 Anthropic Messages 还会整理出完整 `response.json`（合并 delta / content_block）。**Responses API（`/v1/responses`）当前只保留原始 `response.sse`**，不生成整理后的 `response.json`（事件结构与 Chat Completions 不同）。`request.meta.json` 记录客户端方法、路径、查询参数、来源地址、User-Agent、Content-Length 和脱敏后的请求头；`upstream_request.json` 与 `upstream_response.json` 记录最终一次上游请求/响应；`fallback_attempts.json` 记录每次尝试的 provider、协议、状态码/错误、耗时和是否为 fallback；`metadata.json` 汇总最终 provider、model、耗时、HTTP 状态、token 统计、缓存读写 token 和缓存命中率，流式响应会额外记录 `full_response_path`。
 
 调试日志默认输出到终端，包含每轮 round id、客户端请求摘要、provider/model 选择、上游请求、上游响应和最终 token 摘要。`Authorization`、`X-API-Key`、`Cookie` 等敏感头会显示为 `<redacted>`。
 最终 token 摘要也会带 `round`，并在流式读取中断、客户端写入失败等场景附带 `error`；对应错误也会写入该轮 `metadata.json`，便于并发请求交错时追踪完整生命周期。

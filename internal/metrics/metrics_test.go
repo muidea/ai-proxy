@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +13,7 @@ import (
 func TestRegistryNilSafe(t *testing.T) {
 	var r *Registry
 	// 所有 Record* 方法在 r==nil 时必须静默返回,不允许 panic。
-	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 100*time.Millisecond)
+	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 100*time.Millisecond, "success")
 	r.RecordTokens("openai", "gpt-4", 10, 5, 0, 0)
 	r.RecordUpstreamError("openai", 502)
 	r.RecordFallbackAttempt("openai", "deepseek", "502")
@@ -26,9 +27,9 @@ func TestRegistryNilSafe(t *testing.T) {
 
 func TestRegistryCounters(t *testing.T) {
 	r := NewRegistry()
-	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 100*time.Millisecond)
-	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 200*time.Millisecond)
-	r.RecordRequest("openai", "gpt-4", "chat_completions", 500, 300*time.Millisecond)
+	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 100*time.Millisecond, "success")
+	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 200*time.Millisecond, "success")
+	r.RecordRequest("openai", "gpt-4", "chat_completions", 500, 300*time.Millisecond, "success")
 	r.RecordTokens("openai", "gpt-4", 100, 50, 30, 5)
 	r.RecordTokens("openai", "gpt-4", 200, 100, 0, 0)
 	r.RecordUpstreamError("openai", 502)
@@ -40,8 +41,8 @@ func TestRegistryCounters(t *testing.T) {
 	}
 	out := buf.String()
 
-	mustContain(t, out, `ai_proxy_requests_total{provider="openai",model="gpt-4",route="chat_completions",status="2xx"} 2`)
-	mustContain(t, out, `ai_proxy_requests_total{provider="openai",model="gpt-4",route="chat_completions",status="5xx"} 1`)
+	mustContain(t, out, `ai_proxy_requests_total{provider="openai",model="gpt-4",route="chat_completions",status="2xx",outcome="success"} 2`)
+	mustContain(t, out, `ai_proxy_requests_total{provider="openai",model="gpt-4",route="chat_completions",status="5xx",outcome="success"} 1`)
 	mustContain(t, out, `ai_proxy_input_tokens_total{provider="openai",model="gpt-4"} 300`)
 	mustContain(t, out, `ai_proxy_output_tokens_total{provider="openai",model="gpt-4"} 150`)
 	mustContain(t, out, `ai_proxy_cached_input_tokens_total{provider="openai",model="gpt-4"} 30`)
@@ -55,16 +56,16 @@ func TestRegistryCounters(t *testing.T) {
 
 func TestRegistryDurationSummary(t *testing.T) {
 	r := NewRegistry()
-	r.RecordRequest("p", "m", "chat_completions", 200, 100*time.Millisecond)
-	r.RecordRequest("p", "m", "chat_completions", 200, 300*time.Millisecond)
+	r.RecordRequest("p", "m", "chat_completions", 200, 100*time.Millisecond, "success")
+	r.RecordRequest("p", "m", "chat_completions", 200, 300*time.Millisecond, "success")
 	var buf strings.Builder
 	if err := r.WritePrometheus(&buf); err != nil {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	mustContain(t, out, `ai_proxy_request_duration_seconds_count{provider="p",model="m",route="chat_completions",status="2xx"} 2`)
+	mustContain(t, out, `ai_proxy_request_duration_seconds_count{provider="p",model="m",route="chat_completions",status="2xx",outcome="success"} 2`)
 	// sum = 0.4s
-	if !strings.Contains(out, `ai_proxy_request_duration_seconds_sum{provider="p",model="m",route="chat_completions",status="2xx"} 0.4`) {
+	if !strings.Contains(out, `ai_proxy_request_duration_seconds_sum{provider="p",model="m",route="chat_completions",status="2xx",outcome="success"} 0.4`) {
 		t.Fatalf("expected 0.4 in output: %s", out)
 	}
 }
@@ -72,7 +73,7 @@ func TestRegistryDurationSummary(t *testing.T) {
 func TestRegistryQuantiles(t *testing.T) {
 	r := NewRegistry()
 	for i := 1; i <= 100; i++ {
-		r.RecordRequest("p", "m", "chat_completions", 200, time.Duration(i)*time.Millisecond)
+		r.RecordRequest("p", "m", "chat_completions", 200, time.Duration(i)*time.Millisecond, "success")
 	}
 	summary := r.computeQuantiles()
 	got, ok := summary[latencyKey{Provider: "p", Model: "m"}]
@@ -89,9 +90,9 @@ func TestRegistryQuantiles(t *testing.T) {
 
 func TestStatsJSONShape(t *testing.T) {
 	r := NewRegistry()
-	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 100*time.Millisecond)
-	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 200*time.Millisecond)
-	r.RecordRequest("deepseek", "chat", "chat_completions", 200, 50*time.Millisecond)
+	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 100*time.Millisecond, "success")
+	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 200*time.Millisecond, "success")
+	r.RecordRequest("deepseek", "chat", "chat_completions", 200, 50*time.Millisecond, "success")
 	r.RecordTokens("openai", "gpt-4", 100, 50, 30, 0)
 	r.RecordTokens("openai", "gpt-4", 100, 50, 0, 0)
 	r.RecordTokens("deepseek", "chat", 50, 25, 50, 0)
@@ -151,7 +152,7 @@ func TestStatsJSONShape(t *testing.T) {
 
 func TestHandlerLoopbackOnly(t *testing.T) {
 	r := NewRegistry()
-	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 50*time.Millisecond)
+	r.RecordRequest("openai", "gpt-4", "chat_completions", 200, 50*time.Millisecond, "success")
 	h := Handler(r, HandlerOptions{AllowRemote: false})
 
 	t.Run("loopback allowed", func(t *testing.T) {
@@ -211,7 +212,7 @@ func TestHandlerLoopbackOnly(t *testing.T) {
 
 func TestHandlerHead(t *testing.T) {
 	r := NewRegistry()
-	r.RecordRequest("p", "m", "chat_completions", 200, 50*time.Millisecond)
+	r.RecordRequest("p", "m", "chat_completions", 200, 50*time.Millisecond, "success")
 	h := Handler(r, HandlerOptions{AllowRemote: true})
 	req := httptest.NewRequest(http.MethodHead, "/metrics", nil)
 	rec := httptest.NewRecorder()
@@ -228,5 +229,85 @@ func mustContain(t *testing.T, haystack, needle string) {
 	t.Helper()
 	if !strings.Contains(haystack, needle) {
 		t.Fatalf("expected output to contain %q, got:\n%s", needle, haystack)
+	}
+}
+
+func TestModelLabelCardinalityCapped(t *testing.T) {
+	reg := NewRegistry()
+	// 写入超过上限的 model,后续应归为 _other。
+	for i := 0; i < maxModelsPerProvider+10; i++ {
+		model := "gpt-model-" + strconv.Itoa(i)
+		reg.RecordRequest("openai", model, "chat_completions", 200, time.Millisecond, "success")
+		reg.RecordTokens("openai", model, 1, 1, 0, 0)
+	}
+	// 通过 Stats 或内部快照验证 knownModels 大小与 _other 存在。
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	if got := len(reg.knownModels["openai"]); got != maxModelsPerProvider {
+		t.Fatalf("known models = %d, want %d", got, maxModelsPerProvider)
+	}
+	// 应存在 _other 维度的请求计数
+	foundOther := false
+	for k := range reg.requestCount {
+		if k.Provider == "openai" && k.Model == otherModelLabel {
+			foundOther = true
+			break
+		}
+	}
+	if !foundOther {
+		t.Fatal("expected _other model label after cardinality overflow")
+	}
+}
+
+func TestUpstreamAttemptLatencySeparateFromCompleted(t *testing.T) {
+	reg := NewRegistry()
+	reg.RecordUpstreamAttempt("p", 500*time.Millisecond, AttemptHeader)
+	reg.RecordRequest("p", "m", "chat_completions", 200, 5*time.Millisecond, "success")
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	if len(reg.upstreamHeaderLatency["p"]) != 1 {
+		t.Fatalf("upstream samples = %d", len(reg.upstreamHeaderLatency["p"]))
+	}
+	// 完成请求延迟不应写入 attempt map
+	latKey := latencyKey{Provider: "p", Model: "m"}
+	if len(reg.latencySamples[latKey]) != 1 {
+		t.Fatalf("completed latency samples = %d", len(reg.latencySamples[latKey]))
+	}
+	// 空 model key 不应被 attempt 占用
+	empty := latencyKey{Provider: "p", Model: ""}
+	if len(reg.latencySamples[empty]) != 0 {
+		t.Fatalf("empty-model latency should be unused, got %d", len(reg.latencySamples[empty]))
+	}
+}
+
+func TestMetricsCIDRAllowlist(t *testing.T) {
+	r := NewRegistry()
+	h := Handler(r, HandlerOptions{
+		AllowRemote:  true,
+		AllowedCIDRs: []string{"10.0.0.0/8"},
+	})
+	// loopback always ok
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("loopback status = %d", rec.Code)
+	}
+	// allowed
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.RemoteAddr = "10.1.2.3:9999"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("allowed cidr status = %d", rec.Code)
+	}
+	// denied
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.RemoteAddr = "192.168.1.1:9999"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("denied status = %d", rec.Code)
 	}
 }

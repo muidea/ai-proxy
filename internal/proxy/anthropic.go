@@ -35,9 +35,13 @@ type anthropicRequest struct {
 // anthropic provider: 直通; openai provider: 转换为 chat/completions 再回写 Anthropic 形状。
 func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request, requestID string) {
 	start := time.Now()
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := h.readLimitedBody(w, r)
 	if err != nil {
-		http.Error(w, "read request body failed", http.StatusBadRequest)
+		status := http.StatusBadRequest
+		if isRequestTooLarge(err) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	defer r.Body.Close()
@@ -101,21 +105,29 @@ func (h *Handler) forwardAnthropicNative(w http.ResponseWriter, r *http.Request,
 
 	responsePath := responseFileName(resp.Header.Get("Content-Type"), strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "event-stream"))
 	if strings.HasSuffix(responsePath, ".sse") {
-		copyHeader(w.Header(), resp.Header)
+		copyResponseHeader(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		usage, fullPath, streamErr := h.copyAndArchiveRawStream(w, resp, round, providerName, provider, model, body, r.Context(), result.Cancel)
+		usage, fullPath, streamErr := h.copyAndArchiveRawStream(w, resp, round, providerName, provider, model, body, r.Context(), result.Cancel, r.URL.Path)
 		duration := time.Since(start)
-		h.recordAndPrint(round, r, providerName, model, true, resp.StatusCode, duration, usage, streamErr)
-		h.writeArchiveMetadata(round, providerName, model, true, resp.StatusCode, duration, usage, responsePath, streamErr, fullPath)
+		errMsg := ""
+		if streamErr != nil {
+			errMsg = streamErr.Error()
+		}
+		h.recordAndPrintFail(round, r, providerName, model, true, resp.StatusCode, duration, usage, streamErr)
+		h.writeArchiveMetadata(round, providerName, model, true, resp.StatusCode, duration, usage, responsePath, errMsg, fullPath, outcomeFromStreamFail(streamErr, resp.StatusCode))
 		return
 	}
-	responseBody, err := io.ReadAll(resp.Body)
-	readErrMessage := ""
+	responseBody, err := h.readLimitedUpstream(resp.Body)
 	if err != nil {
-		readErrMessage = h.logStreamIssue(round, providerName, model, "read anthropic response", err, nil, nil)
+		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
+		return
 	}
-	responseBody, responseHeader := decodedResponseBodyAndHeader(responseBody, resp.Header)
-	copyHeader(w.Header(), responseHeader)
+	responseBody, responseHeader, err := h.decodedResponseBodyAndHeader(responseBody, resp.Header)
+	if err != nil {
+		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
+		return
+	}
+	copyResponseHeader(w.Header(), responseHeader)
 	w.WriteHeader(resp.StatusCode)
 	if len(responseBody) > 0 {
 		_, _ = w.Write(responseBody)
@@ -128,8 +140,8 @@ func (h *Handler) forwardAnthropicNative(w http.ResponseWriter, r *http.Request,
 		usage = usageFromRawResponse(provider, responseBody, body)
 	}
 	duration := time.Since(start)
-	h.recordAndPrint(round, r, providerName, model, stream, resp.StatusCode, duration, usage, readErrMessage)
-	h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, usage, responsePath, readErrMessage, "")
+	h.recordAndPrint(round, r, providerName, model, stream, resp.StatusCode, duration, usage, "")
+	h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, usage, responsePath, "", "", "")
 }
 
 func (h *Handler) convertAnthropicMessagesToOpenAI(w http.ResponseWriter, r *http.Request, round *archive.Round, start time.Time, providerName string, provider config.Provider, body map[string]any, model string, stream bool) {
@@ -151,12 +163,12 @@ func (h *Handler) convertAnthropicMessagesToOpenAI(w http.ResponseWriter, r *htt
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		responseBody, err := io.ReadAll(resp.Body)
+		responseBody, err := h.readLimitedUpstream(resp.Body)
 		if err != nil {
 			h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 			return
 		}
-		copyHeader(w.Header(), resp.Header)
+		copyResponseHeader(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(responseBody)
 		responsePath := responseFileName(resp.Header.Get("Content-Type"), false)
@@ -165,7 +177,7 @@ func (h *Handler) convertAnthropicMessagesToOpenAI(w http.ResponseWriter, r *htt
 		}
 		duration := time.Since(start)
 		h.recordAndPrint(round, r, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, "")
-		h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, responsePath, "", "")
+		h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, responsePath, "", "", "")
 		return
 	}
 	if stream {
@@ -201,12 +213,12 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		responseBody, err := io.ReadAll(resp.Body)
+		responseBody, err := h.readLimitedUpstream(resp.Body)
 		if err != nil {
 			h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 			return
 		}
-		copyHeader(w.Header(), resp.Header)
+		copyResponseHeader(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(responseBody)
 		responsePath := responseFileName(resp.Header.Get("Content-Type"), false)
@@ -215,7 +227,7 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 		}
 		duration := time.Since(start)
 		h.recordAndPrint(round, r, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, "")
-		h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, responsePath, "", "")
+		h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, responsePath, "", "", "")
 		return
 	}
 	if stream {
@@ -226,6 +238,9 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 }
 
 func buildAnthropicRequest(body map[string]any, model string, stream bool) (anthropicRequest, error) {
+	if err := rejectUnsupportedConversionFeatures(body, "openai->anthropic"); err != nil {
+		return anthropicRequest{}, err
+	}
 	req := anthropicRequest{
 		Model:     model,
 		MaxTokens: 1024,
@@ -246,9 +261,21 @@ func buildAnthropicRequest(body map[string]any, model string, stream bool) (anth
 	}
 	var system []string
 	for _, item := range messages {
-		message, _ := item.(map[string]any)
+		message, ok := item.(map[string]any)
+		if !ok {
+			return req, fmt.Errorf("each message must be an object")
+		}
 		role, _ := message["role"].(string)
-		content := flattenValue(message["content"])
+		if _, hasTools := message["tool_calls"]; hasTools {
+			return req, fmt.Errorf("protocol conversion does not support tool_calls; use a native openai provider")
+		}
+		if role == "tool" {
+			return req, fmt.Errorf("protocol conversion does not support tool role messages; use a native openai provider")
+		}
+		content, err := extractTextContent(message["content"], "openai->anthropic")
+		if err != nil {
+			return req, err
+		}
 		switch role {
 		case "system":
 			if content != "" {
@@ -257,7 +284,7 @@ func buildAnthropicRequest(body map[string]any, model string, stream bool) (anth
 		case "assistant", "user":
 			req.Messages = append(req.Messages, anthropicMessage{Role: role, Content: content})
 		default:
-			req.Messages = append(req.Messages, anthropicMessage{Role: "user", Content: content})
+			return req, fmt.Errorf("protocol conversion does not support role %q; use a native provider", role)
 		}
 	}
 	req.System = strings.Join(system, "\n\n")
@@ -268,6 +295,9 @@ func buildAnthropicRequest(body map[string]any, model string, stream bool) (anth
 }
 
 func buildOpenAIChatFromAnthropic(body map[string]any, model string, stream bool) ([]byte, error) {
+	if err := rejectUnsupportedConversionFeatures(body, "anthropic->openai"); err != nil {
+		return nil, err
+	}
 	openAI := map[string]any{
 		"model":  model,
 		"stream": stream,
@@ -286,28 +316,99 @@ func buildOpenAIChatFromAnthropic(body map[string]any, model string, stream bool
 	}
 
 	messages := make([]any, 0)
-	if system := flattenValue(body["system"]); system != "" {
-		messages = append(messages, map[string]any{"role": "system", "content": system})
+	if systemRaw, ok := body["system"]; ok && systemRaw != nil {
+		system, err := extractTextContent(systemRaw, "anthropic->openai")
+		if err != nil {
+			return nil, err
+		}
+		if system != "" {
+			messages = append(messages, map[string]any{"role": "system", "content": system})
+		}
 	}
 	rawMessages, ok := body["messages"].([]any)
 	if !ok || len(rawMessages) == 0 {
 		return nil, fmt.Errorf("messages must be a non-empty array")
 	}
 	for _, item := range rawMessages {
-		message, _ := item.(map[string]any)
-		role, _ := message["role"].(string)
-		if role == "" {
-			role = "user"
+		message, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("each message must be an object")
 		}
-		content := flattenValue(message["content"])
+		role, _ := message["role"].(string)
+		switch role {
+		case "user", "assistant":
+		default:
+			return nil, fmt.Errorf("protocol conversion does not support role %q; use a native provider", role)
+		}
+		content, err := extractTextContent(message["content"], "anthropic->openai")
+		if err != nil {
+			return nil, err
+		}
 		messages = append(messages, map[string]any{"role": role, "content": content})
 	}
 	openAI["messages"] = messages
 	return json.Marshal(openAI)
 }
 
+// rejectUnsupportedConversionFeatures 拒绝协议转换无法保真的能力,避免静默破坏语义。
+func rejectUnsupportedConversionFeatures(body map[string]any, direction string) error {
+	unsupportedKeys := []string{"tools", "tool_choice", "functions", "function_call", "response_format"}
+	for _, key := range unsupportedKeys {
+		if _, ok := body[key]; ok {
+			return fmt.Errorf("%s conversion does not support %q; use a native provider", direction, key)
+		}
+	}
+	return nil
+}
+
+// extractTextContent 仅接受纯文本或文本 content blocks;图片/工具等明确拒绝。
+func extractTextContent(value any, direction string) (string, error) {
+	switch v := value.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return v, nil
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			switch part := item.(type) {
+			case string:
+				parts = append(parts, part)
+			case map[string]any:
+				typ, _ := part["type"].(string)
+				switch typ {
+				case "", "text":
+					text, _ := part["text"].(string)
+					if text == "" {
+						// OpenAI 某些块用 content 字段
+						text, _ = part["content"].(string)
+					}
+					parts = append(parts, text)
+				case "image", "image_url", "input_image", "tool_use", "tool_result", "input_audio", "audio", "document", "file":
+					return "", fmt.Errorf("%s conversion does not support content type %q; use a native provider", direction, typ)
+				default:
+					return "", fmt.Errorf("%s conversion does not support content type %q; use a native provider", direction, typ)
+				}
+			default:
+				return "", fmt.Errorf("%s conversion requires string or text content blocks", direction)
+			}
+		}
+		return strings.Join(parts, ""), nil
+	case map[string]any:
+		// Anthropic system 可为 [{type:text,text:...}]
+		typ, _ := v["type"].(string)
+		if typ == "" || typ == "text" {
+			text, _ := v["text"].(string)
+			return text, nil
+		}
+		return "", fmt.Errorf("%s conversion does not support content type %q; use a native provider", direction, typ)
+	default:
+		return "", fmt.Errorf("%s conversion requires string or text content blocks", direction)
+	}
+}
+
 func (h *Handler) handleAnthropicBuffered(w http.ResponseWriter, r *http.Request, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any) {
-	body, err := io.ReadAll(resp.Body)
+	body, err := h.readLimitedUpstream(resp.Body)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, model, false, http.StatusBadGateway, err.Error())
 		return
@@ -333,11 +434,11 @@ func (h *Handler) handleAnthropicBuffered(w http.ResponseWriter, r *http.Request
 	}
 	duration := time.Since(start)
 	h.recordAndPrint(round, r, providerName, model, false, http.StatusOK, duration, usage, "")
-	h.writeArchiveMetadata(round, providerName, model, false, http.StatusOK, duration, usage, "response.json", "", "")
+	h.writeArchiveMetadata(round, providerName, model, false, http.StatusOK, duration, usage, "response.json", "", "", "success")
 }
 
 func (h *Handler) handleOpenAIToAnthropicBuffered(w http.ResponseWriter, r *http.Request, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any) {
-	body, err := io.ReadAll(resp.Body)
+	body, err := h.readLimitedUpstream(resp.Body)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, model, false, http.StatusBadGateway, err.Error())
 		return
@@ -363,7 +464,7 @@ func (h *Handler) handleOpenAIToAnthropicBuffered(w http.ResponseWriter, r *http
 	}
 	duration := time.Since(start)
 	h.recordAndPrint(round, r, providerName, model, false, http.StatusOK, duration, usage, "")
-	h.writeArchiveMetadata(round, providerName, model, false, http.StatusOK, duration, usage, "response.json", "", "")
+	h.writeArchiveMetadata(round, providerName, model, false, http.StatusOK, duration, usage, "response.json", "", "", "success")
 }
 
 func convertAnthropicResponse(body []byte, fallbackModel string) ([]byte, tokenUsage, error) {
@@ -387,8 +488,11 @@ func convertAnthropicResponse(body []byte, fallbackModel string) ([]byte, tokenU
 	}
 	var text strings.Builder
 	for _, part := range payload.Content {
-		if part.Type == "text" {
+		switch part.Type {
+		case "text", "":
 			text.WriteString(part.Text)
+		default:
+			return nil, tokenUsage{}, fmt.Errorf("protocol conversion does not support response content type %q; use a native provider", part.Type)
 		}
 	}
 	model := payload.Model
@@ -429,7 +533,9 @@ func convertOpenAIChatToAnthropicResponse(body []byte, fallbackModel string) ([]
 		Model   string `json:"model"`
 		Choices []struct {
 			Message struct {
-				Content any `json:"content"`
+				Content      any `json:"content"`
+				ToolCalls    any `json:"tool_calls"`
+				FunctionCall any `json:"function_call"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -444,7 +550,21 @@ func convertOpenAIChatToAnthropicResponse(body []byte, fallbackModel string) ([]
 	content := ""
 	stopReason := "end_turn"
 	if len(payload.Choices) > 0 {
-		content = flattenValue(payload.Choices[0].Message.Content)
+		msg := payload.Choices[0].Message
+		if msg.ToolCalls != nil {
+			return nil, tokenUsage{}, fmt.Errorf("protocol conversion does not support response tool_calls; use a native provider")
+		}
+		if msg.FunctionCall != nil {
+			return nil, tokenUsage{}, fmt.Errorf("protocol conversion does not support response function_call; use a native provider")
+		}
+		text, err := extractTextContent(msg.Content, "openai->anthropic response")
+		if err != nil {
+			return nil, tokenUsage{}, err
+		}
+		content = text
+		if fr := payload.Choices[0].FinishReason; fr == "tool_calls" || fr == "function_call" {
+			return nil, tokenUsage{}, fmt.Errorf("protocol conversion does not support finish_reason %q; use a native provider", fr)
+		}
 		stopReason = openAIStopReasonToAnthropic(payload.Choices[0].FinishReason)
 	}
 	model := payload.Model
@@ -494,25 +614,54 @@ func (h *Handler) handleAnthropicStream(w http.ResponseWriter, r *http.Request, 
 	var content strings.Builder
 	finishReason := "stop"
 	roleSent := false
+	maxStream, maxLine := h.streamLimits()
 	idleTimer, stopIdleTimer := h.startStreamIdleTimer(cancel)
 	defer stopIdleTimer()
-	streamErr := ""
+	var streamErr *streamFail
+	var upstreamBytes, totalBytes int64
+	sawTerminal := false
 
 	for {
-		line, err := reader.ReadBytes('\n')
+		line, err := readSSELine(reader, maxLine)
 		if len(line) > 0 {
 			resetStreamIdleTimer(idleTimer, h.cfg.StreamIdleTimeout)
+			upstreamBytes += int64(len(line))
+			if upstreamBytes > maxStream {
+				streamErr = h.logStreamIssue(round, providerName, model, "read anthropic stream limit", fmt.Errorf("upstream stream exceeds limit of %d bytes", maxStream), requestContext, nil)
+				break
+			}
 			text := strings.TrimSpace(string(line))
 			if strings.HasPrefix(text, "data:") {
 				rest, _ := strings.CutPrefix(text, "data:")
 				payload := strings.TrimSpace(rest)
 				if payload != "" {
-					events := anthropicStreamEvents(payload, &id, &currentModel, &usage, &content, &finishReason, &roleSent, created)
+					terminal := isTerminalAnthropicPayload(payload)
+					if terminal {
+						sawTerminal = true
+					}
+					events, convErr := anthropicStreamEvents(payload, &id, &currentModel, &usage, &content, &finishReason, &roleSent, created)
+					if convErr != nil {
+						// 在产生点明确 kind:非法 JSON=protocol;不支持内容=conversion
+						kind := streamKindConversion
+						countUp := false
+						if strings.Contains(strings.ToLower(convErr.Error()), "invalid sse json") {
+							kind = streamKindProtocol
+							countUp = true
+						}
+						streamErr = newStreamFail(kind, fmt.Sprintf("convert anthropic stream: %v", convErr), convErr, countUp)
+						h.logStreamFail(round, providerName, model, streamErr)
+						break
+					}
 					for _, event := range events {
+						if totalBytes+int64(len(event)) > maxStream {
+							streamErr = h.logStreamIssue(round, providerName, model, "write anthropic stream client limit", fmt.Errorf("downstream stream exceeds limit of %d bytes", maxStream), requestContext, nil)
+							break
+						}
 						if _, writeErr := w.Write(event); writeErr != nil {
 							streamErr = h.logStreamIssue(round, providerName, model, "write anthropic stream client", writeErr, requestContext, nil)
 							break
 						}
+						totalBytes += int64(len(event))
 						if archiveWriter != nil {
 							if _, writeErr := archiveWriter.Write(event); writeErr != nil {
 								h.logStreamIssue(round, providerName, model, "write anthropic archive stream", writeErr, nil, nil)
@@ -522,7 +671,11 @@ func (h *Handler) handleAnthropicStream(w http.ResponseWriter, r *http.Request, 
 							flusher.Flush()
 						}
 					}
-					if streamErr != "" {
+					if streamErr != nil {
+						break
+					}
+					// 终止事件已转换写出后立即退出,避免 idle timeout 覆盖成功结果。
+					if terminal {
 						break
 					}
 				}
@@ -531,10 +684,12 @@ func (h *Handler) handleAnthropicStream(w http.ResponseWriter, r *http.Request, 
 		if err != nil {
 			if err != io.EOF {
 				streamErr = h.logStreamIssue(round, providerName, model, "read anthropic stream", err, requestContext, idleTimer)
+			} else if !sawTerminal {
+				streamErr = h.logStreamIssue(round, providerName, model, "read anthropic stream", fmt.Errorf("upstream stream ended without message_stop"), requestContext, idleTimer)
 			}
 			break
 		}
-		if streamErr != "" {
+		if streamErr != nil {
 			break
 		}
 	}
@@ -547,30 +702,48 @@ func (h *Handler) handleAnthropicStream(w http.ResponseWriter, r *http.Request, 
 		usage.CompletionTokens = estimateTokens(content.String())
 		usage.Estimated = true
 	}
-	usageChunk := openAIStreamChunk(id, currentModel, created, []any{}, usage)
-	usageEvent := fmt.Appendf(nil, "data: %s\n\n", usageChunk)
-	doneEvent := []byte("data: [DONE]\n\n")
-	_, _ = w.Write(usageEvent)
-	_, _ = w.Write(doneEvent)
-	if archiveWriter != nil {
-		if _, writeErr := archiveWriter.Write(usageEvent); writeErr != nil {
-			log.Printf("write anthropic archive usage: %v", writeErr)
+	// 仅在无错误时发送正常终止事件;终止事件也计入下游流量上限。
+	if streamErr == nil {
+		usageChunk := openAIStreamChunk(id, currentModel, created, []any{}, usage)
+		usageEvent := fmt.Appendf(nil, "data: %s\n\n", usageChunk)
+		doneEvent := []byte("data: [DONE]\n\n")
+		for _, event := range [][]byte{usageEvent, doneEvent} {
+			if totalBytes+int64(len(event)) > maxStream {
+				streamErr = h.logStreamIssue(round, providerName, model, "write anthropic stream client limit", fmt.Errorf("downstream stream exceeds limit of %d bytes", maxStream), requestContext, nil)
+				break
+			}
+			if _, writeErr := w.Write(event); writeErr != nil {
+				streamErr = h.logStreamIssue(round, providerName, model, "write anthropic stream client", writeErr, requestContext, nil)
+				break
+			}
+			totalBytes += int64(len(event))
+			if archiveWriter != nil {
+				if _, writeErr := archiveWriter.Write(event); writeErr != nil {
+					h.logStreamIssue(round, providerName, model, "write anthropic archive stream", writeErr, nil, nil)
+				}
+			}
 		}
-		if _, writeErr := archiveWriter.Write(doneEvent); writeErr != nil {
-			log.Printf("write anthropic archive done: %v", writeErr)
+		if streamErr == nil && flusher != nil {
+			flusher.Flush()
 		}
 	}
-	if flusher != nil {
-		flusher.Flush()
-	}
-	if fullResponse, err := streamCompletionJSON(id, currentModel, created, "assistant", content.String(), finishReason, usage); err != nil {
-		log.Printf("build anthropic stream full response: %v", err)
-	} else if err := round.WriteResponse("response.json", append(fullResponse, '\n')); err != nil {
-		log.Printf("archive anthropic stream full response: %v", err)
+	fullPath := ""
+	if streamErr == nil {
+		if fullResponse, err := streamCompletionJSON(id, currentModel, created, "assistant", content.String(), finishReason, usage); err != nil {
+			log.Printf("build anthropic stream full response: %v", err)
+		} else if err := round.WriteResponse("response.json", append(fullResponse, '\n')); err != nil {
+			log.Printf("archive anthropic stream full response: %v", err)
+		} else {
+			fullPath = "response.json"
+		}
 	}
 	duration := time.Since(start)
-	h.recordAndPrint(round, r, providerName, model, true, http.StatusOK, duration, usage, streamErr)
-	h.writeArchiveMetadata(round, providerName, model, true, http.StatusOK, duration, usage, "response.sse", streamErr, "response.json")
+	errMsg := ""
+	if streamErr != nil {
+		errMsg = streamErr.Error()
+	}
+	h.recordAndPrintFail(round, r, providerName, model, true, http.StatusOK, duration, usage, streamErr)
+	h.writeArchiveMetadata(round, providerName, model, true, http.StatusOK, duration, usage, "response.sse", errMsg, fullPath, outcomeFromStreamFail(streamErr, http.StatusOK))
 }
 
 // handleOpenAIToAnthropicStream 将 OpenAI SSE 转成 Anthropic Messages SSE（基础文本）。
@@ -595,17 +768,28 @@ func (h *Handler) handleOpenAIToAnthropicStream(w http.ResponseWriter, r *http.R
 	var content strings.Builder
 	stopReason := "end_turn"
 	started := false
+	maxStream, maxLine := h.streamLimits()
 	idleTimer, stopIdleTimer := h.startStreamIdleTimer(cancel)
 	defer stopIdleTimer()
-	streamErr := ""
+	var streamErr *streamFail
+	var upstreamBytes, totalBytes int64
+	sawTerminal := false
 
 	writeEvent := func(eventType string, payload any) {
+		if streamErr != nil {
+			return
+		}
 		data, _ := json.Marshal(payload)
 		event := []byte("event: " + eventType + "\ndata: " + string(data) + "\n\n")
+		if totalBytes+int64(len(event)) > maxStream {
+			streamErr = h.logStreamIssue(round, providerName, model, "write openai→anthropic stream client limit", fmt.Errorf("downstream stream exceeds limit of %d bytes", maxStream), requestContext, nil)
+			return
+		}
 		if _, writeErr := w.Write(event); writeErr != nil {
 			streamErr = h.logStreamIssue(round, providerName, model, "write openai→anthropic stream client", writeErr, requestContext, nil)
 			return
 		}
+		totalBytes += int64(len(event))
 		if archiveWriter != nil {
 			if _, writeErr := archiveWriter.Write(event); writeErr != nil {
 				h.logStreamIssue(round, providerName, model, "write openai→anthropic archive stream", writeErr, nil, nil)
@@ -617,21 +801,34 @@ func (h *Handler) handleOpenAIToAnthropicStream(w http.ResponseWriter, r *http.R
 	}
 
 	for {
-		line, err := reader.ReadBytes('\n')
+		line, err := readSSELine(reader, maxLine)
 		if len(line) > 0 {
 			resetStreamIdleTimer(idleTimer, h.cfg.StreamIdleTimeout)
+			upstreamBytes += int64(len(line))
+			if upstreamBytes > maxStream {
+				streamErr = h.logStreamIssue(round, providerName, model, "read openai→anthropic stream limit", fmt.Errorf("upstream stream exceeds limit of %d bytes", maxStream), requestContext, nil)
+				break
+			}
 			text := strings.TrimSpace(string(line))
 			if !strings.HasPrefix(text, "data:") {
 				continue
 			}
 			rest, _ := strings.CutPrefix(text, "data:")
 			payload := strings.TrimSpace(rest)
-			if payload == "" || payload == "[DONE]" {
+			if payload == "" {
 				continue
+			}
+			if payload == "[DONE]" {
+				sawTerminal = true
+				// 终止事件后立即退出,随后补发 Anthropic 终止事件。
+				break
 			}
 			var chunk map[string]any
 			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-				continue
+				uerr := fmt.Errorf("invalid SSE JSON: %w", err)
+				streamErr = newStreamFail(streamKindProtocol, fmt.Sprintf("protocol openai→anthropic stream: %v", uerr), uerr, true)
+				h.logStreamFail(round, providerName, model, streamErr)
+				break
 			}
 			if value, ok := chunk["id"].(string); ok && value != "" {
 				id = value
@@ -661,7 +858,7 @@ func (h *Handler) handleOpenAIToAnthropicStream(w http.ResponseWriter, r *http.R
 						"usage": map[string]any{"input_tokens": usage.PromptTokens, "output_tokens": 0},
 					},
 				})
-				if streamErr != "" {
+				if streamErr != nil {
 					break
 				}
 				writeEvent("content_block_start", map[string]any{
@@ -672,13 +869,17 @@ func (h *Handler) handleOpenAIToAnthropicStream(w http.ResponseWriter, r *http.R
 						"text": "",
 					},
 				})
-				if streamErr != "" {
+				if streamErr != nil {
 					break
 				}
 			}
 			if choices, ok := chunk["choices"].([]any); ok && len(choices) > 0 {
 				choice, _ := choices[0].(map[string]any)
 				if delta, ok := choice["delta"].(map[string]any); ok {
+					if delta["tool_calls"] != nil || delta["function_call"] != nil {
+						streamErr = h.logStreamIssue(round, providerName, model, "convert openai→anthropic stream", fmt.Errorf("protocol conversion does not support streaming tool_calls/function_call; use a native provider"), requestContext, nil)
+						break
+					}
 					if textDelta := flattenValue(delta["content"]); textDelta != "" {
 						content.WriteString(textDelta)
 						writeEvent("content_block_delta", map[string]any{
@@ -686,12 +887,16 @@ func (h *Handler) handleOpenAIToAnthropicStream(w http.ResponseWriter, r *http.R
 							"index": 0,
 							"delta": map[string]any{"type": "text_delta", "text": textDelta},
 						})
-						if streamErr != "" {
+						if streamErr != nil {
 							break
 						}
 					}
 				}
 				if reason, ok := choice["finish_reason"].(string); ok && reason != "" {
+					if reason == "tool_calls" || reason == "function_call" {
+						streamErr = h.logStreamIssue(round, providerName, model, "convert openai→anthropic stream", fmt.Errorf("protocol conversion does not support finish_reason %q; use a native provider", reason), requestContext, nil)
+						break
+					}
 					stopReason = openAIStopReasonToAnthropic(reason)
 				}
 			}
@@ -699,15 +904,17 @@ func (h *Handler) handleOpenAIToAnthropicStream(w http.ResponseWriter, r *http.R
 		if err != nil {
 			if err != io.EOF {
 				streamErr = h.logStreamIssue(round, providerName, model, "read openai→anthropic stream", err, requestContext, idleTimer)
+			} else if !sawTerminal {
+				streamErr = h.logStreamIssue(round, providerName, model, "read openai→anthropic stream", fmt.Errorf("upstream stream ended without [DONE]"), requestContext, idleTimer)
 			}
 			break
 		}
-		if streamErr != "" {
+		if streamErr != nil {
 			break
 		}
 	}
 
-	if !started {
+	if !started && streamErr == nil {
 		writeEvent("message_start", map[string]any{
 			"type": "message_start",
 			"message": map[string]any{
@@ -732,40 +939,51 @@ func (h *Handler) handleOpenAIToAnthropicStream(w http.ResponseWriter, r *http.R
 		usage.CompletionTokens = estimateTokens(content.String())
 		usage.Estimated = true
 	}
-	writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
-	writeEvent("message_delta", map[string]any{
-		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": stopReason},
-		"usage": map[string]any{"output_tokens": usage.CompletionTokens},
-	})
-	writeEvent("message_stop", map[string]any{"type": "message_stop"})
-
-	full := map[string]any{
-		"id":          id,
-		"type":        "message",
-		"role":        "assistant",
-		"model":       currentModel,
-		"content":     []any{map[string]any{"type": "text", "text": content.String()}},
-		"stop_reason": stopReason,
-		"usage": map[string]any{
-			"input_tokens":  usage.PromptTokens,
-			"output_tokens": usage.CompletionTokens,
-		},
+	if streamErr == nil {
+		writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+		writeEvent("message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": stopReason},
+			"usage": map[string]any{"output_tokens": usage.CompletionTokens},
+		})
+		writeEvent("message_stop", map[string]any{"type": "message_stop"})
 	}
-	if encoded, err := json.Marshal(full); err != nil {
-		log.Printf("build openai→anthropic full response: %v", err)
-	} else if err := round.WriteResponse("response.json", append(encoded, '\n')); err != nil {
-		log.Printf("archive openai→anthropic full response: %v", err)
+
+	fullPath := ""
+	if streamErr == nil {
+		full := map[string]any{
+			"id":          id,
+			"type":        "message",
+			"role":        "assistant",
+			"model":       currentModel,
+			"content":     []any{map[string]any{"type": "text", "text": content.String()}},
+			"stop_reason": stopReason,
+			"usage": map[string]any{
+				"input_tokens":  usage.PromptTokens,
+				"output_tokens": usage.CompletionTokens,
+			},
+		}
+		if encoded, err := json.Marshal(full); err != nil {
+			log.Printf("build openai→anthropic full response: %v", err)
+		} else if err := round.WriteResponse("response.json", append(encoded, '\n')); err != nil {
+			log.Printf("archive openai→anthropic full response: %v", err)
+		} else {
+			fullPath = "response.json"
+		}
 	}
 	duration := time.Since(start)
-	h.recordAndPrint(round, r, providerName, model, true, http.StatusOK, duration, usage, streamErr)
-	h.writeArchiveMetadata(round, providerName, model, true, http.StatusOK, duration, usage, "response.sse", streamErr, "response.json")
+	errMsg := ""
+	if streamErr != nil {
+		errMsg = streamErr.Error()
+	}
+	h.recordAndPrintFail(round, r, providerName, model, true, http.StatusOK, duration, usage, streamErr)
+	h.writeArchiveMetadata(round, providerName, model, true, http.StatusOK, duration, usage, "response.sse", errMsg, fullPath, outcomeFromStreamFail(streamErr, http.StatusOK))
 }
 
-func anthropicStreamEvents(payload string, id, model *string, usage *tokenUsage, content *strings.Builder, finishReason *string, roleSent *bool, created int64) [][]byte {
+func anthropicStreamEvents(payload string, id, model *string, usage *tokenUsage, content *strings.Builder, finishReason *string, roleSent *bool, created int64) ([][]byte, error) {
 	var event map[string]any
 	if err := json.Unmarshal([]byte(payload), &event); err != nil {
-		return nil
+		return nil, fmt.Errorf("invalid SSE JSON: %w", err)
 	}
 	eventType, _ := event["type"].(string)
 	switch eventType {
@@ -788,15 +1006,26 @@ func anthropicStreamEvents(payload string, id, model *string, usage *tokenUsage,
 			*roleSent = true
 			return [][]byte{sseData(openAIStreamChunk(*id, *model, created, []any{
 				map[string]any{"index": 0, "delta": map[string]any{"role": "assistant"}, "finish_reason": nil},
-			}, tokenUsage{}))}
+			}, tokenUsage{}))}, nil
+		}
+	case "content_block_start":
+		if block, ok := event["content_block"].(map[string]any); ok {
+			typ, _ := block["type"].(string)
+			if typ != "" && typ != "text" {
+				return nil, fmt.Errorf("protocol conversion does not support streaming content type %q; use a native provider", typ)
+			}
 		}
 	case "content_block_delta":
 		if delta, ok := event["delta"].(map[string]any); ok {
+			dType, _ := delta["type"].(string)
+			if dType != "" && dType != "text_delta" && dType != "text" {
+				return nil, fmt.Errorf("protocol conversion does not support streaming delta type %q; use a native provider", dType)
+			}
 			if text, ok := delta["text"].(string); ok && text != "" {
 				content.WriteString(text)
 				return [][]byte{sseData(openAIStreamChunk(*id, *model, created, []any{
 					map[string]any{"index": 0, "delta": map[string]any{"content": text}, "finish_reason": nil},
-				}, tokenUsage{}))}
+				}, tokenUsage{}))}, nil
 			}
 		}
 	case "message_delta":
@@ -812,15 +1041,18 @@ func anthropicStreamEvents(payload string, id, model *string, usage *tokenUsage,
 		}
 		if delta, ok := event["delta"].(map[string]any); ok {
 			if reason, ok := delta["stop_reason"].(string); ok && reason != "" {
+				if reason == "tool_use" || reason == "tool_calls" {
+					return nil, fmt.Errorf("protocol conversion does not support stop_reason %q; use a native provider", reason)
+				}
 				*finishReason = anthropicStopReason(reason)
 			}
 		}
 	case "message_stop":
 		return [][]byte{sseData(openAIStreamChunk(*id, *model, created, []any{
 			map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": *finishReason},
-		}, tokenUsage{}))}
+		}, tokenUsage{}))}, nil
 	}
-	return nil
+	return nil, nil
 }
 
 func anthropicUsage(value any) (tokenUsage, bool) {

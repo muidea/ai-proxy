@@ -10,6 +10,8 @@ import (
 type HandlerOptions struct {
 	// AllowRemote 为 true 时允许非 loopback 地址访问;默认仅允许 loopback。
 	AllowRemote bool
+	// AllowedCIDRs 在 AllowRemote=true 时生效;非空则仅这些网段可访问,空表示允许任意远程。
+	AllowedCIDRs []string
 }
 
 // Handler 返回一个挂载 /metrics 与 /stats 端点的 http.Handler。
@@ -59,11 +61,11 @@ func Handler(reg *Registry, opts HandlerOptions) http.Handler {
 	return mux
 }
 
-// authorize 校验请求来源。AllowRemote=false 时仅 loopback 可访问。
+// authorize 校验请求来源。
+// AllowRemote=false:仅 loopback。
+// AllowRemote=true 且 AllowedCIDRs 非空:仅白名单网段(+loopback)。
+// AllowRemote=true 且 AllowedCIDRs 为空:允许任意远程。
 func authorize(r *http.Request, opts HandlerOptions) bool {
-	if opts.AllowRemote {
-		return true
-	}
 	host := clientHost(r)
 	if host == "" {
 		return false
@@ -72,15 +74,41 @@ func authorize(r *http.Request, opts HandlerOptions) bool {
 		return true
 	}
 	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	if ip.IsLoopback() {
+	if ip != nil && ip.IsLoopback() {
 		return true
 	}
 	// 允许 Unix socket 场景(由 net/http 抽象为 @ 后跟随空 host)。
 	if strings.HasPrefix(r.RemoteAddr, "@") {
 		return true
+	}
+	if !opts.AllowRemote {
+		return false
+	}
+	if len(opts.AllowedCIDRs) == 0 {
+		return true
+	}
+	if ip == nil {
+		return false
+	}
+	for _, cidr := range opts.AllowedCIDRs {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		// 允许写单 IP。
+		if single := net.ParseIP(cidr); single != nil {
+			if single.Equal(ip) {
+				return true
+			}
+			continue
+		}
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		if network.Contains(ip) {
+			return true
+		}
 	}
 	return false
 }

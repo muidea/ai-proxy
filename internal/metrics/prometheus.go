@@ -34,7 +34,7 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 	r.mu.Unlock()
 
 	writeCounter(w, "ai_proxy_requests_total",
-		"Total number of LLM requests by provider, model, route, and HTTP status class.",
+		"Total number of LLM requests by provider, model, route, HTTP status class, and outcome.",
 		snapshot.requestCount, requestKeyLabels)
 
 	writeCounterFloat(w, "ai_proxy_request_duration_seconds_sum",
@@ -73,8 +73,39 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 		"Total fallback attempts, by from-provider, to-provider, and reason.",
 		snapshot.fallbackAttempts, fallbackKeyLabels)
 
+	writeSLOWebhookMetrics(w, r.SLO())
+
 	_, err := io.WriteString(w, "# EOF\n")
 	return err
+}
+
+// writeSLOWebhookMetrics 输出 SLO webhook 队列/投递指标(evaluator 未挂接时写 0)。
+func writeSLOWebhookMetrics(w io.Writer, e *SLOEvaluator) {
+	var dropped, ok, errN, non2xx, canceled uint64
+	var queue int
+	if e != nil {
+		dropped = e.WebhookDropped()
+		queue = e.WebhookQueueLength()
+		ok = e.WebhookRequestCount("ok")
+		errN = e.WebhookRequestCount("error")
+		non2xx = e.WebhookRequestCount("non_2xx")
+		canceled = e.WebhookRequestCount("canceled")
+	}
+
+	emitType(w, "ai_proxy_slo_webhook_dropped_total", "counter",
+		"Total SLO webhook batches dropped because the queue was full or the evaluator was closed.")
+	_, _ = fmt.Fprintf(w, "ai_proxy_slo_webhook_dropped_total %d\n", dropped)
+
+	emitType(w, "ai_proxy_slo_webhook_queue_length", "gauge",
+		"Current number of SLO webhook batches waiting in the send queue.")
+	_, _ = fmt.Fprintf(w, "ai_proxy_slo_webhook_queue_length %d\n", queue)
+
+	emitType(w, "ai_proxy_slo_webhook_requests_total", "counter",
+		"Total SLO webhook delivery attempts by result (ok, error, non_2xx, canceled).")
+	_, _ = fmt.Fprintf(w, "ai_proxy_slo_webhook_requests_total{result=\"ok\"} %d\n", ok)
+	_, _ = fmt.Fprintf(w, "ai_proxy_slo_webhook_requests_total{result=\"error\"} %d\n", errN)
+	_, _ = fmt.Fprintf(w, "ai_proxy_slo_webhook_requests_total{result=\"non_2xx\"} %d\n", non2xx)
+	_, _ = fmt.Fprintf(w, "ai_proxy_slo_webhook_requests_total{result=\"canceled\"} %d\n", canceled)
 }
 
 type prometheusSnapshot struct {
@@ -147,6 +178,7 @@ func requestKeyLabels(k requestKey) string {
 		"model", k.Model,
 		"route", k.Route,
 		"status", k.Status,
+		"outcome", k.Outcome,
 	)
 }
 

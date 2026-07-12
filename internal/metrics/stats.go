@@ -20,6 +20,7 @@ type StatsRequests struct {
 	Total      int64            `json:"total"`
 	ByProvider map[string]int64 `json:"by_provider"`
 	ByStatus   map[string]int64 `json:"by_status"`
+	ByOutcome  map[string]int64 `json:"by_outcome"`
 }
 
 // StatsCache 汇总缓存命中统计。
@@ -60,11 +61,17 @@ func buildStatsLocked(r *Registry) StatsJSON {
 	requests := StatsRequests{
 		ByProvider: map[string]int64{},
 		ByStatus:   map[string]int64{},
+		ByOutcome:  map[string]int64{},
 	}
 	for k, v := range r.requestCount {
 		requests.Total += int64(v)
 		requests.ByProvider[k.Provider] += int64(v)
 		requests.ByStatus[k.Status] += int64(v)
+		outcome := k.Outcome
+		if outcome == "" {
+			outcome = "success"
+		}
+		requests.ByOutcome[outcome] += int64(v)
 	}
 
 	cache := StatsCache{ByProvider: map[string]StatsCacheProvider{}}
