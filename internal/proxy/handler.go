@@ -1089,7 +1089,8 @@ func (h *Handler) resolveProviderName(_ *http.Request, model string) (string, er
 }
 
 func (h *Handler) findProviderByModel(model string) (string, bool, error) {
-	model = strings.ToLower(strings.TrimSpace(model))
+	// model 严格区分大小写,仅 trim,与 providers.*.models / model_catalog 原文匹配。
+	model = strings.TrimSpace(model)
 	if model == "" {
 		return "", false, nil
 	}
@@ -1140,7 +1141,8 @@ func defaultModelPatterns(name, protocol string) []string {
 }
 
 func matchModelPattern(model, pattern string) bool {
-	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	// model / pattern 均严格区分大小写。
+	pattern = strings.TrimSpace(pattern)
 	switch {
 	case pattern == "":
 		return false

@@ -319,7 +319,8 @@ func setProvider(cfg *Config, name, key, value string) error {
 	case "type", "protocol":
 		provider.Protocol = strings.ToLower(value)
 	case "models", "model_patterns":
-		provider.Models = parseList(value)
+		// models 严格区分大小写,与请求 body.model 原文匹配。
+		provider.Models = parseModelList(value)
 	case "fallbacks", "fallback_providers":
 		provider.Fallbacks = parseList(value)
 	case "enabled":
@@ -521,7 +522,8 @@ func applyProviderEnv(cfg *Config, name, fallbackBaseURL string) error {
 		provider.Protocol = "anthropic"
 	}
 	if models != "" {
-		provider.Models = parseList(models)
+		// models 严格区分大小写,与请求 body.model 原文匹配。
+		provider.Models = parseModelList(models)
 	}
 	if fallbacks != "" {
 		provider.Fallbacks = parseList(fallbacks)
@@ -592,7 +594,9 @@ func normalize(cfg *Config) error {
 		}
 		provider.Protocol = strings.ToLower(provider.Protocol)
 		provider.BaseURL = strings.TrimRight(provider.BaseURL, "/")
-		provider.Models = normalizeList(provider.Models)
+		// models 严格区分大小写,与请求 body.model 原文匹配。
+		provider.Models = normalizeModelPatterns(provider.Models)
+		// fallbacks 是 provider 名,与 provider 键一样做大小写折叠。
 		provider.Fallbacks = normalizeList(provider.Fallbacks)
 		normalized[key] = provider
 	}
@@ -602,7 +606,6 @@ func normalize(cfg *Config) error {
 		cfg.ModelCatalog = map[string]ModelInfo{}
 	}
 	catalog := make(map[string]ModelInfo, len(cfg.ModelCatalog))
-	seenIDs := map[string]string{} // lower -> original display id
 	for name, info := range cfg.ModelCatalog {
 		id := strings.TrimSpace(info.ID)
 		if id == "" {
@@ -618,13 +621,11 @@ func normalize(cfg *Config) error {
 		if info.MaxOutputTokens < 0 {
 			info.MaxOutputTokens = 0
 		}
-		lower := strings.ToLower(id)
-		if prev, ok := seenIDs[lower]; ok {
-			return fmt.Errorf("duplicate model_catalog id after case fold: %q and %q both map to %q", prev, id, lower)
+		// model id 严格区分大小写:查找键与展示 ID 均保留配置原文。
+		if prev, ok := catalog[id]; ok {
+			return fmt.Errorf("duplicate model_catalog id: %q (also seen as %q)", id, prev.ID)
 		}
-		seenIDs[lower] = id
-		// 查找键小写;展示 ID 保留配置原文。
-		catalog[lower] = info
+		catalog[id] = info
 	}
 	cfg.ModelCatalog = catalog
 	return nil
@@ -939,7 +940,17 @@ func parseStrictFloat(value string) (float64, error) {
 	return parsed, nil
 }
 
+// parseList 解析逗号分隔列表,并折叠为小写(用于 provider fallbacks / CIDR 等)。
 func parseList(value string) []string {
+	return parseCSVList(value, true)
+}
+
+// parseModelList 解析 models 列表,保留原文大小写。
+func parseModelList(value string) []string {
+	return parseCSVList(value, false)
+}
+
+func parseCSVList(value string, foldCase bool) []string {
 	value = strings.TrimSpace(value)
 	value = strings.TrimPrefix(value, "[")
 	value = strings.TrimSuffix(value, "]")
@@ -949,7 +960,10 @@ func parseList(value string) []string {
 	parts := strings.Split(value, ",")
 	items := make([]string, 0, len(parts))
 	for _, part := range parts {
-		item := strings.ToLower(strings.TrimSpace(unquote(part)))
+		item := strings.TrimSpace(unquote(part))
+		if foldCase {
+			item = strings.ToLower(item)
+		}
 		if item != "" {
 			items = append(items, item)
 		}
@@ -957,13 +971,26 @@ func parseList(value string) []string {
 	return items
 }
 
+// normalizeList 折叠为小写(provider fallbacks 等)。
 func normalizeList(values []string) []string {
+	return normalizeCSVList(values, true)
+}
+
+// normalizeModelPatterns 保留 models 原文大小写,仅 trim。
+func normalizeModelPatterns(values []string) []string {
+	return normalizeCSVList(values, false)
+}
+
+func normalizeCSVList(values []string, foldCase bool) []string {
 	if len(values) == 0 {
 		return nil
 	}
 	normalized := make([]string, 0, len(values))
 	for _, value := range values {
-		value = strings.ToLower(strings.TrimSpace(value))
+		value = strings.TrimSpace(value)
+		if foldCase {
+			value = strings.ToLower(value)
+		}
 		if value != "" {
 			normalized = append(normalized, value)
 		}

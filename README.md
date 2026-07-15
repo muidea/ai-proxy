@@ -138,8 +138,8 @@ make run
 
 路由规则：
 
-1. 从请求 body 读取 `model`
-2. 在所有 **enabled** provider 的 `models` 中匹配（精确名或 `*` 前缀，如 `gpt-*`、`deepseek*`）
+1. 从请求 body 读取 `model`（**严格区分大小写**，与配置原文匹配）
+2. 在所有 **enabled** provider 的 `models` 中匹配（精确名或 `*` 前缀，如 `gpt-*`、`DeepSeek-V4-Flash`；`models` 与 `model_catalog` id 均保留配置原文大小写）
    - 0 命中 → 使用 `default_provider`（若配置）
    - 1 命中 → 选用
    - >1 命中 → **400**（请保证各 provider 的 `models` 不重叠）
@@ -149,7 +149,7 @@ make run
 
 ### 模型上下文查询（`GET /v1/models`）
 
-在配置中用**全局** `model_catalog` 登记具体模型能力（各 provider 共用，与路由 `providers.*.models` 独立）：
+在配置中用**全局** `model_catalog` 登记具体模型能力（各 provider 共用，与路由 `providers.*.models` 独立；**id 严格区分大小写**）：
 
 ```yaml
 model_catalog:

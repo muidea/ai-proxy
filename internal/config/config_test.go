@@ -126,13 +126,16 @@ model_catalog:
 	if gpt.ID != "gpt-4o" || gpt.ContextWindowTokens != 128000 || gpt.MaxOutputTokens != 16384 {
 		t.Fatalf("gpt-4o = %#v", gpt)
 	}
-	// 查找键小写,展示 ID 保留配置原文
-	ds, ok := cfg.ModelCatalog["deepseek-v4-flash"]
+	// model id 严格区分大小写:查找键与展示 ID 均保留配置原文
+	ds, ok := cfg.ModelCatalog["DeepSeek-V4-Flash"]
 	if !ok {
-		t.Fatalf("missing deepseek-v4-flash catalog entry: %#v", cfg.ModelCatalog)
+		t.Fatalf("missing DeepSeek-V4-Flash catalog entry: %#v", cfg.ModelCatalog)
 	}
 	if ds.ID != "DeepSeek-V4-Flash" || ds.ContextWindowTokens != 128000 || ds.MaxOutputTokens != 8192 {
 		t.Fatalf("DeepSeek-V4-Flash = %#v", ds)
+	}
+	if _, ok := cfg.ModelCatalog["deepseek-v4-flash"]; ok {
+		t.Fatalf("unexpected lowercased catalog key: %#v", cfg.ModelCatalog)
 	}
 }
 
@@ -567,7 +570,8 @@ func TestLoadRejectsCaseFoldProviderDuplicate(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsCaseFoldModelCatalogDuplicate(t *testing.T) {
+func TestLoadAllowsCaseDifferingModelCatalogIDs(t *testing.T) {
+	// model 严格区分大小写:仅大小写不同的 id 可并存。
 	cfg := Config{
 		ListenAddr: "127.0.0.1:8080",
 		Providers: map[string]Provider{
@@ -578,8 +582,32 @@ func TestLoadRejectsCaseFoldModelCatalogDuplicate(t *testing.T) {
 			"gpt-4o": {ID: "gpt-4o"},
 		},
 	}
+	if err := normalize(&cfg); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if _, ok := cfg.ModelCatalog["GPT-4o"]; !ok {
+		t.Fatalf("missing GPT-4o: %#v", cfg.ModelCatalog)
+	}
+	if _, ok := cfg.ModelCatalog["gpt-4o"]; !ok {
+		t.Fatalf("missing gpt-4o: %#v", cfg.ModelCatalog)
+	}
+}
+
+func TestLoadRejectsExactModelCatalogDuplicate(t *testing.T) {
+	cfg := Config{
+		ListenAddr: "127.0.0.1:8080",
+		Providers: map[string]Provider{
+			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://api.openai.com", APIKey: "a"},
+		},
+		ModelCatalog: map[string]ModelInfo{
+			"gpt-4o": {ID: "gpt-4o"},
+		},
+	}
+	// 模拟 map 键与 info.ID 不同但归一化后撞上同一 id 的情况:
+	// 再塞一个 name 不同、ID 相同的条目(通过二次写入 ensure 路径不方便,直接调 normalize 前构造)。
+	cfg.ModelCatalog["alias"] = ModelInfo{ID: "gpt-4o"}
 	if err := normalize(&cfg); err == nil {
-		t.Fatal("expected case-fold duplicate model error")
+		t.Fatal("expected exact duplicate model error")
 	}
 }
 

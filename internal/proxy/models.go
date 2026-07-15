@@ -94,7 +94,8 @@ func buildModelsListResponse(catalog map[string]config.ModelInfo, providers map[
 }
 
 func ownedByForModel(modelID string, providers map[string]config.Provider) string {
-	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	// model 严格区分大小写,与 providers.*.models 原文匹配。
+	modelID = strings.TrimSpace(modelID)
 	if modelID == "" {
 		return "ai-proxy"
 	}
