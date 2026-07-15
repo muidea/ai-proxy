@@ -53,15 +53,6 @@ type upstreamResponseDebugInfo struct {
 	Error         string    `json:"error,omitempty"`
 }
 
-type fallbackAttemptDebugInfo struct {
-	Provider   string `json:"provider"`
-	Protocol   string `json:"protocol"`
-	Status     int    `json:"status,omitempty"`
-	Error      string `json:"error,omitempty"`
-	Fallback   bool   `json:"fallback"`
-	DurationMS int64  `json:"duration_ms"`
-}
-
 func (h *Handler) debugf(format string, args ...any) {
 	if !h.cfg.DebugLog {
 		return
@@ -199,19 +190,10 @@ func (h *Handler) archiveAndLogUpstreamResponse(round *archive.Round, r *http.Re
 		info.ContentLength,
 		info.Error,
 	)
-	h.logUpstreamAlert(round, providerName, provider.Protocol, info.Status, duration, info.Error, false, "")
+	h.logUpstreamAlert(round, providerName, provider.Protocol, info.Status, duration, info.Error)
 }
 
-func (h *Handler) archiveAndLogFallbackAttempts(round *archive.Round, attempts []fallbackAttemptDebugInfo) {
-	if round == nil || len(attempts) == 0 {
-		return
-	}
-	if err := round.WriteJSON("fallback_attempts.json", attempts); err != nil {
-		log.Printf("archive fallback attempts: %v", err)
-	}
-}
-
-func (h *Handler) logUpstreamAlert(round *archive.Round, providerName, protocol string, status int, duration time.Duration, errMessage string, fallback bool, nextProvider string) {
+func (h *Handler) logUpstreamAlert(round *archive.Round, providerName, protocol string, status int, duration time.Duration, errMessage string) {
 	if !h.cfg.DebugLog {
 		return
 	}
@@ -237,10 +219,6 @@ func (h *Handler) logUpstreamAlert(round *archive.Round, providerName, protocol 
 		slog.Int("status", status),
 		slog.Duration("duration", duration.Truncate(time.Millisecond)),
 		slog.String("message", message),
-		slog.Bool("fallback", fallback),
-	}
-	if nextProvider != "" {
-		attrs = append(attrs, slog.String("next_provider", nextProvider))
 	}
 	slog.LogAttrs(context.Background(), level, "upstream alert", toAttrs(attrs)...)
 }

@@ -11,8 +11,27 @@ import (
 	"ai-proxy/internal/metrics"
 )
 
+// ModelsListResponse 是 GET/POST /v1/models 的具体外部协议 DTO。
+// 禁止使用 map[string]any / []any 动态组装。
+type ModelsListResponse struct {
+	Object string        `json:"object"`
+	Data   []ModelRecord `json:"data"`
+}
+
+// ModelRecord 是 catalog 中单个模型的稳定输出。
+type ModelRecord struct {
+	ID                  string   `json:"id"`
+	Object              string   `json:"object"`
+	Created             int64    `json:"created"`
+	OwnedBy             string   `json:"owned_by"`
+	Operations          []string `json:"operations"`
+	ContextWindowTokens int      `json:"contextWindowTokens,omitempty"`
+	MaxOutputTokens     int      `json:"maxOutputTokens,omitempty"`
+}
+
 // handleModels 返回本地 model_catalog 合成的 OpenAI-compatible 模型列表。
-// 不转发上游;字段 contextWindowTokens / maxOutputTokens 为扩展元数据。
+// 不转发上游;字段 contextWindowTokens / maxOutputTokens / operations 为扩展元数据。
+// owned_by 来自启动校验写入的确定 RouteOwner。
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request, requestID string) {
 	start := time.Now()
 	bodyBytes := []byte(nil)
@@ -40,7 +59,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request, requestID
 	}
 	h.archiveAndLogClientRequest(round, r, len(bodyBytes))
 
-	payload := buildModelsListResponse(h.cfg.ModelCatalog, h.cfg.Providers)
+	payload := buildModelsListResponse(h.cfg.ModelCatalog)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, "", "", false, http.StatusInternalServerError, err.Error())
@@ -59,64 +78,41 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request, requestID
 	h.writeArchiveMetadata(round, "", "", false, http.StatusOK, duration, tokenUsage{}, "response.json", "", "", "success")
 }
 
-func buildModelsListResponse(catalog map[string]config.ModelInfo, providers map[string]config.Provider) map[string]any {
-	items := make([]config.ModelInfo, 0, len(catalog))
-	for _, info := range catalog {
-		if strings.TrimSpace(info.ID) == "" {
-			continue
-		}
-		items = append(items, info)
-	}
-	sort.Slice(items, func(i, j int) bool {
-		return strings.ToLower(items[i].ID) < strings.ToLower(items[j].ID)
-	})
-
-	data := make([]any, 0, len(items))
+func buildModelsListResponse(catalog map[string]config.ModelInfo) ModelsListResponse {
+	items := config.CatalogModelsSorted(catalog)
+	data := make([]ModelRecord, 0, len(items))
 	for _, info := range items {
-		entry := map[string]any{
-			"id":       info.ID,
-			"object":   "model",
-			"created":  0,
-			"owned_by": ownedByForModel(info.ID, providers),
+		operations := info.Operations
+		if operations == nil {
+			operations = []string{}
+		} else {
+			// 防御性拷贝,避免后续修改共享底层数组。
+			operations = append([]string(nil), operations...)
+		}
+		rec := ModelRecord{
+			ID:         info.ID,
+			Object:     "model",
+			Created:    0,
+			OwnedBy:    info.RouteOwner,
+			Operations: operations,
 		}
 		if info.ContextWindowTokens > 0 {
-			entry["contextWindowTokens"] = info.ContextWindowTokens
+			rec.ContextWindowTokens = info.ContextWindowTokens
 		}
 		if info.MaxOutputTokens > 0 {
-			entry["maxOutputTokens"] = info.MaxOutputTokens
+			rec.MaxOutputTokens = info.MaxOutputTokens
 		}
-		data = append(data, entry)
+		data = append(data, rec)
 	}
-	return map[string]any{
-		"object": "list",
-		"data":   data,
+	return ModelsListResponse{
+		Object: "list",
+		Data:   data,
 	}
-}
-
-func ownedByForModel(modelID string, providers map[string]config.Provider) string {
-	// model 严格区分大小写,与 providers.*.models 原文匹配。
-	modelID = strings.TrimSpace(modelID)
-	if modelID == "" {
-		return "ai-proxy"
-	}
-	matches := make([]string, 0, 1)
-	for name, provider := range providers {
-		if provider.Disabled {
-			continue
-		}
-		if providerMatchesModel(name, provider, modelID) {
-			matches = append(matches, name)
-		}
-	}
-	if len(matches) == 1 {
-		return matches[0]
-	}
-	return "ai-proxy"
 }
 
 // ReserveMetricsModels 为 metrics 预占 model label 槽位。
 // 1) 各 provider 的精确 models(不含通配);
-// 2) model_catalog 中仅唯一匹配某一 provider 的 ID(排序后稳定)。
+// 2) model_catalog 中已确定 RouteOwner 的 ID。
 func ReserveMetricsModels(reg *metrics.Registry, cfg config.Config) {
 	if reg == nil {
 		return
@@ -135,17 +131,10 @@ func ReserveMetricsModels(reg *metrics.Registry, cfg config.Config) {
 	}
 	sort.Strings(catalogIDs)
 	for _, id := range catalogIDs {
-		matches := make([]string, 0, 1)
-		for name, provider := range cfg.Providers {
-			if provider.Disabled {
-				continue
-			}
-			if providerMatchesModel(name, provider, id) {
-				matches = append(matches, name)
-			}
+		info, ok := cfg.ModelCatalog[id]
+		if !ok || strings.TrimSpace(info.RouteOwner) == "" {
+			continue
 		}
-		if len(matches) == 1 {
-			reg.ReserveModels(matches[0], []string{id})
-		}
+		reg.ReserveModels(info.RouteOwner, []string{id})
 	}
 }

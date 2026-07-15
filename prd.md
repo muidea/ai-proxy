@@ -11,17 +11,17 @@
 
 *   **本地统一入口**：为 NextChat、LobeChat、ChatBox、IDE Agent 等客户端提供一个本地 `API_BASE_URL`，屏蔽不同上游 provider 的 Base URL、API Key 与协议差异。
 *   **标准 path + 纯 model 路由**：客户端只访问 OpenAI/Anthropic 标准入站 path；代理仅按请求 `model` 与 provider `models` 规则匹配上游，不再使用 `X-AI-Provider` / `?provider=` / `provider/model`。
-*   **双向协议兼容**：OpenAI chat ↔ Anthropic messages 提供基础协议转换；其余 OpenAI 端点对 openai provider 直通。
+*   **双向协议兼容**：OpenAI chat ↔ Anthropic messages 提供基础协议转换；其余 OpenAI 端点仅在 RouteOwner 显式声明对应 `endpoint_capabilities` 时对 openai provider 直通。
 *   **用量与成本可见**：对每个经代理处理的标准 `/v1/*` 请求记录 provider、model、HTTP 状态、耗时、流式/非流式、输入/输出 token、缓存读写 token、缓存命中率；没有模型或 token 语义的请求保留空模型与 0 token，不能阻塞流水记录。
-*   **问题可追踪**：每个经代理处理的请求生成独立交互归档，保留请求、上游请求、上游响应、最终响应、元数据、fallback 尝试、request_id 和请求指纹，便于复盘异常、并发交错和 prompt 漂移。
-*   **多 provider 路由与韧性**：支持模型匹配规则、默认 provider 和同协议 fallback；在限流、超时、网络错误或 5xx 时可自动切换备用上游。
+*   **问题可追踪**：每个经代理处理的请求生成独立交互归档，保留请求、上游请求、上游响应、最终响应、元数据、request_id 和请求指纹，便于复盘异常、并发交错和 prompt 漂移。
+*   **多 provider 纯 model 路由**：`model_catalog` 唯一 RouteOwner；无 provider fallback；未匹配/operation 不支持直接 typed 4xx。
 *   **轻量本地运维**：采用 Go 单二进制交付，不依赖数据库、中间件或长期驻留外部服务；配置、用量流水和交互归档均使用本地文件。
-*   **可观测性内建**：提供 `/healthz`、`/metrics`、`/stats`、`/stats/stream`，让终端、Prometheus、TUI 或轻量 dashboard 能实时查看请求量、延迟分位数、错误率、fallback 和 cache 命中率。
+*   **可观测性内建**：提供 `/healthz`、`/metrics`、`/stats`、`/stats/stream`，实时查看请求量、延迟分位数、错误率和 cache 命中率。
 
 ### 2.2 范围边界
 
 *   **Provider 配置**：通过 `config.yaml` 与环境变量配置端口、超时、usage 文件、交互归档目录、保留轮数、debug 日志、metrics 访问策略、SLO 阈值和 provider 列表。
-*   **Provider 选择**：仅 `models` 匹配 + `default_provider` 兜底；多 provider 命中同一 model 时返回明确 400。
+*   **Provider 选择**：仅 `model_catalog` exact model → 唯一 RouteOwner；无 default_provider / fallback。
 *   **转发能力**：标准 OpenAI path 与 Anthropic `/v1/messages`；非白名单 path 404；OpenAI chat ↔ Anthropic messages 基础双向转换。
 *   **记录能力**：`usage.csv` 作为结构化流水账，`interactions/{round_id}/` 作为完整交互归档；归档需要脱敏敏感请求头。
 *   **监控能力**：`/metrics` 输出 Prometheus text exposition format，`/stats` 输出 JSON 聚合快照，`/stats/stream` 输出 SSE 快照流；默认仅允许 loopback 访问，可通过 `metrics_remote_access` 显式开放远程访问。
@@ -31,9 +31,9 @@
 
 *   **代理延迟**：在本机 loopback mock 上游、非 TLS、固定小响应的验收环境下，代理层自身引入的首包额外延迟 P95 目标不超过 20ms。
 *   **资源占用**：进程空闲 60s 后的 RSS 目标不超过 30MB；持续请求下不因归档、metrics 或 SSE 处理出现无界内存增长。
-*   **并发安全**：本地多个客户端并发调用时，CSV 追加、交互目录序号、metrics 聚合和 fallback 记录不能错乱或数据竞争。
+*   **并发安全**：本地多个客户端并发调用时，CSV 追加、交互目录序号、metrics 聚合不能错乱或数据竞争。
 *   **用量准确性**：上游提供 usage 时优先使用精确值；缺失 usage 时允许估算，但必须在 CSV、metadata 和控制台摘要中标记。
-*   **故障透明**：未触发 fallback 的上游错误透传原始状态码和响应体；触发 fallback 时归档每次失败原因，若备用上游成功则返回备用结果，若全部失败则返回最终一次上游错误或明确的代理错误。
+*   **故障透明**：上游错误透传原始状态码和响应体；代理自身错误返回明确 4xx/5xx typed 合同。
 *   **部署简单**：用户能通过 `make build` 得到单个可执行文件，并通过 `config.example.yaml` 或环境变量完成首次运行。
 
 ### 2.4 非目标 (Non-Goals)
@@ -54,18 +54,16 @@
 - [ ] `GET /healthz` 返回 200 和 JSON 健康状态。
 - [ ] `POST /v1/chat/completions` 能完成 OpenAI-compatible 非流式转发，客户端收到的状态码、主要响应头和 JSON body 与上游语义一致。
 - [ ] `POST /v1/chat/completions` 在 `stream: true` 时以 SSE 方式转发，客户端能边生成边接收；代理不能等待完整流结束后才向客户端返回，归档层允许增量写入原始流并在流结束后生成整理版响应。
-- [ ] 白名单 OpenAI 端点（`/v1/responses`、`/v1/completions`、`/v1/embeddings`、`/v1/models`）可直通 openai provider；非白名单 `/v1/*` 返回 404。
+- [ ] 白名单 OpenAI 端点（`/v1/responses`、`/v1/completions`、`/v1/embeddings`、`/v1/models`）在 RouteOwner 显式声明对应 `endpoint_capabilities` 时可直通 openai provider；非白名单 `/v1/*` 返回 404。
 - [ ] Anthropic `POST /v1/messages` 可直通 anthropic provider，或在命中 openai provider 时做基础转换；OpenAI chat 命中 anthropic provider 时可做反向基础转换。
-- [ ] 未触发 fallback 的上游 400、401、403、404、429、5xx 等错误能保留原始状态码和错误体透传给客户端；代理自身错误返回明确、可读的 4xx/5xx 信息。
+- [x] 上游 400、401、403、404、429、5xx 等错误保留原始状态码和错误体透传；代理自身错误返回明确 typed 4xx/5xx。
 
-### 3.2 Provider 路由与 fallback
+### 3.2 Provider 路由（catalog authority）
 
-- [ ] 仅按 `models` 与 `default_provider` 路由；`X-AI-Provider` / `?provider=` / `provider/model` 被忽略；行为有测试覆盖和文档说明。
-- [ ] provider `enabled: false` 后不参与 model 匹配。
-- [ ] 当多个 provider 的 models 同时命中同一 model 时返回 400，提示调整 models 规则。
-- [ ] fallback 仅在网络错误、408、429 和 5xx 等可重试场景触发；401、403、400 等认证或请求错误不触发 fallback。
-- [ ] fallback 只能切换到同协议、已启用、已配置的 provider；每次尝试记录 provider、状态码/错误、耗时和原因。
-- [ ] fallback 成功时，客户端响应、`usage.csv` 和 `metadata.json` 记录实际返回的备用 provider；fallback 全部失败时，客户端收到最终一次上游错误响应，网络级失败则收到明确的代理 502。
+- [x] 仅按 `model_catalog` exact model + RouteOwner 路由；`X-AI-Provider` / `?provider=` / `provider/model` 被忽略。
+- [x] 无 provider fallback；无 model 未命中时的 default_provider 兜底。
+- [x] provider `enabled: false` 后不参与 model 匹配。
+- [x] 当多个 provider 的 models 同时命中同一 model 时配置加载启动失败，提示调整 `models` 规则。
 
 ### 3.3 Token、cache 与用量统计
 
@@ -87,17 +85,17 @@
 
 ### 3.5 可观测性与 SLO
 
-- [ ] `/metrics` 返回 Prometheus 兼容文本，至少包含请求数、请求耗时、输入/输出 token、cache token、cache hit rate、上游错误和 fallback 次数。
-- [ ] `/stats` 返回 JSON 聚合快照，至少包含 uptime、按 provider/status 的请求量、cache 命中率、延迟 p50/p75/p90/p95/p99、上游错误分布和 fallback 次数。
+- [x] `/metrics` 返回 Prometheus 兼容文本，至少包含请求数、请求耗时、输入/输出 token、cache token、cache hit rate、上游错误。
+- [x] `/stats` 返回 JSON 聚合快照，至少包含 uptime、按 provider/status 的请求量、cache 命中率、延迟分位数、上游错误分布。
 - [ ] `/stats/stream` 以 SSE 周期推送 `/stats` 快照，客户端断开后资源能释放。
 - [ ] `/metrics`、`/stats`、`/stats/stream` 默认仅允许 loopback 访问；开启 `metrics_remote_access` 后才允许远程访问。本阶段不验收 `metrics_allowed_cidrs` 白名单生效。
 - [ ] SLO 配置支持 cache 命中率下限、上游错误率上限、p99 延迟上限和巡检周期；命中阈值时输出可定位 provider 与规则的事件。
 
 ### 3.6 配置、安全与部署
 
-- [ ] `config.example.yaml` 覆盖 server、provider、fallback、metrics 和 SLO 的常用配置，并且可直接复制为 `config.yaml` 后运行。
-- [ ] 支持通过环境变量覆盖监听地址、端口、usage 文件、交互目录、超时、默认 provider；内置 provider 支持 `AI_PROXY_<PROVIDER>_*` / `<PROVIDER>_*` 覆盖 API Key、Base URL、模型规则和 fallback，自定义 provider 通过 `config.yaml` 中的 `${ENV}` 注入。
-- [ ] 配置加载会校验至少存在一个启用 provider，`default_provider` 必须指向已启用 provider。
+- [x] `config.example.yaml` 覆盖 server、provider（含 endpoint_capabilities）、model_catalog、metrics 和 SLO，可复制为 `config.yaml` 后运行。
+- [x] 支持通过环境变量覆盖监听地址、端口、usage 文件、交互目录、超时等 server 字段；**不支持** env 注入 provider；provider 与 api_key 在 config 中声明，可用 `${ENV}` 展开。
+- [x] 配置加载校验至少存在一个启用 provider；不支持 `default_provider`。
 - [ ] 日志、请求元信息、归档和错误输出会脱敏 `Authorization`、`X-API-Key`、`Cookie` 等敏感头。
 - [ ] `make build` 能生成单二进制；目标机器无需安装 Go、数据库或中间件即可运行该二进制。
 - [ ] 服务收到 SIGINT/SIGTERM 后能在超时时间内优雅关闭，不丢失已完成请求的 CSV 和归档记录。
@@ -106,7 +104,19 @@
 
 - [ ] 在本机 loopback mock 上游、非 TLS、固定 1KB 非流式响应和固定首个 SSE chunk 立即返回的环境中，各执行 1000 次请求、并发度 1 与 10 各一轮；代理路径相对直接访问 mock 上游的首包额外延迟 P95 满足 20ms 目标。若环境不满足，需要在验收记录中说明瓶颈和实测值。
 - [ ] 进程启动并空闲 60s 后 RSS 满足 30MB 目标；持续 1000 次请求后，metrics 样本、归档清理和流式处理没有无界增长。
-- [ ] 并发测试覆盖 CSV 写入、交互归档序号、metrics 聚合、fallback 记录和流式转发。
+- [x] 并发测试覆盖 CSV 写入、交互归档序号、metrics 聚合和流式转发。
 - [ ] `make check` 通过，即 `go fmt ./...`、`go vet ./...`、`go test ./...` 均无失败。
 - [ ] 关键路径测试覆盖配置加载、provider 选择、OpenAI-compatible 转发、Anthropic 适配、流式 usage、usage 估算、cache 字段、归档、metrics、SLO 和错误透传。
 - [ ] README、`config.example.yaml` 与本 PRD 的端点、字段、环境变量和运行方式保持一致。
+
+## model_catalog operation 合同（WorkOrch 对齐）
+
+- [x] `model_catalog` 每项必填 `operations`（`chat_completions` / `embeddings`），case-fold 后 model id 唯一。
+- [x] 每个 catalog model 唯一匹配 enabled provider；`GET /v1/models` 使用具体 DTO，`owned_by` 为确定 RouteOwner。
+- [x] 请求前按 exact model + path operation 校验；`operation_unsupported` / `model_not_found` 不访问上游。
+
+### Provider endpoint_capabilities
+
+- [x] enabled provider 必须显式配置 `endpoint_capabilities`。
+- [x] 不支持 env 注入 provider；不支持 `fallbacks`。
+- [x] 请求前校验 endpoint capability，失败返回 `endpoint_unsupported`。

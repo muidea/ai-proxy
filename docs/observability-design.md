@@ -1,10 +1,14 @@
 # ai-proxy Observability Improvement Design
 
-Status: draft
+Status: superseded
 
 Type: module-architecture
 
 Last Updated: 2026-06-11
+
+> 历史设计草案：下文的“当前状态”和阶段规划记录 2026-06-11 的改造起点，不描述当前实现，且不构成
+> provider 路由或 fallback 合同。当前运行语义以 `README.md`、`prd.md` 和
+> `workorch-model-catalog-operation-closure-plan-2026-07-15.md` 为准。
 
 Related:
 
@@ -27,10 +31,9 @@ Related:
 
 | 能力 | 实现位置 | 落盘内容 |
 |---|---|---|
-| Per-interaction 全量归档 | `internal/archive/recorder.go:57-100` | `interactions/{round_id}/{metadata,request,request.meta,response,response.sse,upstream_request,upstream_response,fallback_attempts}.json` |
+| Per-interaction 全量归档 | `internal/archive/recorder.go:57-100` | `interactions/{round_id}/{metadata,request,request.meta,response,response.sse,upstream_request,upstream_response}.json` |
 | CSV 累计记录 | `internal/stats/recorder.go:36-40` | `usage.csv`(当前 6441 行,12 列:time / provider / model / input_tokens / output_tokens / total_tokens / duration_ms / stream / estimated / http_status,缺 cache 字段) |
 | Debug 日志 | `internal/proxy/debug.go:63-67` (`debugf`) | stderr 文本日志,每 round 一组 `client_request / selected / upstream_request / upstream_response / [ai-proxy][OK] provider=...` |
-| Fallback 路径追踪 | `internal/proxy/handler.go:449-521` | 每 round 写入 `fallback_attempts.json`,记录尝试的 fallback provider 与失败原因 |
 | SSE 流式跟踪 | `internal/proxy/stream_archive.go:30,166` | `TrackSSELine` 累计 usage 与 content |
 | Health 端点 | `internal/proxy/handler.go:52-58` | `GET /healthz` 返回 `{"status":"ok"}` |
 
@@ -47,7 +50,6 @@ Related:
 | **无告警阈值** | provider 失败、cache 命中率突降无人值守 | P2 |
 | **无实时流式指标推送** | TUI / 监控面板只能轮询 CSV | P2 |
 | **无 stable prefix 指纹** | 无法在 ai-proxy 端发现 workorch 的 prompt 漂移 | P2 |
-| **无 provider failover 聚合** | fallback_attempts.json 是 per-call,无趋势统计 | P3 |
 | **无 OpenTelemetry / Prometheus 集成** | 只能走文件 + 文本日志,无法对接现代监控栈 | P3 |
 | **usage.csv 无 cache 字段** | `internal/stats/recorder.go:11` 的 Record 结构已含 CachedInputTokens / CacheCreationInputTokens / CacheHitRate,但 CSV 输出只 10 列(没写 cache 字段) | P0 |
 
@@ -83,7 +85,7 @@ Related:
 ### 三层结构
 
 ```
-[handler 层]                request_id 注入 + 计时 + fallback 状态采集
+[handler 层]                request_id 注入 + 计时 + 单 RouteOwner 上游状态采集
     |
     v
 [metrics 聚合层]            滑动窗口 / 计数器 / 直方图(provider / model / route 维度)
@@ -148,7 +150,6 @@ Related:
  - `ai_proxy_cache_creation_input_tokens_total{provider,model}` Counter
  - `ai_proxy_cache_hit_rate{provider,model}` Gauge
  - `ai_proxy_upstream_errors_total{provider,status_code}` Counter
- - `ai_proxy_fallback_attempts_total{from_provider,to_provider,reason}` Counter
 - 路由:`GET /metrics`,返回 `Content-Type: text/plain; version=0.0.4`
 - 限流:仅本机 / localhost 可访问(默认开启,可在 config.yaml 加 `metrics_remote_access: true` 关闭)
 
@@ -180,8 +181,7 @@ Related:
    },
    "errors": {
      "upstream_5xx": 50,
-     "upstream_timeout": 12,
-     "fallback_triggered": 30
+     "upstream_timeout": 12
    }
  }
  ```
@@ -256,7 +256,7 @@ Related:
 - 在收到请求时,对 `request.json` 的 system 段或稳定前 N 字节计算 `sha256`
 - 写入 `metadata.json` 新增字段 `request_fingerprint` 与 `stable_prefix_hash`
 - 允许 workorch 端跨 run 比对(若 ai-proxy 与 workorch 共享同一 hash 算法,workorch 端 P1-2 的 invariant assertion 可直接复用)
-- 新增 fallback 策略:若发现连续 N 个请求的 stable_prefix_hash 与上一个不同,记 `stable_prefix_drift` 事件
+- 新增检测策略:若发现连续 N 个请求的 stable_prefix_hash 与上一个不同,记 `stable_prefix_drift` 事件
 
 ### P3 — 完整可观测性栈
 
@@ -279,14 +279,6 @@ Related:
 - 在 `metadata.json` 与 `usage.csv` 记录 trace_id
 - 允许 workorch 端在 OTel collector 中按 trace_id 串接
 
-#### P3-3. Provider failover 聚合
-
-**位置**:`internal/metrics/failover.go`(新建)
-
-**实现**:
-- 单独统计 fallback 触发率、平均 fallback 链长度、最终成功 provider
-- 与 cache hit rate 一起构成"链路健康度"指标
-
 ## File-by-File Change List
 
 | 文件 | 阶段 | 改动 |
@@ -306,7 +298,6 @@ Related:
 | `internal/archive/recorder.go` | P2-3 | Metadata 增加 stable_prefix_hash 字段 |
 | `internal/metrics/otel.go`(新建) | P3-1 | OpenTelemetry 接入 |
 | `internal/metrics/trace.go`(新建) | P3-2 | 分布式 trace 关联 |
-| `internal/metrics/failover.go`(新建) | P3-3 | provider failover 聚合 |
 | `config.example.yaml` | P0~P3 | 增 SLO 阈值 / metrics 配置 |
 | `README.md` | P0~P3 | 文档更新 |
 
@@ -364,7 +355,6 @@ Related:
 
 1. OpenTelemetry 接入(评估是否引入依赖)
 2. 分布式 trace 关联
-3. provider failover 聚合面板
 
 ## Risk Assessment
 
@@ -406,7 +396,7 @@ Related:
 - `internal/config/config.go` L12-32
 - `internal/archive/recorder.go` L17-100
 - `internal/stats/recorder.go` L11-40
-- `internal/proxy/handler.go` L1-58, L52-58(/healthz), L449-521(fallback)
+- `internal/proxy/handler.go`（唯一 RouteOwner 上游执行）
 - `internal/proxy/debug.go` L63-67(debugf), L190(upstream alert)
 - `cmd/ai-proxy/main.go`(启动入口)
 - 配套 workorch 端设计:`workorch/docs/30-module-architecture/llm-cache-improvement-design.md`

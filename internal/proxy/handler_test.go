@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -296,7 +297,7 @@ func TestAnthropicBufferedConversion(t *testing.T) {
 			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://upstream.test", APIKey: "anthropic-key"},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
 	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"claude-test","messages":[{"role":"system","content":"brief"},{"role":"user","content":"hi"}]}`)
 	response := newResponseRecorder()
@@ -362,7 +363,7 @@ func TestAnthropicNativeAvoidsDuplicateV1AndArchives(t *testing.T) {
 			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://upstream.test/v1", APIKey: "test-key"},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
 	request := newRequest(http.MethodPost, "/v1/messages?beta=true", `{"model":"claude-test","messages":[{"role":"user","content":"hi"}]}`)
 	request.Header.Set("Anthropic-Version", "2023-06-01")
@@ -415,7 +416,7 @@ func TestAnthropicRawRequestInfersAnthropicProvider(t *testing.T) {
 			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://anthropic.test", APIKey: "anthropic-key"},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
 	request := newRequest(http.MethodPost, "/v1/messages?beta=true", `{"model":"claude-test","messages":[{"role":"user","content":"hi"}]}`)
 	request.Header.Set("Anthropic-Version", "2023-06-01")
@@ -451,7 +452,7 @@ func TestUnmatchedModelWithoutDefaultProviderReturns400(t *testing.T) {
 			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key"},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		t.Fatalf("request should not reach upstream")
 		return nil, nil
@@ -464,7 +465,7 @@ func TestUnmatchedModelWithoutDefaultProviderReturns400(t *testing.T) {
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), "no provider matches model") {
+	if !strings.Contains(response.Body.String(), "model_not_found") {
 		t.Fatalf("unexpected body: %s", response.Body.String())
 	}
 	records := readUsageCSV(t, usageFile)
@@ -488,7 +489,7 @@ func TestMultipleProvidersMatchingSameModelReturns400(t *testing.T) {
 			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "k2", Models: []string{"shared-*"}},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		t.Fatalf("request should not reach upstream")
 		return nil, nil
@@ -501,49 +502,41 @@ func TestMultipleProvidersMatchingSameModelReturns400(t *testing.T) {
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), "multiple providers match model") {
+	// 启动/合成 catalog 时多匹配 model 不会进入 authority,运行时返回 model_not_found。
+	if !strings.Contains(response.Body.String(), "model_not_found") {
 		t.Fatalf("unexpected body: %s", response.Body.String())
 	}
 }
 
-func TestDefaultProviderHandlesUnknownOpenAIModel(t *testing.T) {
-	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Host != "openai.test" {
-			t.Fatalf("unexpected host: %s", r.URL.Host)
-		}
-		return jsonResponse(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`), nil
-	})
-
+func TestDefaultProviderNoLongerRoutesUnknownModel(t *testing.T) {
+	// catalog 权威:未知 model 不再回落到 default_provider。
 	usageFile := filepath.Join(t.TempDir(), "usage.csv")
 	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Config{
-		ListenAddr:      ":0",
-		UsageFile:       usageFile,
-		InteractionDir:  filepath.Join(filepath.Dir(usageFile), "interactions"),
-		DefaultProvider: "openai",
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
 		Providers: map[string]config.Provider{
 			"openai":   {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "openai-key"},
 			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key"},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
-	handler.client.Transport = transport
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("request should not reach upstream")
+		return nil, nil
+	})
 	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"healthcheck","messages":[{"role":"user","content":"hi"}]}`)
 	response := newResponseRecorder()
-
 	handler.ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
-	assertFileContains(t, filepath.Join(interactionDir, "upstream_request.json"), `"provider": "openai"`)
-	records := readUsageCSV(t, usageFile)
-	if got := records[1][1]; got != "openai" {
-		t.Fatalf("provider = %s", got)
+	if !strings.Contains(response.Body.String(), "model_not_found") {
+		t.Fatalf("unexpected body: %s", response.Body.String())
 	}
 }
 
@@ -566,15 +559,17 @@ func TestLocalModelsEndpointReturnsCatalog(t *testing.T) {
 				ID:                  "gpt-4o",
 				ContextWindowTokens: 128000,
 				MaxOutputTokens:     16384,
+				Operations:          []string{config.ModelOperationChatCompletions},
 			},
 			"deepseek-chat": {
 				ID:                  "deepseek-chat",
 				ContextWindowTokens: 64000,
 				MaxOutputTokens:     8192,
+				Operations:          []string{config.ModelOperationChatCompletions, config.ModelOperationEmbeddings},
 			},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		t.Fatalf("GET /v1/models should not reach upstream: %s", r.URL.String())
 		return nil, nil
@@ -607,6 +602,15 @@ func TestLocalModelsEndpointReturnsCatalog(t *testing.T) {
 	if !strings.Contains(response.Body.String(), `"owned_by":"openai"`) && !strings.Contains(response.Body.String(), `"owned_by": "openai"`) {
 		t.Fatalf("expected owned_by openai for gpt-4o, got: %s", response.Body.String())
 	}
+	if !strings.Contains(response.Body.String(), `"operations"`) {
+		t.Fatalf("expected operations field, got: %s", response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"chat_completions"`) {
+		t.Fatalf("expected chat_completions operation, got: %s", response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"embeddings"`) {
+		t.Fatalf("expected embeddings operation on deepseek-chat, got: %s", response.Body.String())
+	}
 	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
 	assertFileContains(t, filepath.Join(interactionDir, "response.json"), `"object":"list"`)
 }
@@ -633,7 +637,7 @@ func TestOpenAICompatibleProviderSelectionByBuiltInModelFamily(t *testing.T) {
 			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key"},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
 	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}`)
 	response := newResponseRecorder()
@@ -669,7 +673,7 @@ func TestOpenAICompatibleProviderSelectionByConfiguredModelPattern(t *testing.T)
 			"custom-openai": {Name: "custom-openai", Protocol: "openai", BaseURL: "https://custom-openai.test", APIKey: "custom-key", Models: []string{"kimi-*"}},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
 	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"kimi-k2","messages":[{"role":"user","content":"hi"}]}`)
 	response := newResponseRecorder()
@@ -681,98 +685,6 @@ func TestOpenAICompatibleProviderSelectionByConfiguredModelPattern(t *testing.T)
 	}
 	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
 	assertFileContains(t, filepath.Join(interactionDir, "upstream_request.json"), `"provider": "custom-openai"`)
-}
-
-func TestOpenAICompatibleFallsBackOnRetryableStatus(t *testing.T) {
-	var upstreamHosts []string
-	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		upstreamHosts = append(upstreamHosts, r.URL.Host)
-		switch r.URL.Host {
-		case "primary.test":
-			return testResponse(http.StatusTooManyRequests, "application/json", `{"error":"rate limited"}`), nil
-		case "backup.test":
-			if got := r.Header.Get("Authorization"); got != "Bearer backup-key" {
-				t.Fatalf("unexpected authorization: %s", got)
-			}
-			return jsonResponse(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`), nil
-		default:
-			t.Fatalf("unexpected host: %s", r.URL.Host)
-			return nil, nil
-		}
-	})
-
-	usageFile := filepath.Join(t.TempDir(), "usage.csv")
-	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg := config.Config{
-		ListenAddr:     ":0",
-		UsageFile:      usageFile,
-		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
-		Providers: map[string]config.Provider{
-			"primary": {Name: "primary", Protocol: "openai", BaseURL: "https://primary.test", APIKey: "primary-key", Models: []string{"gpt-*"}, Fallbacks: []string{"backup"}},
-			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "backup-key"},
-		},
-	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
-	handler.client.Transport = transport
-	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
-	response := newResponseRecorder()
-
-	handler.ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
-	}
-	if got := strings.Join(upstreamHosts, ","); got != "primary.test,backup.test" {
-		t.Fatalf("upstream hosts = %s", got)
-	}
-	records := readUsageCSV(t, usageFile)
-	if got := records[1][1]; got != "backup" {
-		t.Fatalf("provider = %s", got)
-	}
-	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
-	assertFileContains(t, filepath.Join(interactionDir, "fallback_attempts.json"), `"provider": "primary"`)
-	assertFileContains(t, filepath.Join(interactionDir, "fallback_attempts.json"), `"status": 429`)
-	assertFileContains(t, filepath.Join(interactionDir, "fallback_attempts.json"), `"provider": "backup"`)
-	assertFileContains(t, filepath.Join(interactionDir, "metadata.json"), `"provider": "backup"`)
-}
-
-func TestOpenAICompatibleDoesNotFallbackOnClientError(t *testing.T) {
-	var upstreamHosts []string
-	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		upstreamHosts = append(upstreamHosts, r.URL.Host)
-		return testResponse(http.StatusBadRequest, "application/json", `{"error":"bad request"}`), nil
-	})
-
-	usageFile := filepath.Join(t.TempDir(), "usage.csv")
-	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg := config.Config{
-		ListenAddr:     ":0",
-		UsageFile:      usageFile,
-		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
-		Providers: map[string]config.Provider{
-			"primary": {Name: "primary", Protocol: "openai", BaseURL: "https://primary.test", APIKey: "primary-key", Models: []string{"gpt-*"}, Fallbacks: []string{"backup"}},
-			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "backup-key"},
-		},
-	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
-	handler.client.Transport = transport
-	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
-	response := newResponseRecorder()
-
-	handler.ServeHTTP(response, request)
-
-	if response.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
-	}
-	if got := strings.Join(upstreamHosts, ","); got != "primary.test" {
-		t.Fatalf("upstream hosts = %s", got)
-	}
 }
 
 func TestProviderExceptionLogsAreProminent(t *testing.T) {
@@ -819,66 +731,6 @@ func TestProviderExceptionLogsAreProminent(t *testing.T) {
 	}
 }
 
-func TestFallbackLogsNextProvider(t *testing.T) {
-	var logBuffer strings.Builder
-	previousWriter := log.Writer()
-	previousFlags := log.Flags()
-	previousSlog := slog.Default()
-	log.SetOutput(&logBuffer)
-	log.SetFlags(0)
-	slog.SetDefault(slog.New(slog.NewTextHandler(&combineWriter{&logBuffer}, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	defer func() {
-		log.SetOutput(previousWriter)
-		log.SetFlags(previousFlags)
-		slog.SetDefault(previousSlog)
-	}()
-
-	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		switch r.URL.Host {
-		case "primary.test":
-			return testResponse(http.StatusTooManyRequests, "application/json", `{"error":"rate limited"}`), nil
-		case "backup.test":
-			return jsonResponse(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`), nil
-		default:
-			t.Fatalf("unexpected host: %s", r.URL.Host)
-			return nil, nil
-		}
-	})
-
-	usageFile := filepath.Join(t.TempDir(), "usage.csv")
-	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg := config.Config{
-		ListenAddr:     ":0",
-		UsageFile:      usageFile,
-		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
-		DebugLog:       true,
-		Providers: map[string]config.Provider{
-			"primary": {Name: "primary", Protocol: "openai", BaseURL: "https://primary.test", APIKey: "primary-key", Models: []string{"gpt-*"}, Fallbacks: []string{"backup"}},
-			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "backup-key"},
-		},
-	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
-	handler.client.Transport = transport
-	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
-	response := newResponseRecorder()
-
-	handler.ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("status = %d", response.Code)
-	}
-	logs := logBuffer.String()
-	if !strings.Contains(logs, "level=WARN") || !strings.Contains(logs, "upstream alert") {
-		t.Fatalf("expected upstream warn log, got: %s", logs)
-	}
-	if !strings.Contains(logs, "fallback=true") || !strings.Contains(logs, "next_provider=backup") {
-		t.Fatalf("expected next provider hint, got: %s", logs)
-	}
-}
-
 func TestRawProxyUsesBodyModelToResolveProvider(t *testing.T) {
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Host != "deepseek.test" {
@@ -901,7 +753,7 @@ func TestRawProxyUsesBodyModelToResolveProvider(t *testing.T) {
 			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key"},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
 	request := newRequest(http.MethodPost, "/v1/responses", `{"model":"deepseek-chat","input":"hi"}`)
 	response := newResponseRecorder()
@@ -955,7 +807,7 @@ func TestAnthropicMessagesConvertsToOpenAIChat(t *testing.T) {
 			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://anthropic.test", APIKey: "anthropic-key"},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
 	request := newRequest(http.MethodPost, "/v1/messages", `{"model":"gpt-5.4","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)
 	response := newResponseRecorder()
@@ -980,48 +832,34 @@ func TestAnthropicMessagesConvertsToOpenAIChat(t *testing.T) {
 	}
 }
 
-func TestOpenAIResponsesEndpointUsesDefaultProviderWithoutModel(t *testing.T) {
-	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.String() != "https://openai.test/v1/responses" {
-			t.Fatalf("unexpected url: %s", r.URL.String())
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer openai-key" {
-			t.Fatalf("unexpected authorization: %s", got)
-		}
-		return jsonResponse(`{"id":"resp_1","usage":{"input_tokens":9,"output_tokens":2,"total_tokens":11,"input_tokens_details":{"cached_tokens":3}}}`), nil
-	})
-
+func TestOpenAIResponsesRequiresModel(t *testing.T) {
+	// catalog 权威:无 model 时返回 model_required,不再使用 default_provider。
 	usageFile := filepath.Join(t.TempDir(), "usage.csv")
 	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Config{
-		ListenAddr:      ":0",
-		UsageFile:       usageFile,
-		InteractionDir:  filepath.Join(filepath.Dir(usageFile), "interactions"),
-		DefaultProvider: "openai",
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
 		Providers: map[string]config.Provider{
-			"openai":    {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "openai-key"},
-			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://anthropic.test", APIKey: "anthropic-key"},
+			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "openai-key"},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
-	handler.client.Transport = transport
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("request should not reach upstream")
+		return nil, nil
+	})
 	request := newRequest(http.MethodPost, "/v1/responses", `{"input":"hi"}`)
 	response := newResponseRecorder()
-
 	handler.ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	records := readUsageCSV(t, usageFile)
-	if got := records[1][1]; got != "openai" {
-		t.Fatalf("provider = %s", got)
-	}
-	if got := records[1][11]; got != "3" {
-		t.Fatalf("cached input tokens = %s", got)
+	if !strings.Contains(response.Body.String(), "model_required") {
+		t.Fatalf("unexpected body: %s", response.Body.String())
 	}
 }
 
@@ -1039,7 +877,7 @@ func TestOpenAIResponsesRejectsAnthropicProvider(t *testing.T) {
 			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://anthropic.test", APIKey: "anthropic-key", Models: []string{"claude*"}},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		t.Fatalf("request should not reach upstream")
 		return nil, nil
@@ -1052,7 +890,8 @@ func TestOpenAIResponsesRejectsAnthropicProvider(t *testing.T) {
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), "only POST /v1/chat/completions supports OpenAI->Anthropic conversion") {
+	// catalog/endpoint authority: anthropic 不具备 /v1/responses → endpoint_unsupported
+	if !strings.Contains(response.Body.String(), "endpoint_unsupported") {
 		t.Fatalf("unexpected body: %s", response.Body.String())
 	}
 }
@@ -1091,7 +930,7 @@ func TestExplicitProviderHeaderIsIgnored(t *testing.T) {
 			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key"},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
 	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}`)
 	request.Header.Set("X-AI-Provider", "openai")
@@ -1138,7 +977,7 @@ func TestRawOpenAIStreamArchivesFullResponse(t *testing.T) {
 			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key", Models: []string{"deepseek*"}},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
 	request := newRequest(http.MethodPost, "/v1/responses", `{"model":"deepseek-chat","stream":true,"input":"hi"}`)
 	response := newResponseRecorder()
@@ -1196,7 +1035,7 @@ func TestAnthropicRawStreamRecordsCacheUsage(t *testing.T) {
 			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://anthropic.test", APIKey: "anthropic-key"},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = transport
 	request := newRequest(http.MethodPost, "/v1/messages", `{"model":"claude-test","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 	request.Header.Set("Anthropic-Version", "2023-06-01")
@@ -1223,40 +1062,35 @@ func TestAnthropicRawStreamRecordsCacheUsage(t *testing.T) {
 }
 
 func TestDisabledProviderIsSkippedForModelSelection(t *testing.T) {
-	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Host != "openai.test" {
-			t.Fatalf("unexpected host: %s", r.URL.Host)
-		}
-		return jsonResponse(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`), nil
-	})
-
+	// disabled provider 不参与 catalog 合成;deepseek-chat 无 route → model_not_found。
 	usageFile := filepath.Join(t.TempDir(), "usage.csv")
 	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Config{
-		ListenAddr:      ":0",
-		UsageFile:       usageFile,
-		InteractionDir:  filepath.Join(filepath.Dir(usageFile), "interactions"),
-		DefaultProvider: "openai",
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
 		Providers: map[string]config.Provider{
 			"openai":   {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "openai-key"},
 			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key", Disabled: true},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
-	handler.client.Transport = transport
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("request should not reach upstream")
+		return nil, nil
+	})
 	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}`)
 	response := newResponseRecorder()
-
 	handler.ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	interactionDir := filepath.Join(filepath.Dir(usageFile), "interactions", "000001")
-	assertFileContains(t, filepath.Join(interactionDir, "upstream_request.json"), `"provider": "openai"`)
+	if !strings.Contains(response.Body.String(), "model_not_found") {
+		t.Fatalf("unexpected body: %s", response.Body.String())
+	}
 }
 
 func TestDisabledProviderIsNotMatchedByModel(t *testing.T) {
@@ -1273,16 +1107,14 @@ func TestDisabledProviderIsNotMatchedByModel(t *testing.T) {
 			"deepseek": {Name: "deepseek", Protocol: "openai", BaseURL: "https://deepseek.test", APIKey: "deepseek-key", Disabled: true},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	request := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}`)
 	response := newResponseRecorder()
-
 	handler.ServeHTTP(response, request)
-
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), "no provider matches model") {
+	if !strings.Contains(response.Body.String(), "model_not_found") {
 		t.Fatalf("unexpected body: %s", response.Body.String())
 	}
 }
@@ -1322,10 +1154,6 @@ func TestBuildUpstreamURLAvoidsDuplicateV1(t *testing.T) {
 }
 
 func testHandler(baseURL, usageFile, provider string) *Handler {
-	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
-	if err != nil {
-		panic(err)
-	}
 	cfg := config.Config{
 		ListenAddr:     ":0",
 		UsageFile:      usageFile,
@@ -1335,7 +1163,7 @@ func testHandler(baseURL, usageFile, provider string) *Handler {
 			provider: {Name: provider, Protocol: "openai", BaseURL: baseURL, APIKey: "test-key"},
 		},
 	}
-	return NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	return newTestHandler(cfg, usageFile)
 }
 
 func readUsageCSV(t *testing.T, path string) [][]string {
@@ -1659,7 +1487,7 @@ func TestProtocolConversionRejectsTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHandler(config.Config{
+	handler := NewHandler(mustHandlerConfig(config.Config{
 		ListenAddr:     ":0",
 		UsageFile:      usageFile,
 		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
@@ -1667,7 +1495,7 @@ func TestProtocolConversionRejectsTools(t *testing.T) {
 		Providers: map[string]config.Provider{
 			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://upstream.test", APIKey: "k", Models: []string{"claude*"}},
 		},
-	}, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	}), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		t.Fatal("upstream should not be called for unsupported conversion")
 		return nil, nil
@@ -1780,7 +1608,7 @@ func TestPrimeStreamBodyFirstLine(t *testing.T) {
 }
 
 func TestPrimeStreamBodyPartialEOF(t *testing.T) {
-	// 无换行的 partial 数据应失败,以便 fallback。
+	// 无换行的 partial 数据应作为首事件失败返回。
 	body := io.NopCloser(strings.NewReader("data: partial-without-newline"))
 	resp := &http.Response{StatusCode: 200, Body: body, Header: make(http.Header)}
 	_, err := primeStreamBody(resp, time.Second, 1024)
@@ -1872,6 +1700,8 @@ func TestResponsesStreamFailedOutcome(t *testing.T) {
 	handler := testHandler("https://upstream.test", usageFile, "openai")
 	// ensure model matches
 	handler.cfg.Providers["openai"] = config.Provider{Name: "openai", Protocol: "openai", BaseURL: "https://upstream.test", APIKey: "k", Models: []string{"deepseek*"}}
+	handler.cfg.ModelCatalog = nil
+	handler.cfg = mustHandlerConfig(handler.cfg)
 	handler.client.Transport = transport
 	req := newRequest(http.MethodPost, "/v1/responses", `{"model":"deepseek-chat","stream":true,"input":"hi"}`)
 	handler.ServeHTTP(newResponseRecorder(), req)
@@ -1916,6 +1746,8 @@ func TestResponsesStreamRecordsUsageFromCompleted(t *testing.T) {
 	usageFile := filepath.Join(t.TempDir(), "usage.csv")
 	handler := testHandler("https://upstream.test", usageFile, "openai")
 	handler.cfg.Providers["openai"] = config.Provider{Name: "openai", Protocol: "openai", BaseURL: "https://upstream.test", APIKey: "k", Models: []string{"deepseek*"}}
+	handler.cfg.ModelCatalog = nil
+	handler.cfg = mustHandlerConfig(handler.cfg)
 	handler.client.Transport = transport
 	req := newRequest(http.MethodPost, "/v1/responses", `{"model":"deepseek-chat","stream":true,"input":"hi"}`)
 	handler.ServeHTTP(newResponseRecorder(), req)
@@ -2029,7 +1861,7 @@ func TestConversionStreamReturnsAfterDONEWithoutWaitingEOF(t *testing.T) {
 			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://upstream.test", APIKey: "k", Models: []string{"gpt*"}},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -2119,7 +1951,7 @@ func TestAnthropicToOpenAIStreamReturnsAfterMessageStop(t *testing.T) {
 			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://upstream.test", APIKey: "k", Models: []string{"claude*"}},
 		},
 	}
-	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
 	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path != "/v1/messages" {
 			t.Errorf("upstream path = %s", r.URL.Path)
@@ -2152,5 +1984,715 @@ func TestAnthropicToOpenAIStreamReturnsAfterMessageStop(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("expected OpenAI [DONE] after conversion, got: %s", body)
+	}
+}
+
+func TestOperationUnsupportedRejectsBeforeUpstream(t *testing.T) {
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		Providers: map[string]config.Provider{
+			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "k", Models: []string{"gpt-chat", "embed-model"}},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"gpt-chat": {
+				ID: "gpt-chat", ContextWindowTokens: 128000, MaxOutputTokens: 16384,
+				Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "openai",
+			},
+			"embed-model": {
+				ID: "embed-model", ContextWindowTokens: 8192, MaxOutputTokens: 8191,
+				Operations: []string{config.ModelOperationEmbeddings}, RouteOwner: "openai",
+			},
+		},
+	}
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	upstreamHits := 0
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		upstreamHits++
+		t.Fatalf("upstream should not be called for operation_unsupported")
+		return nil, nil
+	})
+
+	// chat-only model calling embeddings
+	req := newRequest(http.MethodPost, "/v1/embeddings", `{"model":"gpt-chat","input":"hi"}`)
+	resp := newResponseRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "operation_unsupported") {
+		t.Fatalf("body = %s", resp.Body.String())
+	}
+
+	// embedding-only model calling chat
+	req = newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"embed-model","messages":[{"role":"user","content":"hi"}]}`)
+	resp = newResponseRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "operation_unsupported") {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("upstream hits = %d", upstreamHits)
+	}
+}
+
+func TestSupportedOperationForwardsUpstream(t *testing.T) {
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		Providers: map[string]config.Provider{
+			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "k", Models: []string{"gpt-chat"}},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"gpt-chat": {
+				ID: "gpt-chat", ContextWindowTokens: 128000, MaxOutputTokens: 16384,
+				Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "openai",
+			},
+		},
+	}
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "openai.test" {
+			t.Fatalf("host = %s", r.URL.Host)
+		}
+		return jsonResponse(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`), nil
+	})
+	req := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-chat","messages":[{"role":"user","content":"hi"}]}`)
+	resp := newResponseRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestModelsListResponseUsesTypedDTO(t *testing.T) {
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		Providers: map[string]config.Provider{
+			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "k", Models: []string{"gpt-4o"}},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"gpt-4o": {
+				ID: "gpt-4o", ContextWindowTokens: 128000, MaxOutputTokens: 16384,
+				Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "openai",
+			},
+		},
+	}
+	handler := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	req := newRequest(http.MethodGet, "/v1/models", "")
+	resp := newResponseRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	var payload ModelsListResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Object != "list" || len(payload.Data) != 1 {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if payload.Data[0].OwnedBy != "openai" || len(payload.Data[0].Operations) != 1 || payload.Data[0].Operations[0] != "chat_completions" {
+		t.Fatalf("record = %#v", payload.Data[0])
+	}
+}
+
+func TestModelsGETAndPOSTConsistent(t *testing.T) {
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := mustHandlerConfig(config.Config{
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		Providers: map[string]config.Provider{
+			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "k", Models: []string{"gpt-4o", "emb"}},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"emb": {
+				ID: "emb", ContextWindowTokens: 8192, MaxOutputTokens: 8191,
+				Operations: []string{config.ModelOperationEmbeddings}, RouteOwner: "openai",
+			},
+			"gpt-4o": {
+				ID: "gpt-4o", ContextWindowTokens: 128000, MaxOutputTokens: 16384,
+				Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "openai",
+			},
+		},
+	})
+	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	getRec := newResponseRecorder()
+	handler.ServeHTTP(getRec, newRequest(http.MethodGet, "/v1/models", ""))
+	postRec := newResponseRecorder()
+	handler.ServeHTTP(postRec, newRequest(http.MethodPost, "/v1/models", ""))
+	if getRec.Code != 200 || postRec.Code != 200 {
+		t.Fatalf("status get=%d post=%d", getRec.Code, postRec.Code)
+	}
+	var getPayload, postPayload ModelsListResponse
+	if err := json.Unmarshal(getRec.Body.Bytes(), &getPayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(postRec.Body.Bytes(), &postPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(getPayload.Data) != 2 || len(postPayload.Data) != 2 {
+		t.Fatalf("len get=%d post=%d", len(getPayload.Data), len(postPayload.Data))
+	}
+	// stable order by case-fold id: emb, gpt-4o
+	if getPayload.Data[0].ID != "emb" || getPayload.Data[1].ID != "gpt-4o" {
+		t.Fatalf("order = %q %q", getPayload.Data[0].ID, getPayload.Data[1].ID)
+	}
+	getBody, err := json.Marshal(getPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postBody, err := json.Marshal(postPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(getPayload, postPayload) {
+		t.Fatalf("GET/POST payload mismatch: get=%s post=%s", getBody, postBody)
+	}
+	if getPayload.Data[0].OwnedBy != "openai" || getPayload.Data[1].OwnedBy != "openai" {
+		t.Fatalf("owned_by = %#v", getPayload.Data)
+	}
+}
+
+func TestEmbeddingOnlyRejectsMessagesResponsesCompletions(t *testing.T) {
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := mustHandlerConfig(config.Config{
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		Providers: map[string]config.Provider{
+			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: "k", Models: []string{"emb-only"}},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"emb-only": {
+				ID: "emb-only", ContextWindowTokens: 8192, MaxOutputTokens: 8191,
+				Operations: []string{config.ModelOperationEmbeddings}, RouteOwner: "openai",
+			},
+		},
+	})
+	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	hits := 0
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hits++
+		t.Fatalf("upstream should not be called: %s", r.URL.Path)
+		return nil, nil
+	})
+	for _, path := range []string{"/v1/messages", "/v1/responses", "/v1/completions", "/v1/chat/completions"} {
+		rec := newResponseRecorder()
+		body := `{"model":"emb-only","messages":[{"role":"user","content":"hi"}],"input":"hi","prompt":"hi"}`
+		handler.ServeHTTP(rec, newRequest(http.MethodPost, path, body))
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "operation_unsupported") {
+			t.Fatalf("path %s status=%d body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("upstream hits=%d", hits)
+	}
+}
+
+func TestAPIErrorDoesNotLeakSecrets(t *testing.T) {
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := "sk-super-secret-key-should-not-leak"
+	cfg := mustHandlerConfig(config.Config{
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		Providers: map[string]config.Provider{
+			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://openai.test", APIKey: secret, Models: []string{"gpt-chat"}},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"gpt-chat": {
+				ID: "gpt-chat", ContextWindowTokens: 128000, MaxOutputTokens: 16384,
+				Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "openai",
+			},
+		},
+	})
+	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	rec := newResponseRecorder()
+	handler.ServeHTTP(rec, newRequest(http.MethodPost, "/v1/embeddings", `{"model":"gpt-chat","input":"hi"}`))
+	body := rec.Body.String()
+	if strings.Contains(body, secret) || strings.Contains(body, "Authorization") {
+		t.Fatalf("error leaked secret: %s", body)
+	}
+	if !strings.Contains(body, "operation_unsupported") {
+		t.Fatalf("body=%s", body)
+	}
+}
+
+func TestNewHandlerRejectsUnresolvedConfig(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for unresolved config")
+		}
+	}()
+	_ = NewHandler(config.Config{
+		Providers: map[string]config.Provider{
+			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://x", APIKey: "k"},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"gpt-x": {ID: "gpt-x", ContextWindowTokens: 100, MaxOutputTokens: 10, Operations: []string{"chat_completions"}},
+		},
+	}, stats.NewCSVRecorder(filepath.Join(t.TempDir(), "u.csv")), nil, metrics.NewRegistry())
+}
+
+func TestNewHandlerAllowsEmptyCatalog(t *testing.T) {
+	cfg := config.Config{
+		Providers: map[string]config.Provider{
+			"openai": {
+				Name: "openai", Protocol: "openai", BaseURL: "https://x", APIKey: "k",
+				EndpointCapabilities: []string{config.EndpointCapabilityChatCompletions},
+			},
+		},
+		ModelCatalog: map[string]config.ModelInfo{},
+	}
+	h := NewHandler(cfg, stats.NewCSVRecorder(filepath.Join(t.TempDir(), "u.csv")), nil, metrics.NewRegistry())
+	if h == nil {
+		t.Fatal("handler nil")
+	}
+}
+
+func TestRequireResolvedConfigRejectsUnknownProtocol(t *testing.T) {
+	err := requireResolvedConfig(config.Config{
+		Providers: map[string]config.Provider{
+			"weird": {
+				Name: "weird", Protocol: "foo", BaseURL: "https://x", APIKey: "k",
+				EndpointCapabilities: []string{config.EndpointCapabilityChatCompletions},
+			},
+		},
+		ModelCatalog: map[string]config.ModelInfo{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "unknown protocol") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRequireResolvedConfigRejectsDuplicateCapabilities(t *testing.T) {
+	err := requireResolvedConfig(config.Config{
+		Providers: map[string]config.Provider{
+			"openai": {
+				Name: "openai", Protocol: "openai", BaseURL: "https://x", APIKey: "k",
+				EndpointCapabilities: []string{
+					config.EndpointCapabilityChatCompletions,
+					config.EndpointCapabilityChatCompletions,
+				},
+			},
+		},
+		ModelCatalog: map[string]config.ModelInfo{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRequireResolvedConfigRejectsUnsortedOperations(t *testing.T) {
+	err := requireResolvedConfig(config.Config{
+		Providers: map[string]config.Provider{
+			"openai": {
+				Name: "openai", Protocol: "openai", BaseURL: "https://x", APIKey: "k",
+				Models: []string{"multi"},
+				EndpointCapabilities: []string{
+					config.EndpointCapabilityChatCompletions,
+					config.EndpointCapabilityEmbeddings,
+				},
+			},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"multi": {
+				ID: "multi", ContextWindowTokens: 1000, MaxOutputTokens: 100,
+				// embeddings 应在 chat_completions 之后
+				Operations: []string{config.ModelOperationEmbeddings, config.ModelOperationChatCompletions},
+				RouteOwner: "openai",
+			},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "sorted") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRequireResolvedConfigAllowsEmptyCatalog(t *testing.T) {
+	err := requireResolvedConfig(config.Config{
+		Providers: map[string]config.Provider{
+			"openai": {
+				Name: "openai", Protocol: "openai", BaseURL: "https://x", APIKey: "k",
+				EndpointCapabilities: []string{config.EndpointCapabilityChatCompletions},
+			},
+		},
+		ModelCatalog: map[string]config.ModelInfo{},
+	})
+	if err != nil {
+		t.Fatalf("empty catalog should be allowed: %v", err)
+	}
+}
+
+func TestRetryableUpstreamErrorDoesNotSwitchProvider(t *testing.T) {
+	// 5xx 仅打唯一 RouteOwner,不切换其它 provider。
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosts := []string{}
+	cfg := mustHandlerConfig(config.Config{
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		Providers: map[string]config.Provider{
+			"primary": {Name: "primary", Protocol: "openai", BaseURL: "https://primary.test", APIKey: "k", Models: []string{"gpt-test"}},
+			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "k", Models: []string{"other-*"}},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"gpt-test": {
+				ID: "gpt-test", ContextWindowTokens: 128000, MaxOutputTokens: 16384,
+				Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "primary",
+			},
+		},
+	})
+	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hosts = append(hosts, r.URL.Host)
+		return testResponse(http.StatusBadGateway, "application/json", `{"error":"bad gateway"}`), nil
+	})
+	rec := newResponseRecorder()
+	handler.ServeHTTP(rec, newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(hosts) != 1 || hosts[0] != "primary.test" {
+		t.Fatalf("hosts=%v, want only primary.test once", hosts)
+	}
+}
+
+func TestNetworkErrorDoesNotSwitchProvider(t *testing.T) {
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosts := []string{}
+	cfg := mustHandlerConfig(config.Config{
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		Providers: map[string]config.Provider{
+			"primary": {Name: "primary", Protocol: "openai", BaseURL: "https://primary.test", APIKey: "k", Models: []string{"gpt-test"}},
+			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "k", Models: []string{"other-*"}},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"gpt-test": {
+				ID: "gpt-test", ContextWindowTokens: 128000, MaxOutputTokens: 16384,
+				Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "primary",
+			},
+		},
+	})
+	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hosts = append(hosts, r.URL.Host)
+		return nil, fmt.Errorf("connection refused")
+	})
+	rec := newResponseRecorder()
+	handler.ServeHTTP(rec, newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(hosts) != 1 || hosts[0] != "primary.test" {
+		t.Fatalf("hosts=%v, want only primary.test once", hosts)
+	}
+}
+
+func TestFirstStreamEventFailureDoesNotSwitchProvider(t *testing.T) {
+	usageFile := filepath.Join(t.TempDir(), "usage.csv")
+	interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosts := []string{}
+	cfg := mustHandlerConfig(config.Config{
+		ListenAddr:     ":0",
+		UsageFile:      usageFile,
+		InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+		Providers: map[string]config.Provider{
+			"primary": {Name: "primary", Protocol: "openai", BaseURL: "https://primary.test", APIKey: "k", Models: []string{"gpt-test"}},
+			"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "k", Models: []string{"other-*"}},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"gpt-test": {
+				ID: "gpt-test", ContextWindowTokens: 128000, MaxOutputTokens: 16384,
+				Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "primary",
+			},
+		},
+	})
+	handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hosts = append(hosts, r.URL.Host)
+		return testResponse(http.StatusOK, "text/event-stream", "data: incomplete-first-event"), nil
+	})
+
+	rec := newResponseRecorder()
+	handler.ServeHTTP(rec, newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(hosts) != 1 || hosts[0] != "primary.test" {
+		t.Fatalf("hosts=%v, want only primary.test once", hosts)
+	}
+}
+
+func TestRequireResolvedConfigMalformedTable(t *testing.T) {
+	baseProvider := config.Provider{
+		Name: "openai", Protocol: "openai", BaseURL: "https://x", APIKey: "k",
+		Models: []string{"gpt-x", "multi"},
+		EndpointCapabilities: []string{
+			config.EndpointCapabilityChatCompletions,
+			config.EndpointCapabilityEmbeddings,
+		},
+	}
+	validCatalog := map[string]config.ModelInfo{
+		"gpt-x": {
+			ID: "gpt-x", ContextWindowTokens: 1000, MaxOutputTokens: 100,
+			Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "openai",
+		},
+	}
+	cases := []struct {
+		name    string
+		cfg     config.Config
+		wantSub string
+	}{
+		{
+			name: "unknown protocol",
+			cfg: config.Config{
+				Providers: map[string]config.Provider{
+					"weird": {
+						Name: "weird", Protocol: "foo", BaseURL: "https://x", APIKey: "k",
+						EndpointCapabilities: []string{config.EndpointCapabilityChatCompletions},
+					},
+				},
+			},
+			wantSub: "unknown protocol",
+		},
+		{
+			name: "unknown capability",
+			cfg: config.Config{
+				Providers: map[string]config.Provider{
+					"openai": {
+						Name: "openai", Protocol: "openai", BaseURL: "https://x", APIKey: "k",
+						EndpointCapabilities: []string{"widgets"},
+					},
+				},
+			},
+			wantSub: "unknown value",
+		},
+		{
+			name: "duplicate capability",
+			cfg: config.Config{
+				Providers: map[string]config.Provider{
+					"openai": {
+						Name: "openai", Protocol: "openai", BaseURL: "https://x", APIKey: "k",
+						EndpointCapabilities: []string{
+							config.EndpointCapabilityChatCompletions,
+							config.EndpointCapabilityChatCompletions,
+						},
+					},
+				},
+			},
+			wantSub: "duplicate",
+		},
+		{
+			name: "unsorted capability",
+			cfg: config.Config{
+				Providers: map[string]config.Provider{
+					"openai": {
+						Name: "openai", Protocol: "openai", BaseURL: "https://x", APIKey: "k",
+						EndpointCapabilities: []string{
+							config.EndpointCapabilityEmbeddings,
+							config.EndpointCapabilityChatCompletions,
+						},
+					},
+				},
+			},
+			wantSub: "sorted",
+		},
+		{
+			name: "illegal capacity",
+			cfg: config.Config{
+				Providers: map[string]config.Provider{"openai": baseProvider},
+				ModelCatalog: map[string]config.ModelInfo{
+					"gpt-x": {
+						ID: "gpt-x", ContextWindowTokens: 100, MaxOutputTokens: 100,
+						Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "openai",
+					},
+				},
+			},
+			wantSub: "max_output_tokens",
+		},
+		{
+			name: "case-fold duplicate",
+			cfg: config.Config{
+				Providers: map[string]config.Provider{
+					"openai": {
+						Name: "openai", Protocol: "openai", BaseURL: "https://x", APIKey: "k",
+						// 同时匹配两种原文 id,确保先通过 RouteOwner 匹配再触发 case-fold 校验。
+						Models: []string{"GPT-X", "gpt-x"},
+						EndpointCapabilities: []string{
+							config.EndpointCapabilityChatCompletions,
+							config.EndpointCapabilityEmbeddings,
+						},
+					},
+				},
+				ModelCatalog: map[string]config.ModelInfo{
+					"GPT-X": {
+						ID: "GPT-X", ContextWindowTokens: 1000, MaxOutputTokens: 100,
+						Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "openai",
+					},
+					"gpt-x": {
+						ID: "gpt-x", ContextWindowTokens: 1000, MaxOutputTokens: 100,
+						Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "openai",
+					},
+				},
+			},
+			wantSub: "case-fold",
+		},
+		{
+			name: "wrong route owner",
+			cfg: config.Config{
+				Providers: map[string]config.Provider{
+					"openai": baseProvider,
+					"other": {
+						Name: "other", Protocol: "openai", BaseURL: "https://y", APIKey: "k",
+						Models:               []string{"nope"},
+						EndpointCapabilities: []string{config.EndpointCapabilityChatCompletions},
+					},
+				},
+				ModelCatalog: map[string]config.ModelInfo{
+					"gpt-x": {
+						ID: "gpt-x", ContextWindowTokens: 1000, MaxOutputTokens: 100,
+						Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "other",
+					},
+				},
+			},
+			wantSub: "does not match model",
+		},
+		{
+			name: "operation readiness",
+			cfg: config.Config{
+				Providers: map[string]config.Provider{
+					"openai": {
+						Name: "openai", Protocol: "openai", BaseURL: "https://x", APIKey: "k",
+						Models:               []string{"gpt-x"},
+						EndpointCapabilities: []string{config.EndpointCapabilityChatCompletions},
+					},
+				},
+				ModelCatalog: map[string]config.ModelInfo{
+					"gpt-x": {
+						ID: "gpt-x", ContextWindowTokens: 1000, MaxOutputTokens: 100,
+						Operations: []string{config.ModelOperationEmbeddings}, RouteOwner: "openai",
+					},
+				},
+			},
+			wantSub: "not serviceable",
+		},
+		{
+			name: "unsorted operations",
+			cfg: config.Config{
+				Providers: map[string]config.Provider{"openai": baseProvider},
+				ModelCatalog: map[string]config.ModelInfo{
+					"multi": {
+						ID: "multi", ContextWindowTokens: 1000, MaxOutputTokens: 100,
+						Operations: []string{config.ModelOperationEmbeddings, config.ModelOperationChatCompletions},
+						RouteOwner: "openai",
+					},
+				},
+			},
+			wantSub: "sorted",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := requireResolvedConfig(tc.cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error = %v, want substring %q", err, tc.wantSub)
+			}
+		})
+	}
+	// empty catalog with valid provider is allowed
+	if err := requireResolvedConfig(config.Config{
+		Providers:    map[string]config.Provider{"openai": baseProvider},
+		ModelCatalog: map[string]config.ModelInfo{},
+	}); err != nil {
+		t.Fatalf("empty catalog: %v", err)
+	}
+	_ = validCatalog
+}
+
+func TestSingleRouteOwnerDoesNotSwitchOnRetryableStatuses(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			usageFile := filepath.Join(t.TempDir(), "usage.csv")
+			interactionRecorder, err := archive.NewRecorder(filepath.Join(filepath.Dir(usageFile), "interactions"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			hosts := []string{}
+			cfg := mustHandlerConfig(config.Config{
+				ListenAddr:     ":0",
+				UsageFile:      usageFile,
+				InteractionDir: filepath.Join(filepath.Dir(usageFile), "interactions"),
+				Providers: map[string]config.Provider{
+					"primary": {Name: "primary", Protocol: "openai", BaseURL: "https://primary.test", APIKey: "k", Models: []string{"gpt-test"}},
+					"backup":  {Name: "backup", Protocol: "openai", BaseURL: "https://backup.test", APIKey: "k", Models: []string{"other-*"}},
+				},
+				ModelCatalog: map[string]config.ModelInfo{
+					"gpt-test": {
+						ID: "gpt-test", ContextWindowTokens: 128000, MaxOutputTokens: 16384,
+						Operations: []string{config.ModelOperationChatCompletions}, RouteOwner: "primary",
+					},
+				},
+			})
+			handler := NewHandler(cfg, stats.NewCSVRecorder(usageFile), interactionRecorder, metrics.NewRegistry())
+			handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				hosts = append(hosts, r.URL.Host)
+				return testResponse(status, "application/json", `{"error":"retryable"}`), nil
+			})
+			rec := newResponseRecorder()
+			handler.ServeHTTP(rec, newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`))
+			if rec.Code != status {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if len(hosts) != 1 || hosts[0] != "primary.test" {
+				t.Fatalf("hosts=%v", hosts)
+			}
+		})
 	}
 }

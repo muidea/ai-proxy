@@ -41,7 +41,6 @@ type StatsErrors struct {
 	Upstream5xx       int64            `json:"upstream_5xx"`
 	UpstreamTimeout   int64            `json:"upstream_timeout"`
 	UpstreamRateLimit int64            `json:"upstream_rate_limit"`
-	FallbackTriggered int64            `json:"fallback_triggered"`
 	ByStatusCode      map[string]int64 `json:"upstream_by_status_code"`
 }
 
@@ -124,11 +123,6 @@ func buildStatsLocked(r *Registry) StatsJSON {
 			errors.UpstreamRateLimit += count
 		}
 	}
-	for k, v := range r.fallbackAttempts {
-		errors.FallbackTriggered += int64(v)
-		_ = k
-	}
-
 	latency := make(map[string]quantileSummary, len(r.latencySamples))
 	for key, samples := range r.latencySamples {
 		if len(samples) == 0 {

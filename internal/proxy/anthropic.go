@@ -64,14 +64,18 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	}
 	model, _ := body["model"].(string)
 	stream, _ := body["stream"].(bool)
-	providerName, err := h.resolveProviderName(r, model)
-	if err != nil {
-		h.writeArchivedError(w, round, r, start, "", model, stream, http.StatusBadRequest, err.Error())
+	providerName, _, apiErr := h.resolveProviderName(r, model)
+	if apiErr != nil {
+		h.writeArchivedAPIError(w, round, r, start, "", model, stream, statusForAPIError(apiErr), *apiErr)
 		return
 	}
 	provider, ok := h.cfg.Providers[providerName]
 	if !ok {
-		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadRequest, fmt.Sprintf("provider %q is not configured", providerName))
+		h.writeArchivedAPIError(w, round, r, start, providerName, model, stream, http.StatusServiceUnavailable, APIError{
+			Code:    ErrorCodeProviderUnavailable,
+			Message: fmt.Sprintf("provider %q is not configured", providerName),
+			Model:   model,
+		})
 		return
 	}
 	h.archiveAndLogProviderSelection(round, r, providerName, provider, model, stream)
@@ -90,7 +94,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 
 func (h *Handler) forwardAnthropicNative(w http.ResponseWriter, r *http.Request, round *archive.Round, start time.Time, providerName string, provider config.Provider, bodyBytes []byte, body map[string]any, model string, stream bool) {
 	streamRequest := stream || acceptsEventStream(r.Header)
-	result, err := h.doUpstreamWithFallback(r, round, providerName, provider, bodyBytes, len(bodyBytes), streamRequest)
+	result, err := h.doUpstream(r, round, providerName, provider, bodyBytes, len(bodyBytes), streamRequest)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 		return
@@ -150,7 +154,7 @@ func (h *Handler) convertAnthropicMessagesToOpenAI(w http.ResponseWriter, r *htt
 		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadRequest, err.Error())
 		return
 	}
-	result, err := h.doUpstreamWithFallbackPath(r, round, providerName, provider, openAIBody, len(openAIBody), stream, "/v1/chat/completions", "", http.MethodPost)
+	result, err := h.doUpstreamPath(r, round, providerName, provider, openAIBody, len(openAIBody), stream, "/v1/chat/completions", "", http.MethodPost)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 		return
@@ -200,7 +204,7 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 		return
 	}
 
-	result, err := h.doUpstreamWithFallbackPath(r, round, providerName, provider, encoded, len(encoded), stream, "/v1/messages", "", http.MethodPost)
+	result, err := h.doUpstreamPath(r, round, providerName, provider, encoded, len(encoded), stream, "/v1/messages", "", http.MethodPost)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 		return

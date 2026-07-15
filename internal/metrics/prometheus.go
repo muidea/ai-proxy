@@ -29,7 +29,6 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 		cacheCreationTokens:  copyTokenKeys(r.cacheCreationTokens),
 		cacheHitRate:         computeCacheHitRateLocked(r),
 		upstreamErrors:       copyErrorKeys(r.upstreamErrors),
-		fallbackAttempts:     copyFallbackKeys(r.fallbackAttempts),
 	}
 	r.mu.Unlock()
 
@@ -68,10 +67,6 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 	writeCounter(w, "ai_proxy_upstream_errors_total",
 		"Total upstream error responses, by provider and HTTP status code.",
 		snapshot.upstreamErrors, errorKeyLabels)
-
-	writeCounter(w, "ai_proxy_fallback_attempts_total",
-		"Total fallback attempts, by from-provider, to-provider, and reason.",
-		snapshot.fallbackAttempts, fallbackKeyLabels)
 
 	writeSLOWebhookMetrics(w, r.SLO())
 
@@ -118,7 +113,6 @@ type prometheusSnapshot struct {
 	cacheCreationTokens  map[tokenKey]uint64
 	cacheHitRate         map[tokenKey]float64
 	upstreamErrors       map[errorKey]uint64
-	fallbackAttempts     map[fallbackKey]uint64
 }
 
 func computeCacheHitRateLocked(r *Registry) map[tokenKey]float64 {
@@ -188,10 +182,6 @@ func tokenKeyLabels(k tokenKey) string {
 
 func errorKeyLabels(k errorKey) string {
 	return formatLabels("provider", k.Provider, "status_code", k.StatusCode)
-}
-
-func fallbackKeyLabels(k fallbackKey) string {
-	return formatLabels("from_provider", k.From, "to_provider", k.To, "reason", k.Reason)
 }
 
 func formatLabels(kv ...string) string {
@@ -297,12 +287,6 @@ func copyTokenKeys(src map[tokenKey]uint64) map[tokenKey]uint64 {
 
 func copyErrorKeys(src map[errorKey]uint64) map[errorKey]uint64 {
 	out := make(map[errorKey]uint64, len(src))
-	maps.Copy(out, src)
-	return out
-}
-
-func copyFallbackKeys(src map[fallbackKey]uint64) map[fallbackKey]uint64 {
-	out := make(map[fallbackKey]uint64, len(src))
 	maps.Copy(out, src)
 	return out
 }

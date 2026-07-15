@@ -74,7 +74,7 @@ Prometheus: `ai_proxy_requests_total{...,status,outcome}`；`/stats` 含 `reques
   - Anthropic：`POST /v1/messages`
   - 其它 `/v1/*` 返回 404
 - **纯 model 路由**：只根据 body 中的 `model` 与各 provider 的 `models` 规则匹配；已禁用 `X-AI-Provider`、`?provider=`、`provider/model` 前缀选择
-- **模型能力目录**：全局 `model_catalog` 配置上下文窗口；`GET /v1/models` 本地返回 `contextWindowTokens` / `maxOutputTokens`（不透传上游）
+- **模型能力目录**：全局 `model_catalog` 配置上下文窗口与 `operations`；`GET /v1/models` 本地返回 `contextWindowTokens` / `maxOutputTokens` / `operations`（不透传上游）
 - 双向基础协议转换：
   - OpenAI 客户端 → Anthropic 上游：`POST /v1/chat/completions` 命中 `protocol: anthropic` 时转换
   - Anthropic 客户端 → OpenAI 上游：`POST /v1/messages` 命中 `protocol: openai` 时转换
@@ -83,7 +83,7 @@ Prometheus: `ai_proxy_requests_total{...,status,outcome}`；`/stats` 含 `reques
 - 记录缓存使用量和缓存命中率（OpenAI cached_tokens / Anthropic cache_*_input_tokens）
 - 上游 4xx/5xx 错误状态码和错误体透传
 - CSV 追加写入并发安全；每轮交互归档到 `interactions/{round_id}/`
-- 同协议 provider fallback（网络错误 / 408 / 429 / 5xx）
+- 无 provider fallback：model 必须在 `model_catalog` 唯一路由，未匹配直接 typed 4xx
 
 ## 配置
 
@@ -93,11 +93,12 @@ Prometheus: `ai_proxy_requests_total{...,status,outcome}`；`/stats` 含 `reques
 cp config.example.yaml config.yaml
 ```
 
-也可以只用环境变量：
+配置文件中的 `api_key` 等字段可用 `${ENV}` 展开，但 **provider 本身必须写在 config.yaml**：
 
 ```bash
-export OPENAI_API_KEY=sk-...
+export OPENAI_API_KEY=sk-...   # 供 config 中 ${OPENAI_API_KEY} 展开
 export AI_PROXY_LISTEN_ADDR=127.0.0.1:8080
+cp config.example.yaml config.yaml   # 编辑 providers / model_catalog / endpoint_capabilities
 make run
 ```
 
@@ -117,16 +118,11 @@ make run
 - `AI_PROXY_LOG_FORMAT` / `LOG_FORMAT`: 日志格式，`json` 或 `text`；`text` 会按日志等级给 `level=` 字段着色。
 - `AI_PROXY_REQUEST_TIMEOUT_SECONDS`: 非流式请求总超时、流式请求等待上游响应头的超时时间，默认 `300`。
 - `AI_PROXY_STREAM_IDLE_TIMEOUT_SECONDS`: 流式响应读取空闲超时，默认 `300`；设为 `0` 可禁用。该值不是流式请求总时长限制，只在连续没有收到 SSE 数据时触发。
-- `AI_PROXY_DEFAULT_PROVIDER`: 默认 provider 名称；当请求无 `model`、或 `models` 规则未命中时使用。
-- `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`: provider API Key。
-- `AI_PROXY_<PROVIDER>_API_KEY`, `<PROVIDER>_API_KEY`: 设置内置 provider API Key，例如 `AI_PROXY_OPENAI_API_KEY`、`DEEPSEEK_API_KEY`。
-- `AI_PROXY_<PROVIDER>_BASE_URL`, `<PROVIDER>_BASE_URL`: 覆盖内置 provider Base URL。
-- `AI_PROXY_<PROVIDER>_MODELS`, `<PROVIDER>_MODELS`: 覆盖内置 provider 模型匹配规则，例如 `deepseek*,gpt-*`。
-- `AI_PROXY_<PROVIDER>_FALLBACKS`, `<PROVIDER>_FALLBACKS`: 覆盖内置 provider fallback 列表。
-- `AI_PROXY_<PROVIDER>_ENABLED`, `<PROVIDER>_ENABLED`: 启用或禁用内置 provider。
+- Provider **仅**通过 `config.yaml` 的 `providers` 声明；**不支持**通过 env 注入/创建 provider。
+- 配置值可用 `${ENV}` 展开（例如 `api_key: ${OPENAI_API_KEY}`），但 provider 条目本身必须写在配置文件中。
+- 每个 enabled provider 必须显式配置 `endpoint_capabilities`（不得从 protocol 推断）。
 - `AI_PROXY_METRICS_REMOTE_ACCESS`: 设为 `true` 开放 `/metrics` 与 `/stats` 端点的非 loopback 访问。
 - `AI_PROXY_METRICS_ALLOWED_CIDRS`: 逗号分隔的 CIDR 白名单(预留,P0 阶段未启用)。
-- `API_KEY`, `API_BASE_URL`: 创建名为 `custom` 的通用 provider。
 
 ### Provider 路由（仅 model）
 
@@ -138,27 +134,39 @@ make run
 
 路由规则：
 
-1. 从请求 body 读取 `model`（**严格区分大小写**，与配置原文匹配）
-2. 在所有 **enabled** provider 的 `models` 中匹配（精确名或 `*` 前缀，如 `gpt-*`、`DeepSeek-V4-Flash`；`models` 与 `model_catalog` id 均保留配置原文大小写）
-   - 0 命中 → 使用 `default_provider`（若配置）
-   - 1 命中 → 选用
-   - >1 命中 → **400**（请保证各 provider 的 `models` 不重叠）
-3. 无 `model`（如部分请求）→ 仅使用 `default_provider`；未配置则 400
+1. 从请求 body 读取 exact `model`（与 `model_catalog` 展示 ID 原文匹配）
+2. 在 `model_catalog` 中查找模型（启动时已保证唯一 RouteOwner）
+3. 校验入站 path 对应 operation 是否在模型 `operations` 中
+4. 校验 RouteOwner 的 `endpoint_capabilities`（含协议转换矩阵）是否支持该入站 path
+5. 仅请求该唯一上游；**无 provider fallback / default_provider**
+6. 无 model / 未登记 / operation 或 endpoint 不支持 → typed 4xx，不访问上游
 
 **已废弃（忽略）：** `X-AI-Provider` 头、`?provider=` 查询参数、`provider/model` 前缀。
 
 ### 模型上下文查询（`GET /v1/models`）
 
-在配置中用**全局** `model_catalog` 登记具体模型能力（各 provider 共用，与路由 `providers.*.models` 独立；**id 严格区分大小写**）：
+在配置中用**全局** `model_catalog` 登记具体模型能力（各 provider 共用）。`model_catalog` 是容量、operations 与确定路由的权威：
+- model id **case-fold 后全局唯一**（展示 ID 保留配置原文；`GPT-4o` 与 `gpt-4o` 不得并存）
+- 每个 catalog model 必须**唯一匹配**一个 enabled provider，作为 `owned_by` / RouteOwner
+- `operations` **必填**，仅允许 `chat_completions` / `embeddings`（可多选，逗号分隔）
+- **operations 是执行合同**：请求在访问上游前按 exact model 与入站 path 对应 operation 校验
+
+配置示例：
 
 ```yaml
 model_catalog:
   gpt-4o:
     context_window_tokens: 128000
     max_output_tokens: 16384
+    operations: chat_completions
   claude-sonnet-4-20250514:
     context_window_tokens: 200000
     max_output_tokens: 8192
+    operations: chat_completions
+  text-embedding-3-large:
+    context_window_tokens: 8192
+    max_output_tokens: 8191
+    operations: embeddings
 ```
 
 `GET /v1/models`（`POST` 同样）由代理**本地合成** OpenAI-compatible 列表，不再转发上游。示例响应：
@@ -173,7 +181,8 @@ model_catalog:
       "created": 0,
       "owned_by": "openai",
       "contextWindowTokens": 128000,
-      "maxOutputTokens": 16384
+      "maxOutputTokens": 16384,
+      "operations": ["chat_completions"]
     }
   ]
 }
@@ -182,28 +191,31 @@ model_catalog:
 说明：
 
 - 仅 catalog 中登记的模型会出现在列表中；仅有 `gpt-*` 通配不会自动展开
-- `owned_by` 在能唯一匹配到某个 enabled provider 时填 provider 名，否则为 `ai-proxy`
+- `owned_by` 为启动校验写入的确定 RouteOwner（enabled provider 名）；不存在 `ai-proxy` 回退
 - `contextWindowTokens` / `maxOutputTokens` 为扩展字段；值为 0 或未配置时省略
+- `operations` **始终输出**为非空数组；取值仅 `chat_completions` / `embeddings`
+- 请求前校验：model 必须在 catalog 中且声明了入站 path 对应 operation，否则返回 typed 400（`model_not_found` / `operation_unsupported` 等），**不访问上游**
+- path → operation：`/v1/chat/completions|/v1/messages|/v1/responses|/v1/completions` → `chat_completions`；`/v1/embeddings` → `embeddings`
 
 其它规则：
 
-- `default_provider` 必须指向已启用 provider，否则启动时报配置错误
+- **不支持** `default_provider`；配置中声明将启动失败（路由仅使用 model_catalog RouteOwner）
 - `enabled: false` 的 provider 不参与 model 匹配
-- `fallbacks` 仅切换**同协议**备用上游；触发条件为网络错误、408、429、5xx；400/401/403 不切换
+- **不支持** `fallbacks`；配置中声明 `fallbacks` 将启动失败
 - 协议转换：
   | 入站 path | 命中 provider.protocol | 行为 |
   |---|---|---|
-  | OpenAI 路径 | openai | 直通 |
+  | OpenAI 路径 | openai（已显式声明当前 path 的 endpoint capability） | 直通 |
   | `/v1/messages` | anthropic | 直通 |
-  | `/v1/chat/completions` | anthropic | OpenAI→Anthropic 文本转换（含 fallback）；tools/多模态/tool_calls 返回 400 |
-  | `/v1/messages` | openai | Anthropic→OpenAI 文本转换（含 fallback）；tools/多模态/tool_use 返回 400 |
+  | `/v1/chat/completions` | anthropic | OpenAI→Anthropic 文本转换（provider 须声明 `messages`）；tools/多模态/tool_calls 返回 400 |
+  | `/v1/messages` | openai | Anthropic→OpenAI 文本转换（provider 须声明 `chat_completions`）；tools/多模态/tool_use 返回 400 |
   | 其它 OpenAI 路径 | anthropic | 400（不支持该端点转换） |
 
 如果 `base_url` 已包含 `/v1`（含嵌套如 `.../codex/v1`），代理会避免重复拼接版本路径。
 
-fallback 尝试归档到 `fallback_attempts.json`；`usage.csv` / `metadata.json` 记录实际返回的 provider。流式响应在写出首包 SSE 前可 fallback：收到上游 HTTP 2xx 后会先探测首字节，若在首字节前断流/超时则继续切换同协议备用 provider。
+上游错误透传；`usage.csv` / `metadata.json` 记录实际 RouteOwner provider。流式响应在写出首包 SSE 前会探测首字节以便识别断流，但**不会**切换其它 provider。
 
-一个带 fallback 的 provider 示例（注意 `models` 互不重叠）：
+Provider 与 model_catalog 示例（`models` 互不重叠；catalog model 必须唯一命中）：
 
 ```yaml
 providers:
@@ -212,25 +224,28 @@ providers:
     protocol: openai
     base_url: https://primary.example/v1
     api_key: ${OPENAI_API_KEY}
+    endpoint_capabilities: chat_completions, responses, completions, embeddings
     models: gpt-*, chatgpt-*, o*, text-embedding-*
-    fallbacks: backup-openai, deepseek
   backup-openai:
     enabled: true
     protocol: openai
     base_url: https://backup.example/v1
     api_key: ${BACKUP_OPENAI_API_KEY}
+    endpoint_capabilities: chat_completions
     models: backup-gpt-*
   deepseek:
     enabled: true
     protocol: openai
     base_url: https://api.deepseek.com
     api_key: ${DEEPSEEK_API_KEY}
+    endpoint_capabilities: chat_completions
     models: deepseek*
   anthropic:
     enabled: true
     protocol: anthropic
     base_url: https://api.anthropic.com
     api_key: ${ANTHROPIC_API_KEY}
+    endpoint_capabilities: messages
     models: claude*
 ```
 
@@ -297,7 +312,6 @@ curl http://127.0.0.1:8080/stats
     "upstream_5xx": 50,
     "upstream_timeout": 12,
     "upstream_rate_limit": 8,
-    "fallback_triggered": 30,
     "upstream_by_status_code": {"502": 30, "504": 12, "429": 8}
   }
 }
@@ -311,7 +325,6 @@ curl http://127.0.0.1:8080/stats
 - `ai_proxy_cached_input_tokens_total{provider,model}` / `ai_proxy_cache_creation_input_tokens_total{provider,model}`
 - `ai_proxy_cache_hit_rate{provider,model}` — 缓存命中率
 - `ai_proxy_upstream_errors_total{provider,status_code}` — upstream 错误分布
-- `ai_proxy_fallback_attempts_total{from_provider,to_provider,reason}` — fallback 触发计数
 
 ## 构建单二进制
 
@@ -354,7 +367,6 @@ interactions/
     request.meta.json
     upstream_request.json
     upstream_response.json
-    fallback_attempts.json
     response.json
     metadata.json
   000002/
@@ -367,7 +379,7 @@ interactions/
     metadata.json
 ```
 
-非流式响应通常写入 `response.json`。流式响应始终写入原始 `response.sse`；其中 Chat Completions / Completions 与 Anthropic Messages 还会整理出完整 `response.json`（合并 delta / content_block）。**Responses API（`/v1/responses`）当前只保留原始 `response.sse`**，不生成整理后的 `response.json`（事件结构与 Chat Completions 不同）。`request.meta.json` 记录客户端方法、路径、查询参数、来源地址、User-Agent、Content-Length 和脱敏后的请求头；`upstream_request.json` 与 `upstream_response.json` 记录最终一次上游请求/响应；`fallback_attempts.json` 记录每次尝试的 provider、协议、状态码/错误、耗时和是否为 fallback；`metadata.json` 汇总最终 provider、model、耗时、HTTP 状态、token 统计、缓存读写 token 和缓存命中率，流式响应会额外记录 `full_response_path`。
+非流式响应通常写入 `response.json`。流式响应始终写入原始 `response.sse`；其中 Chat Completions / Completions 与 Anthropic Messages 还会整理出完整 `response.json`（合并 delta / content_block）。**Responses API（`/v1/responses`）当前只保留原始 `response.sse`**，不生成整理后的 `response.json`（事件结构与 Chat Completions 不同）。`request.meta.json` 记录客户端方法、路径、查询参数、来源地址、User-Agent、Content-Length 和脱敏后的请求头；`upstream_request.json` 与 `upstream_response.json` 记录唯一 RouteOwner 的上游请求/响应；`metadata.json` 汇总最终 provider、model、耗时、HTTP 状态、token 统计、缓存读写 token 和缓存命中率，流式响应会额外记录 `full_response_path`。
 
 调试日志默认输出到终端，包含每轮 round id、客户端请求摘要、provider/model 选择、上游请求、上游响应和最终 token 摘要。`Authorization`、`X-API-Key`、`Cookie` 等敏感头会显示为 `<redacted>`。
 最终 token 摘要也会带 `round`，并在流式读取中断、客户端写入失败等场景附带 `error`；对应错误也会写入该轮 `metadata.json`，便于并发请求交错时追踪完整生命周期。

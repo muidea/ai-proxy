@@ -45,11 +45,6 @@ type errorKey struct {
 	Provider, StatusCode string
 }
 
-// fallbackKey 是 fallback 触发的复合 label。
-type fallbackKey struct {
-	From, To, Reason string
-}
-
 // latencyKey 是延迟样本的复合 label。
 type latencyKey struct {
 	Provider, Model string
@@ -84,8 +79,6 @@ type Registry struct {
 	upstreamErrors   map[errorKey]uint64
 	upstreamAttempts map[string]uint64 // provider -> total attempts
 
-	fallbackAttempts map[fallbackKey]uint64
-
 	// knownModels 记录每个 provider 已见过的 model label(不含 _other),用于基数限制。
 	knownModels map[string]map[string]struct{} // provider -> set(model)
 
@@ -115,7 +108,6 @@ func NewRegistry() *Registry {
 		cachedTokenSumHits:        map[tokenKey]uint64{},
 		upstreamErrors:            map[errorKey]uint64{},
 		upstreamAttempts:          map[string]uint64{},
-		fallbackAttempts:          map[fallbackKey]uint64{},
 		knownModels:               map[string]map[string]struct{}{},
 	}
 }
@@ -280,16 +272,6 @@ func (r *Registry) RecordUpstreamError(provider string, status int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.upstreamErrors[errorKey{Provider: provider, StatusCode: strconv.Itoa(status)}]++
-}
-
-// RecordFallbackAttempt 累计一次 fallback 触发。reason 可为 status_code 或 "network"。
-func (r *Registry) RecordFallbackAttempt(from, to, reason string) {
-	if r == nil {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.fallbackAttempts[fallbackKey{From: from, To: to, Reason: reason}]++
 }
 
 // StartedAt 返回注册表创建时间;r 为 nil 时返回零值。

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -42,21 +43,27 @@ type Config struct {
 	LogFormat            string
 	RequestTimeout       time.Duration
 	StreamIdleTimeout    time.Duration
-	DefaultProvider      string
 	MetricsRemoteAccess  bool
 	MetricsAllowedCIDRs  []string
 	SLO                  SLOConfig
 	Providers            map[string]Provider
-	// ModelCatalog 是全局模型元数据目录,供 GET /v1/models 使用;与 provider 路由解耦。
+	// ModelCatalog 是全局模型元数据目录,供 GET /v1/models 使用;是请求路由与 /v1/models 的共同 authority。
 	ModelCatalog map[string]ModelInfo
 }
 
-// ModelInfo 描述客户端可查询的模型能力(各 provider 共用同一目录)。
+// ModelInfo 描述客户端可查询的模型能力与确定路由(各 provider 共用同一目录)。
+// Operations 为规范化执行合同,仅允许 chat_completions / embeddings。
+// RouteOwner 在启动校验后填入唯一匹配的 enabled provider 名。
 type ModelInfo struct {
 	ID                  string
 	ContextWindowTokens int
 	MaxOutputTokens     int
+	Operations          []string
+	RouteOwner          string
 }
+
+// MaxModelCatalogIDLength 限制 model_catalog id 长度,避免异常配置与标签膨胀。
+const MaxModelCatalogIDLength = 256
 
 // SLOConfig 描述可观测性层面的服务等级目标。
 type SLOConfig struct {
@@ -74,13 +81,15 @@ type SLOConfig struct {
 }
 
 type Provider struct {
-	Name      string
-	Protocol  string
-	BaseURL   string
-	APIKey    string
-	Models    []string
-	Fallbacks []string
-	Disabled  bool
+	Name     string
+	Protocol string
+	BaseURL  string
+	APIKey   string
+	Models   []string
+	// EndpointCapabilities 为 provider 显式声明的直通端点能力(非 protocol 推断)。
+	// 取值: chat_completions / messages / responses / completions / embeddings。
+	EndpointCapabilities []string
+	Disabled             bool
 }
 
 func Load(path string) (Config, error) {
@@ -263,7 +272,7 @@ func setTopLevel(cfg *Config, key, value string) error {
 		}
 		cfg.StreamIdleTimeout = time.Duration(n) * time.Second
 	case "default_provider":
-		cfg.DefaultProvider = value
+		return fmt.Errorf("default_provider is not supported; routing uses model_catalog RouteOwner only")
 	case "metrics_remote_access":
 		b, err := parseStrictBool(value)
 		if err != nil {
@@ -322,7 +331,13 @@ func setProvider(cfg *Config, name, key, value string) error {
 		// models 严格区分大小写,与请求 body.model 原文匹配。
 		provider.Models = parseModelList(value)
 	case "fallbacks", "fallback_providers":
-		provider.Fallbacks = parseList(value)
+		return fmt.Errorf("providers.%s: fallbacks is not supported; remove fallbacks and rely on unique model_catalog RouteOwner", name)
+	case "endpoint_capabilities", "endpoint_capability":
+		caps, err := parseEndpointCapabilities(value)
+		if err != nil {
+			return fmt.Errorf("providers.%s.endpoint_capabilities: %w", name, err)
+		}
+		provider.EndpointCapabilities = caps
 	case "enabled":
 		b, err := parseStrictBool(value)
 		if err != nil {
@@ -375,6 +390,12 @@ func setModelInfo(cfg *Config, id, key, value string) error {
 			return fmt.Errorf("model_catalog.%s.%s: %w", id, key, err)
 		}
 		info.MaxOutputTokens = n
+	case "operations", "operation":
+		ops, err := parseModelOperations(value)
+		if err != nil {
+			return fmt.Errorf("model_catalog.%s.%s: %w", id, key, err)
+		}
+		info.Operations = ops
 	default:
 		return fmt.Errorf("model_catalog.%s: unknown key %q", id, key)
 	}
@@ -464,9 +485,6 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.StreamIdleTimeout = time.Duration(n) * time.Second
 	}
-	if value := os.Getenv("AI_PROXY_DEFAULT_PROVIDER"); value != "" {
-		cfg.DefaultProvider = value
-	}
 	if value := os.Getenv("AI_PROXY_METRICS_REMOTE_ACCESS"); value != "" {
 		b, err := parseStrictBool(value)
 		if err != nil {
@@ -478,68 +496,14 @@ func applyEnv(cfg *Config) error {
 		cfg.MetricsAllowedCIDRs = parseList(value)
 	}
 
-	if err := applyProviderEnv(cfg, "openai", "https://api.openai.com"); err != nil {
-		return err
-	}
-	if err := applyProviderEnv(cfg, "deepseek", "https://api.deepseek.com"); err != nil {
-		return err
-	}
-	if err := applyProviderEnv(cfg, "anthropic", "https://api.anthropic.com"); err != nil {
-		return err
-	}
-
-	if key := os.Getenv("API_KEY"); key != "" {
-		provider := ensureProvider(cfg, "custom")
-		provider.APIKey = key
-		if base := os.Getenv("API_BASE_URL"); base != "" {
-			provider.BaseURL = base
-		}
-		cfg.Providers["custom"] = provider
-	}
-	return nil
-}
-
-func applyProviderEnv(cfg *Config, name, fallbackBaseURL string) error {
-	envPrefix := strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
-	key := firstEnv("AI_PROXY_"+envPrefix+"_API_KEY", envPrefix+"_API_KEY")
-	baseURL := firstEnv("AI_PROXY_"+envPrefix+"_BASE_URL", envPrefix+"_BASE_URL")
-	models := firstEnv("AI_PROXY_"+envPrefix+"_MODELS", envPrefix+"_MODELS")
-	fallbacks := firstEnv("AI_PROXY_"+envPrefix+"_FALLBACKS", envPrefix+"_FALLBACKS")
-	enabled := firstEnv("AI_PROXY_"+envPrefix+"_ENABLED", envPrefix+"_ENABLED")
-	if key == "" && baseURL == "" && models == "" && fallbacks == "" && enabled == "" {
-		return nil
-	}
-	provider := ensureProvider(cfg, name)
-	if key != "" {
-		provider.APIKey = key
-	}
-	if baseURL != "" {
-		provider.BaseURL = baseURL
-	} else if provider.BaseURL == "" {
-		provider.BaseURL = fallbackBaseURL
-	}
-	if provider.Protocol == "" && name == "anthropic" {
-		provider.Protocol = "anthropic"
-	}
-	if models != "" {
-		// models 严格区分大小写,与请求 body.model 原文匹配。
-		provider.Models = parseModelList(models)
-	}
-	if fallbacks != "" {
-		provider.Fallbacks = parseList(fallbacks)
-	}
-	if enabled != "" {
-		b, err := parseStrictBool(enabled)
-		if err != nil {
-			return fmt.Errorf("%s_ENABLED: %w", envPrefix, err)
-		}
-		provider.Disabled = !b
-	}
-	cfg.Providers[name] = provider
+	// Provider 仅从 config 文件声明;不支持通过 env 注入/创建 provider。
+	// api_key 等字段仍可用 ${ENV} 在配置文件中展开。
 	return nil
 }
 
 func ensureKnownProviders(cfg *Config) {
+	// 仅补齐已在配置中声明的 provider 的 name/protocol/baseURL 缺省;
+	// 不创建 provider,不默认补 endpoint_capabilities(必须在配置中显式声明)。
 	defaults := map[string]string{
 		"openai":    "https://api.openai.com",
 		"deepseek":  "https://api.deepseek.com",
@@ -565,7 +529,6 @@ func ensureKnownProviders(cfg *Config) {
 
 func normalize(cfg *Config) error {
 	cfg.LogFormat = normalizeLogFormat(cfg.LogFormat)
-	cfg.DefaultProvider = strings.ToLower(strings.TrimSpace(cfg.DefaultProvider))
 	cfg.InboundAPIKey = strings.TrimSpace(cfg.InboundAPIKey)
 	if cfg.MaxRequestBodyBytes <= 0 {
 		cfg.MaxRequestBodyBytes = DefaultMaxRequestBodyBytes
@@ -596,8 +559,11 @@ func normalize(cfg *Config) error {
 		provider.BaseURL = strings.TrimRight(provider.BaseURL, "/")
 		// models 严格区分大小写,与请求 body.model 原文匹配。
 		provider.Models = normalizeModelPatterns(provider.Models)
-		// fallbacks 是 provider 名,与 provider 键一样做大小写折叠。
-		provider.Fallbacks = normalizeList(provider.Fallbacks)
+		caps, err := normalizeEndpointCapabilities(provider.EndpointCapabilities)
+		if err != nil {
+			return fmt.Errorf("provider %q endpoint_capabilities: %w", key, err)
+		}
+		provider.EndpointCapabilities = caps
 		normalized[key] = provider
 	}
 	cfg.Providers = normalized
@@ -606,6 +572,7 @@ func normalize(cfg *Config) error {
 		cfg.ModelCatalog = map[string]ModelInfo{}
 	}
 	catalog := make(map[string]ModelInfo, len(cfg.ModelCatalog))
+	seenFold := map[string]string{} // lower -> display id
 	for name, info := range cfg.ModelCatalog {
 		id := strings.TrimSpace(info.ID)
 		if id == "" {
@@ -614,6 +581,9 @@ func normalize(cfg *Config) error {
 		if id == "" {
 			continue
 		}
+		if err := validateModelCatalogID(id); err != nil {
+			return fmt.Errorf("model_catalog.%s: %w", id, err)
+		}
 		info.ID = id
 		if info.ContextWindowTokens < 0 {
 			info.ContextWindowTokens = 0
@@ -621,10 +591,24 @@ func normalize(cfg *Config) error {
 		if info.MaxOutputTokens < 0 {
 			info.MaxOutputTokens = 0
 		}
-		// model id 严格区分大小写:查找键与展示 ID 均保留配置原文。
+		ops, err := normalizeModelOperations(info.Operations)
+		if err != nil {
+			return fmt.Errorf("model_catalog.%s.operations: %w", id, err)
+		}
+		if len(ops) == 0 {
+			return fmt.Errorf("model_catalog.%s.operations: at least one of chat_completions, embeddings is required", id)
+		}
+		info.Operations = ops
+		// case-fold 后全局唯一,避免 WorkOrch 刷新目录时因大小写重复拒绝整表。
+		fold := strings.ToLower(id)
+		if prev, ok := seenFold[fold]; ok {
+			return fmt.Errorf("duplicate model_catalog id after case fold: %q and %q both map to %q", prev, id, fold)
+		}
 		if prev, ok := catalog[id]; ok {
 			return fmt.Errorf("duplicate model_catalog id: %q (also seen as %q)", id, prev.ID)
 		}
+		seenFold[fold] = id
+		info.RouteOwner = "" // filled in validateModelRoutes
 		catalog[id] = info
 	}
 	cfg.ModelCatalog = catalog
@@ -651,18 +635,18 @@ func validateMetricsCIDRs(cidrs []string) error {
 
 func validate(cfg Config) error {
 	if len(cfg.Providers) == 0 {
-		return fmt.Errorf("no providers configured; set config.yaml providers or OPENAI_API_KEY/API_KEY")
+		return fmt.Errorf("no providers configured; declare providers in config.yaml")
 	}
 	if !hasEnabledProvider(cfg.Providers) {
 		return fmt.Errorf("no enabled providers configured")
-	}
-	if err := validateDefaultProvider(cfg); err != nil {
-		return err
 	}
 	if err := validateListenAndAuth(cfg); err != nil {
 		return err
 	}
 	if err := validateProviders(cfg); err != nil {
+		return err
+	}
+	if err := validateModelRoutes(cfg); err != nil {
 		return err
 	}
 	if err := validateSLO(cfg.SLO); err != nil {
@@ -742,17 +726,11 @@ func validateProviders(cfg Config) error {
 		default:
 			return fmt.Errorf("provider %q has unknown protocol %q (want openai or anthropic)", name, provider.Protocol)
 		}
-		for _, fb := range provider.Fallbacks {
-			fallback, ok := cfg.Providers[fb]
-			if !ok {
-				return fmt.Errorf("provider %q fallback %q is not configured", name, fb)
-			}
-			if fallback.Disabled {
-				continue
-			}
-			if fallback.Protocol != provider.Protocol {
-				return fmt.Errorf("provider %q fallback %q has protocol %q, want same as primary %q", name, fb, fallback.Protocol, provider.Protocol)
-			}
+		if len(provider.EndpointCapabilities) == 0 {
+			return fmt.Errorf("provider %q endpoint_capabilities is required (explicit; not inferred from protocol)", name)
+		}
+		if err := validateProtocolEndpointCaps(provider.Protocol, provider.EndpointCapabilities); err != nil {
+			return fmt.Errorf("provider %q: %w", name, err)
 		}
 	}
 	return nil
@@ -795,20 +773,6 @@ func hasEnabledProvider(providers map[string]Provider) bool {
 		}
 	}
 	return false
-}
-
-func validateDefaultProvider(cfg Config) error {
-	if cfg.DefaultProvider == "" {
-		return nil
-	}
-	provider, ok := cfg.Providers[cfg.DefaultProvider]
-	if !ok {
-		return fmt.Errorf("default_provider %q is not configured", cfg.DefaultProvider)
-	}
-	if provider.Disabled {
-		return fmt.Errorf("default_provider %q is disabled", cfg.DefaultProvider)
-	}
-	return nil
 }
 
 func stripComment(line string) string {
@@ -940,7 +904,7 @@ func parseStrictFloat(value string) (float64, error) {
 	return parsed, nil
 }
 
-// parseList 解析逗号分隔列表,并折叠为小写(用于 provider fallbacks / CIDR 等)。
+// parseList 解析逗号分隔列表,并折叠为小写(用于 CIDR 等)。
 func parseList(value string) []string {
 	return parseCSVList(value, true)
 }
@@ -971,7 +935,7 @@ func parseCSVList(value string, foldCase bool) []string {
 	return items
 }
 
-// normalizeList 折叠为小写(provider fallbacks 等)。
+// normalizeList 折叠为小写(CIDR 等)。
 func normalizeList(values []string) []string {
 	return normalizeCSVList(values, true)
 }
@@ -996,4 +960,392 @@ func normalizeCSVList(values []string, foldCase bool) []string {
 		}
 	}
 	return normalized
+}
+
+// 允许的 model_catalog.operations 取值(与 WorkOrch LLMOperation 对齐)。
+const (
+	ModelOperationChatCompletions = "chat_completions"
+	ModelOperationEmbeddings      = "embeddings"
+)
+
+// parseModelOperations 解析 model_catalog.operations(逗号分隔或单值),保留已知枚举大小写折叠后的规范名。
+func parseModelOperations(value string) ([]string, error) {
+	raw := parseCSVList(value, true)
+	return normalizeModelOperations(raw)
+}
+
+// normalizeModelOperations 去重并稳定排序;仅允许 chat_completions / embeddings。
+func normalizeModelOperations(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		op := strings.ToLower(strings.TrimSpace(value))
+		if op == "" {
+			continue
+		}
+		switch op {
+		case ModelOperationChatCompletions, ModelOperationEmbeddings:
+		default:
+			return nil, fmt.Errorf("unknown operation %q (allowed: chat_completions, embeddings)", value)
+		}
+		if _, ok := seen[op]; ok {
+			continue
+		}
+		seen[op] = struct{}{}
+		out = append(out, op)
+	}
+	// 稳定顺序:chat_completions 在前,embeddings 在后。
+	sort.SliceStable(out, func(i, j int) bool {
+		return operationRank(out[i]) < operationRank(out[j])
+	})
+	return out, nil
+}
+
+func operationRank(op string) int {
+	switch op {
+	case ModelOperationChatCompletions:
+		return 0
+	case ModelOperationEmbeddings:
+		return 1
+	default:
+		return 100
+	}
+}
+
+func validateModelCatalogID(id string) error {
+	if id == "" {
+		return fmt.Errorf("id is empty")
+	}
+	if len(id) > MaxModelCatalogIDLength {
+		return fmt.Errorf("id exceeds max length %d", MaxModelCatalogIDLength)
+	}
+	for _, r := range id {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("id contains control character")
+		}
+	}
+	return nil
+}
+
+// validateModelRoutes 保证每个 catalog model:
+// 1) 容量完整且 max_output < context_window;
+// 2) 唯一匹配一个 enabled provider,并写入 RouteOwner。
+// 校验通过后 ModelCatalog 成为路由与 /v1/models 的唯一 authority;无 fallback 兜底。
+func validateModelRoutes(cfg Config) error {
+	// mutate via reassignment of map values
+	// caller holds cfg by value but map is reference — safe to update entries.
+	for id, info := range cfg.ModelCatalog {
+		if info.ContextWindowTokens <= 0 || info.MaxOutputTokens <= 0 {
+			return fmt.Errorf("model_catalog.%s: context_window_tokens and max_output_tokens must both be positive", id)
+		}
+		if info.MaxOutputTokens >= info.ContextWindowTokens {
+			return fmt.Errorf("model_catalog.%s: max_output_tokens must be less than context_window_tokens", id)
+		}
+		matches := matchingEnabledProviders(cfg.Providers, id)
+		switch len(matches) {
+		case 0:
+			return fmt.Errorf("model_catalog.%s: no enabled provider matches model; configure providers.*.models", id)
+		case 1:
+			info.RouteOwner = matches[0]
+		default:
+			return fmt.Errorf("model_catalog.%s: multiple enabled providers match model %v; disambiguate providers.*.models", id, matches)
+		}
+		primary, ok := cfg.Providers[info.RouteOwner]
+		if !ok || primary.Disabled {
+			return fmt.Errorf("model_catalog.%s: route owner %q is missing or disabled", id, info.RouteOwner)
+		}
+		if !ProviderMatchesModel(info.RouteOwner, primary, id) {
+			return fmt.Errorf("model_catalog.%s: route owner %q models do not match model id", id, info.RouteOwner)
+		}
+		// catalog operations 必须可被 RouteOwner 在 canonical 入站 path 上服务。
+		if err := validateModelOperationsAgainstProvider(id, info.Operations, primary); err != nil {
+			return err
+		}
+		cfg.ModelCatalog[id] = info
+	}
+	return nil
+}
+
+// validateModelOperationsAgainstProvider 保证每个 operation 的 canonical path 可被 provider 服务。
+// chat_completions → /v1/chat/completions; embeddings → /v1/embeddings。
+func validateModelOperationsAgainstProvider(modelID string, operations []string, provider Provider) error {
+	for _, op := range operations {
+		path := OperationToPrimaryInboundPath(op)
+		if path == "" {
+			return fmt.Errorf("model_catalog.%s: unknown operation %q", modelID, op)
+		}
+		if !ProviderSupportsInboundPath(provider, path) {
+			return fmt.Errorf("model_catalog.%s: operation %q requires route owner to support inbound path %q (check endpoint_capabilities)", modelID, op, path)
+		}
+	}
+	return nil
+}
+
+// matchingEnabledProviders 返回匹配 model 的 enabled provider 名(稳定排序)。
+func matchingEnabledProviders(providers map[string]Provider, model string) []string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil
+	}
+	matches := make([]string, 0, 1)
+	for name, provider := range providers {
+		if provider.Disabled {
+			continue
+		}
+		if ProviderMatchesModel(name, provider, model) {
+			matches = append(matches, name)
+		}
+	}
+	sort.Strings(matches)
+	return matches
+}
+
+// ProviderMatchesModel 判断 provider 的 models 模式是否匹配 model(区分大小写,仅 trim)。
+func ProviderMatchesModel(name string, provider Provider, model string) bool {
+	patterns := provider.Models
+	if len(patterns) == 0 {
+		patterns = defaultProviderModelPatterns(name, provider.Protocol)
+	}
+	for _, pattern := range patterns {
+		if MatchModelPattern(model, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultProviderModelPatterns 与 proxy 侧历史内置模式保持一致,便于无 models 配置时启动校验。
+func defaultProviderModelPatterns(name, protocol string) []string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "deepseek":
+		return []string{"deepseek*"}
+	case "anthropic", "claude":
+		return []string{"claude*"}
+	case "openai":
+		return []string{"gpt-*", "chatgpt-*", "o*", "text-embedding-*", "dall-e-*"}
+	}
+	if strings.ToLower(strings.TrimSpace(protocol)) == "anthropic" {
+		return []string{"claude*"}
+	}
+	return nil
+}
+
+// MatchModelPattern 精确或前缀通配(* 后缀);model 与 pattern 均区分大小写。
+func MatchModelPattern(model, pattern string) bool {
+	pattern = strings.TrimSpace(pattern)
+	model = strings.TrimSpace(model)
+	switch {
+	case pattern == "":
+		return false
+	case pattern == "*":
+		return true
+	case strings.HasSuffix(pattern, "*"):
+		return strings.HasPrefix(model, strings.TrimSuffix(pattern, "*"))
+	default:
+		return model == pattern
+	}
+}
+
+// 允许的 provider.endpoint_capabilities 枚举。
+const (
+	EndpointCapabilityChatCompletions = "chat_completions"
+	EndpointCapabilityMessages        = "messages"
+	EndpointCapabilityResponses       = "responses"
+	EndpointCapabilityCompletions     = "completions"
+	EndpointCapabilityEmbeddings      = "embeddings"
+)
+
+func parseEndpointCapabilities(value string) ([]string, error) {
+	raw := parseCSVList(value, true)
+	return normalizeEndpointCapabilities(raw)
+}
+
+func normalizeEndpointCapabilities(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		capName := strings.ToLower(strings.TrimSpace(value))
+		if capName == "" {
+			continue
+		}
+		switch capName {
+		case EndpointCapabilityChatCompletions, EndpointCapabilityMessages, EndpointCapabilityResponses,
+			EndpointCapabilityCompletions, EndpointCapabilityEmbeddings:
+		default:
+			return nil, fmt.Errorf("unknown endpoint capability %q", value)
+		}
+		if _, ok := seen[capName]; ok {
+			continue
+		}
+		seen[capName] = struct{}{}
+		out = append(out, capName)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return endpointCapabilityRank(out[i]) < endpointCapabilityRank(out[j])
+	})
+	return out, nil
+}
+
+func endpointCapabilityRank(capName string) int {
+	switch capName {
+	case EndpointCapabilityChatCompletions:
+		return 0
+	case EndpointCapabilityMessages:
+		return 1
+	case EndpointCapabilityResponses:
+		return 2
+	case EndpointCapabilityCompletions:
+		return 3
+	case EndpointCapabilityEmbeddings:
+		return 4
+	default:
+		return 100
+	}
+}
+
+func validateProtocolEndpointCaps(protocol string, caps []string) error {
+	for _, capName := range caps {
+		switch protocol {
+		case "openai":
+			switch capName {
+			case EndpointCapabilityChatCompletions, EndpointCapabilityResponses, EndpointCapabilityCompletions, EndpointCapabilityEmbeddings:
+			case EndpointCapabilityMessages:
+				return fmt.Errorf("endpoint_capabilities messages is invalid for openai protocol (use chat_completions; conversion serves /v1/messages)")
+			default:
+				return fmt.Errorf("unknown endpoint capability %q", capName)
+			}
+		case "anthropic":
+			switch capName {
+			case EndpointCapabilityMessages:
+			case EndpointCapabilityChatCompletions, EndpointCapabilityResponses, EndpointCapabilityCompletions, EndpointCapabilityEmbeddings:
+				return fmt.Errorf("endpoint_capabilities %q is invalid for anthropic protocol (use messages; conversion may serve /v1/chat/completions)", capName)
+			default:
+				return fmt.Errorf("unknown endpoint capability %q", capName)
+			}
+		}
+	}
+	return nil
+}
+
+// ProviderHasEndpointCapability 判断 provider 是否显式声明了直通 capability。
+func ProviderHasEndpointCapability(provider Provider, capability string) bool {
+	capability = strings.TrimSpace(capability)
+	for _, item := range provider.EndpointCapabilities {
+		if item == capability {
+			return true
+		}
+	}
+	return false
+}
+
+// ProviderSupportsInboundPath 根据显式 endpoint_capabilities + 已实现转换矩阵判断是否可服务入站 path。
+// 不得仅因 protocol=openai 假定支持全部 OpenAI path。
+func ProviderSupportsInboundPath(provider Provider, path string) bool {
+	path = strings.TrimRight(strings.TrimSpace(path), "/")
+	switch path {
+	case "/v1/chat/completions":
+		// openai 直通 chat_completions; anthropic 声明 messages 后可通过转换服务。
+		if provider.Protocol == "openai" {
+			return ProviderHasEndpointCapability(provider, EndpointCapabilityChatCompletions)
+		}
+		if provider.Protocol == "anthropic" {
+			return ProviderHasEndpointCapability(provider, EndpointCapabilityMessages)
+		}
+	case "/v1/messages":
+		// anthropic 直通 messages; openai 声明 chat_completions 后可通过转换服务。
+		if provider.Protocol == "anthropic" {
+			return ProviderHasEndpointCapability(provider, EndpointCapabilityMessages)
+		}
+		if provider.Protocol == "openai" {
+			return ProviderHasEndpointCapability(provider, EndpointCapabilityChatCompletions)
+		}
+	case "/v1/responses":
+		return provider.Protocol == "openai" && ProviderHasEndpointCapability(provider, EndpointCapabilityResponses)
+	case "/v1/completions":
+		return provider.Protocol == "openai" && ProviderHasEndpointCapability(provider, EndpointCapabilityCompletions)
+	case "/v1/embeddings":
+		return provider.Protocol == "openai" && ProviderHasEndpointCapability(provider, EndpointCapabilityEmbeddings)
+	}
+	return false
+}
+
+// ServiceableInboundPaths 返回 provider 当前可服务的入站 path 列表(稳定排序)。
+func ServiceableInboundPaths(provider Provider) []string {
+	candidates := []string{
+		"/v1/chat/completions",
+		"/v1/messages",
+		"/v1/responses",
+		"/v1/completions",
+		"/v1/embeddings",
+	}
+	out := make([]string, 0, len(candidates))
+	for _, path := range candidates {
+		if ProviderSupportsInboundPath(provider, path) {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
+func providersShareServiceablePath(a, b Provider) bool {
+	for _, path := range ServiceableInboundPaths(a) {
+		if ProviderSupportsInboundPath(b, path) {
+			return true
+		}
+	}
+	return false
+}
+
+// OperationToPrimaryInboundPath 返回 operation 的主入站 path(用于 capability 校验辅助)。
+func OperationToPrimaryInboundPath(operation string) string {
+	switch strings.TrimSpace(operation) {
+	case ModelOperationChatCompletions:
+		return "/v1/chat/completions"
+	case ModelOperationEmbeddings:
+		return "/v1/embeddings"
+	default:
+		return ""
+	}
+}
+
+// LookupModel 按 exact id 查找 catalog 条目。
+func LookupModel(cfg Config, modelID string) (ModelInfo, bool) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return ModelInfo{}, false
+	}
+	info, ok := cfg.ModelCatalog[modelID]
+	return info, ok
+}
+
+// ModelSupportsOperation 判断 catalog 模型是否声明了 operation。
+func ModelSupportsOperation(info ModelInfo, operation string) bool {
+	operation = strings.TrimSpace(operation)
+	for _, op := range info.Operations {
+		if op == operation {
+			return true
+		}
+	}
+	return false
+}
+
+// CatalogModelsSorted 返回按 case-fold id 稳定排序的 catalog 模型。
+func CatalogModelsSorted(catalog map[string]ModelInfo) []ModelInfo {
+	items := make([]ModelInfo, 0, len(catalog))
+	for _, info := range catalog {
+		if strings.TrimSpace(info.ID) == "" {
+			continue
+		}
+		items = append(items, info)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return strings.ToLower(items[i].ID) < strings.ToLower(items[j].ID)
+	})
+	return items
 }

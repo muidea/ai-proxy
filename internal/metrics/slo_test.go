@@ -188,7 +188,7 @@ func TestSnapshotForSLOAggregatesModels(t *testing.T) {
 
 func TestSLOUsesUpstreamAttemptsAsDenominator(t *testing.T) {
 	reg := NewRegistry()
-	// primary 失败 20 次 attempt,最终全部 fallback 到 backup 成功。
+	// 构造 primary 失败与 backup 成功的独立 attempt 样本，验证分母按 provider 统计。
 	for i := 0; i < 20; i++ {
 		reg.RecordUpstreamAttempt("primary", 100*time.Millisecond, AttemptHeader)
 		reg.RecordUpstreamError("primary", 500)
@@ -214,7 +214,7 @@ func TestSLOUsesUpstreamAttemptsAsDenominator(t *testing.T) {
 
 func TestSLOP99UsesAttemptLatency(t *testing.T) {
 	reg := NewRegistry()
-	// primary 每次 attempt 很慢,最终 fallback 到 backup 很快。
+	// 构造 primary 慢失败与 backup 快成功的独立 attempt 样本，验证 p99 按 provider 统计。
 	for i := 0; i < 20; i++ {
 		reg.RecordUpstreamAttempt("primary", 500*time.Millisecond, AttemptHeader)
 		reg.RecordUpstreamError("primary", 504)

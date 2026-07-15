@@ -35,6 +35,9 @@ type Handler struct {
 }
 
 func NewHandler(cfg config.Config, recorder stats.Recorder, interactionRecorder *archive.Recorder, metricsRegistry *metrics.Registry) *Handler {
+	if err := requireResolvedConfig(cfg); err != nil {
+		panic("proxy.NewHandler: " + err.Error() + "; call config.Load or tests.MustHandlerConfig")
+	}
 	return &Handler{
 		cfg:                 cfg,
 		recorder:            recorder,
@@ -43,6 +46,132 @@ func NewHandler(cfg config.Config, recorder stats.Recorder, interactionRecorder 
 		driftTracker:        NewFingerprintDriftTracker(2),
 		client:              newHTTPClient(cfg.RequestTimeout),
 	}
+}
+
+// requireResolvedConfig 要求 Config 已通过 config.Load 的 authority 合同。
+// Handler 不合成 model、不补默认容量/operations、不猜测 RouteOwner。
+// 对绕过 Load 的调用方做 fail-fast 全量校验。
+func requireResolvedConfig(cfg config.Config) error {
+	if cfg.Providers == nil {
+		return fmt.Errorf("providers is nil")
+	}
+	if cfg.ModelCatalog == nil {
+		cfg.ModelCatalog = map[string]config.ModelInfo{}
+	}
+	seenFold := map[string]string{}
+	for name, provider := range cfg.Providers {
+		if provider.Disabled {
+			continue
+		}
+		switch provider.Protocol {
+		case "openai", "anthropic":
+		case "":
+			return fmt.Errorf("provider %q: protocol unresolved", name)
+		default:
+			return fmt.Errorf("provider %q: unknown protocol %q", name, provider.Protocol)
+		}
+		if len(provider.EndpointCapabilities) == 0 {
+			return fmt.Errorf("provider %q: endpoint_capabilities unresolved", name)
+		}
+		if err := assertUniqueSortedKnownList("provider "+name+" endpoint_capabilities", provider.EndpointCapabilities, knownEndpointCapabilities()); err != nil {
+			return err
+		}
+		if provider.Protocol == "openai" {
+			for _, capName := range provider.EndpointCapabilities {
+				if capName == config.EndpointCapabilityMessages {
+					return fmt.Errorf("provider %q: endpoint_capabilities messages invalid for openai protocol", name)
+				}
+			}
+		}
+		if provider.Protocol == "anthropic" {
+			for _, capName := range provider.EndpointCapabilities {
+				if capName != config.EndpointCapabilityMessages {
+					return fmt.Errorf("provider %q: endpoint_capabilities %q invalid for anthropic protocol", name, capName)
+				}
+			}
+		}
+	}
+	for id, info := range cfg.ModelCatalog {
+		if strings.TrimSpace(info.ID) == "" {
+			return fmt.Errorf("model_catalog.%s: missing id", id)
+		}
+		if info.ID != id {
+			return fmt.Errorf("model_catalog.%s: id mismatch %q", id, info.ID)
+		}
+		fold := strings.ToLower(id)
+		if prev, ok := seenFold[fold]; ok {
+			return fmt.Errorf("model_catalog: case-fold duplicate %q and %q", prev, id)
+		}
+		seenFold[fold] = id
+		if info.ContextWindowTokens <= 0 || info.MaxOutputTokens <= 0 {
+			return fmt.Errorf("model_catalog.%s: capacity unresolved", id)
+		}
+		if info.MaxOutputTokens >= info.ContextWindowTokens {
+			return fmt.Errorf("model_catalog.%s: max_output_tokens must be less than context_window_tokens", id)
+		}
+		if len(info.Operations) == 0 {
+			return fmt.Errorf("model_catalog.%s: operations unresolved", id)
+		}
+		if err := assertUniqueSortedKnownList("model_catalog."+id+" operations", info.Operations, knownModelOperations()); err != nil {
+			return err
+		}
+		owner := strings.TrimSpace(info.RouteOwner)
+		if owner == "" {
+			return fmt.Errorf("model_catalog.%s: RouteOwner unresolved", id)
+		}
+		provider, ok := cfg.Providers[owner]
+		if !ok || provider.Disabled {
+			return fmt.Errorf("model_catalog.%s: RouteOwner %q missing or disabled", id, owner)
+		}
+		if !config.ProviderMatchesModel(owner, provider, id) {
+			return fmt.Errorf("model_catalog.%s: RouteOwner %q does not match model", id, owner)
+		}
+		for _, op := range info.Operations {
+			path := config.OperationToPrimaryInboundPath(op)
+			if path == "" || !config.ProviderSupportsInboundPath(provider, path) {
+				return fmt.Errorf("model_catalog.%s: operation %q not serviceable by RouteOwner %q", id, op, owner)
+			}
+		}
+	}
+	return nil
+}
+
+func knownEndpointCapabilities() map[string]int {
+	return map[string]int{
+		config.EndpointCapabilityChatCompletions: 0,
+		config.EndpointCapabilityMessages:        1,
+		config.EndpointCapabilityResponses:       2,
+		config.EndpointCapabilityCompletions:     3,
+		config.EndpointCapabilityEmbeddings:      4,
+	}
+}
+
+func knownModelOperations() map[string]int {
+	return map[string]int{
+		config.ModelOperationChatCompletions: 0,
+		config.ModelOperationEmbeddings:      1,
+	}
+}
+
+// assertUniqueSortedKnownList 要求 values 仅含 known 键、无重复、且按 known 秩稳定升序。
+func assertUniqueSortedKnownList(label string, values []string, known map[string]int) error {
+	seen := map[string]struct{}{}
+	prevRank := -1
+	for _, value := range values {
+		rank, ok := known[value]
+		if !ok {
+			return fmt.Errorf("%s: unknown value %q", label, value)
+		}
+		if _, dup := seen[value]; dup {
+			return fmt.Errorf("%s: duplicate value %q", label, value)
+		}
+		if rank < prevRank {
+			return fmt.Errorf("%s: not in stable sorted order", label)
+		}
+		seen[value] = struct{}{}
+		prevRank = rank
+	}
+	return nil
 }
 
 func newHTTPClient(requestTimeout time.Duration) *http.Client {
@@ -247,17 +376,21 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 
 	model, _ := body["model"].(string)
 	stream, _ := body["stream"].(bool)
-	providerName, err := h.resolveProviderName(r, model)
-	if err != nil {
-		h.writeArchivedError(w, round, r, start, "", model, stream, http.StatusBadRequest, err.Error())
+	providerName, _, apiErr := h.resolveProviderName(r, model)
+	if apiErr != nil {
+		h.writeArchivedAPIError(w, round, r, start, "", model, stream, statusForAPIError(apiErr), *apiErr)
 		return
 	}
 	provider, ok := h.cfg.Providers[providerName]
 	if !ok {
-		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadRequest, fmt.Sprintf("provider %q is not configured", providerName))
+		h.writeArchivedAPIError(w, round, r, start, providerName, model, stream, http.StatusServiceUnavailable, APIError{
+			Code:    ErrorCodeProviderUnavailable,
+			Message: fmt.Sprintf("provider %q is not configured", providerName),
+			Model:   model,
+		})
 		return
 	}
-	// model 路由仅使用 body.model,不再剥离 provider/model 前缀。
+	// model 路由仅使用 body.model + model_catalog authority。
 	h.archiveAndLogProviderSelection(round, r, providerName, provider, model, stream)
 
 	if provider.Protocol == "anthropic" {
@@ -265,7 +398,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	result, err := h.doUpstreamWithFallback(r, round, providerName, provider, bodyBytes, len(bodyBytes), stream)
+	result, err := h.doUpstream(r, round, providerName, provider, bodyBytes, len(bodyBytes), stream)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 		return
@@ -304,6 +437,34 @@ func (h *Handler) writeArchivedError(w http.ResponseWriter, round *archive.Round
 	h.writeArchiveMetadata(round, provider, model, stream, status, duration, usage, "response.txt", message, "", "")
 }
 
+func (h *Handler) writeArchivedAPIError(w http.ResponseWriter, round *archive.Round, r *http.Request, start time.Time, provider, model string, stream bool, status int, apiErr APIError) {
+	writeAPIError(w, status, apiErr.Code, apiErr.Message, apiErr.Model, apiErr.Operation)
+	body, _ := json.Marshal(APIErrorResponse{Error: apiErr})
+	body = append(body, '\n')
+	if err := round.WriteResponse("response.json", body); err != nil {
+		log.Printf("archive api error response: %v", err)
+	}
+	duration := time.Since(start)
+	usage := tokenUsage{}
+	msg := apiErr.Code + ": " + apiErr.Message
+	h.recordAndPrint(round, r, provider, model, stream, status, duration, usage, msg)
+	h.writeArchiveMetadata(round, provider, model, stream, status, duration, usage, "response.json", msg, "", "")
+}
+
+func statusForAPIError(apiErr *APIError) int {
+	if apiErr == nil {
+		return http.StatusBadRequest
+	}
+	switch apiErr.Code {
+	case ErrorCodeProviderUnavailable:
+		return http.StatusServiceUnavailable
+	case ErrorCodeRouteContractInvalid:
+		return http.StatusInternalServerError
+	default:
+		return http.StatusBadRequest
+	}
+}
+
 func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID string) {
 	start := time.Now()
 	body, err := h.readLimitedBody(w, r)
@@ -331,14 +492,18 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID s
 		log.Printf("archive raw request: %v", err)
 	}
 	h.archiveAndLogClientRequest(round, r, len(body))
-	providerName, err := h.resolveProviderName(r, rawModel)
-	if err != nil {
-		h.writeArchivedError(w, round, r, start, "", rawModel, rawStream, http.StatusBadRequest, err.Error())
+	providerName, _, apiErr := h.resolveProviderName(r, rawModel)
+	if apiErr != nil {
+		h.writeArchivedAPIError(w, round, r, start, "", rawModel, rawStream, statusForAPIError(apiErr), *apiErr)
 		return
 	}
 	provider, ok := h.cfg.Providers[providerName]
 	if !ok {
-		h.writeArchivedError(w, round, r, start, providerName, rawModel, rawStream, http.StatusBadRequest, fmt.Sprintf("provider %q is not configured", providerName))
+		h.writeArchivedAPIError(w, round, r, start, providerName, rawModel, rawStream, http.StatusServiceUnavailable, APIError{
+			Code:    ErrorCodeProviderUnavailable,
+			Message: fmt.Sprintf("provider %q is not configured", providerName),
+			Model:   rawModel,
+		})
 		return
 	}
 	if provider.Protocol == "anthropic" {
@@ -357,7 +522,7 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID s
 	)
 	h.archiveAndLogProviderSelection(round, r, providerName, provider, rawModel, rawStream)
 	streamRequest := rawStream || acceptsEventStream(r.Header)
-	result, err := h.doUpstreamWithFallback(r, round, providerName, provider, body, len(body), streamRequest)
+	result, err := h.doUpstream(r, round, providerName, provider, body, len(body), streamRequest)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, rawModel, rawStream, http.StatusBadGateway, err.Error())
 		return
@@ -727,132 +892,73 @@ type upstreamResult struct {
 	Cancel       context.CancelFunc
 }
 
-func (h *Handler) doUpstreamWithFallback(r *http.Request, round *archive.Round, providerName string, provider config.Provider, body []byte, bodyBytes int, stream bool) (upstreamResult, error) {
-	return h.doUpstreamWithFallbackPath(r, round, providerName, provider, body, bodyBytes, stream, r.URL.Path, r.URL.RawQuery, r.Method)
+func (h *Handler) doUpstream(r *http.Request, round *archive.Round, providerName string, provider config.Provider, body []byte, bodyBytes int, stream bool) (upstreamResult, error) {
+	return h.doUpstreamPath(r, round, providerName, provider, body, bodyBytes, stream, r.URL.Path, r.URL.RawQuery, r.Method)
 }
 
-func (h *Handler) doUpstreamWithFallbackPath(r *http.Request, round *archive.Round, providerName string, provider config.Provider, body []byte, bodyBytes int, stream bool, path, rawQuery, method string) (upstreamResult, error) {
-	candidates := h.fallbackCandidates(providerName, provider)
-	attempts := make([]fallbackAttemptDebugInfo, 0, len(candidates))
-	var lastErr error
-	for index, candidateName := range candidates {
-		candidate := h.cfg.Providers[candidateName]
-		ctx, cancel := h.upstreamContext(r.Context(), stream)
-		req, err := h.newUpstreamRequestForPath(ctx, r, candidate, body, path, rawQuery, method, stream)
-		if err != nil {
-			if cancel != nil {
-				cancel()
-			}
-			lastErr = err
-			attempts = append(attempts, fallbackAttemptDebugInfo{
-				Provider: candidateName,
-				Protocol: candidate.Protocol,
-				Error:    err.Error(),
-				Fallback: index > 0,
-			})
-			continue
+func (h *Handler) doUpstreamPath(r *http.Request, round *archive.Round, providerName string, provider config.Provider, body []byte, bodyBytes int, stream bool, path, rawQuery, method string) (upstreamResult, error) {
+	// catalog RouteOwner 是唯一的上游；任何错误都直接返回给客户端，不会尝试其他 provider。
+	ctx, cancel := h.upstreamContext(r.Context(), stream)
+	req, err := h.newUpstreamRequestForPath(ctx, r, provider, body, path, rawQuery, method, stream)
+	if err != nil {
+		if cancel != nil {
+			cancel()
 		}
-		h.archiveAndLogUpstreamRequest(round, r, candidateName, candidate, req, bodyBytes)
-		h.debugfRound(round, r, "upstream request provider=%s protocol=%s method=%s url=%s body_bytes=%d",
-			candidateName,
-			candidate.Protocol,
-			req.Method,
-			req.URL.String(),
-			bodyBytes,
-		)
-		upstreamStart := time.Now()
-		resp, err := h.client.Do(req)
-		duration := time.Since(upstreamStart)
-		h.archiveAndLogUpstreamResponse(round, r, candidateName, candidate, resp, duration, err)
-		attempt := fallbackAttemptDebugInfo{
-			Provider:   candidateName,
-			Protocol:   candidate.Protocol,
-			Fallback:   index > 0,
-			DurationMS: duration.Milliseconds(),
+		return upstreamResult{}, err
+	}
+	h.archiveAndLogUpstreamRequest(round, r, providerName, provider, req, bodyBytes)
+	h.debugfRound(round, r, "upstream request provider=%s protocol=%s method=%s url=%s body_bytes=%d",
+		providerName,
+		provider.Protocol,
+		req.Method,
+		req.URL.String(),
+		bodyBytes,
+	)
+
+	upstreamStart := time.Now()
+	resp, err := h.client.Do(req)
+	duration := time.Since(upstreamStart)
+	h.archiveAndLogUpstreamResponse(round, r, providerName, provider, resp, duration, err)
+	if resp != nil && resp.StatusCode >= 400 {
+		h.metricsRegistry.RecordUpstreamError(providerName, resp.StatusCode)
+	}
+	if err != nil {
+		if cancel != nil {
+			cancel()
 		}
-		if resp != nil {
-			attempt.Status = resp.StatusCode
-			if resp.StatusCode >= 400 {
-				h.metricsRegistry.RecordUpstreamError(candidateName, resp.StatusCode)
-			}
-		}
-		if err != nil {
-			if cancel != nil {
-				cancel()
-			}
-			lastErr = err
-			attempt.Error = err.Error()
-			attempts = append(attempts, attempt)
-			h.metricsRegistry.RecordUpstreamAttempt(candidateName, duration, metrics.AttemptHeader)
-			h.metricsRegistry.RecordUpstreamError(candidateName, -1)
-			if index < len(candidates)-1 {
-				h.logUpstreamAlert(round, candidateName, candidate.Protocol, 0, duration, err.Error(), true, candidates[index+1])
-				h.debugfRound(round, r, "upstream fallback provider=%s reason=error error=%q next=%s", candidateName, err.Error(), candidates[index+1])
-				h.metricsRegistry.RecordFallbackAttempt(candidateName, candidates[index+1], "error")
-				continue
-			}
-			h.archiveAndLogFallbackAttempts(round, attempts)
-			return upstreamResult{}, err
-		}
-		attempts = append(attempts, attempt)
-		if shouldFallbackStatus(resp.StatusCode) && index < len(candidates)-1 {
-			h.metricsRegistry.RecordUpstreamAttempt(candidateName, duration, metrics.AttemptHeader)
-			h.logUpstreamAlert(round, candidateName, candidate.Protocol, resp.StatusCode, duration, "", true, candidates[index+1])
-			h.debugfRound(round, r, "upstream fallback provider=%s status=%d next=%s", candidateName, resp.StatusCode, candidates[index+1])
-			h.metricsRegistry.RecordFallbackAttempt(candidateName, candidates[index+1], statusBucketForFallback(resp.StatusCode))
+		h.metricsRegistry.RecordUpstreamAttempt(providerName, duration, metrics.AttemptHeader)
+		h.metricsRegistry.RecordUpstreamError(providerName, -1)
+		return upstreamResult{}, err
+	}
+
+	// 流式请求在写出首包前探测完整首行；失败直接返回，绝不切换 RouteOwner。
+	if stream && resp.StatusCode < 400 {
+		_, maxLine := h.streamLimits()
+		primed, peekErr := primeStreamBody(resp, h.cfg.StreamIdleTimeout, maxLine)
+		duration = time.Since(upstreamStart)
+		if peekErr != nil {
 			_ = resp.Body.Close()
 			if cancel != nil {
 				cancel()
 			}
-			continue
+			h.metricsRegistry.RecordUpstreamAttempt(providerName, duration, metrics.AttemptFirstEvent)
+			h.metricsRegistry.RecordUpstreamError(providerName, -1)
+			return upstreamResult{}, peekErr
 		}
-		// 流式:在写出首包 SSE 前探测上游首行;断流/超时则可继续 fallback。
-		// attempt duration 对成功流式路径包含 first-event 等待,供 p99 SLO 使用。
-		if stream && resp.StatusCode < 400 {
-			_, maxLine := h.streamLimits()
-			// 即使是最后一个候选也做探测以得到 first-event 延迟;仅在有后续候选时 fallback。
-			primed, peekErr := primeStreamBody(resp, h.cfg.StreamIdleTimeout, maxLine)
-			duration = time.Since(upstreamStart)
-			if peekErr != nil {
-				lastErr = peekErr
-				attempt.Error = peekErr.Error()
-				attempt.DurationMS = duration.Milliseconds()
-				attempts[len(attempts)-1] = attempt
-				h.metricsRegistry.RecordUpstreamAttempt(candidateName, duration, metrics.AttemptFirstEvent)
-				h.metricsRegistry.RecordUpstreamError(candidateName, -1)
-				if index < len(candidates)-1 {
-					h.logUpstreamAlert(round, candidateName, candidate.Protocol, resp.StatusCode, duration, peekErr.Error(), true, candidates[index+1])
-					h.debugfRound(round, r, "upstream fallback provider=%s reason=stream_first_byte error=%q next=%s", candidateName, peekErr.Error(), candidates[index+1])
-					h.metricsRegistry.RecordFallbackAttempt(candidateName, candidates[index+1], "stream_first_byte")
-					_ = resp.Body.Close()
-					if cancel != nil {
-						cancel()
-					}
-					continue
-				}
-				h.archiveAndLogFallbackAttempts(round, attempts)
-				return upstreamResult{}, peekErr
-			}
-			resp = primed
-		}
-		// 流式成功: first_event;非流式: header。
-		kind := metrics.AttemptHeader
-		if stream {
-			kind = metrics.AttemptFirstEvent
-		}
-		h.metricsRegistry.RecordUpstreamAttempt(candidateName, duration, kind)
-		h.archiveAndLogFallbackAttempts(round, attempts)
-		return upstreamResult{ProviderName: candidateName, Provider: candidate, Response: resp, Duration: duration, Cancel: cancel}, nil
+		resp = primed
 	}
-	h.archiveAndLogFallbackAttempts(round, attempts)
-	if lastErr != nil {
-		return upstreamResult{}, lastErr
+
+	// 流式成功: first_event;非流式: header。
+	kind := metrics.AttemptHeader
+	if stream {
+		kind = metrics.AttemptFirstEvent
 	}
-	return upstreamResult{}, fmt.Errorf("no fallback providers available")
+	h.metricsRegistry.RecordUpstreamAttempt(providerName, duration, kind)
+	return upstreamResult{ProviderName: providerName, Provider: provider, Response: resp, Duration: duration, Cancel: cancel}, nil
 }
 
 // primeStreamBody 在 timeout 内读取上游流式响应的首行(必须含 \n),成功后把字节回填到 Body。
-// 复用 readSSELine 施加单行上限; partial EOF(无换行)视为失败以触发 fallback。
+// 复用 readSSELine 施加单行上限; partial EOF(无换行)视为首事件失败。
 // timeout<=0 时使用 30s 兜底,避免永久阻塞。
 func primeStreamBody(resp *http.Response, timeout time.Duration, maxLine int64) (*http.Response, error) {
 	if resp == nil || resp.Body == nil {
@@ -935,44 +1041,8 @@ func (p *prefixReadCloser) Close() error {
 	return p.rest.Close()
 }
 
-func statusBucketForFallback(status int) string {
-	switch {
-	case status >= 500:
-		return "5xx"
-	case status == 408:
-		return "timeout"
-	case status == 429:
-		return "rate_limit"
-	case status >= 400:
-		return fmt.Sprintf("%d", status)
-	default:
-		return "other"
-	}
-}
-
-func (h *Handler) fallbackCandidates(providerName string, provider config.Provider) []string {
-	candidates := []string{providerName}
-	seen := map[string]struct{}{providerName: {}}
-	for _, fallbackName := range provider.Fallbacks {
-		fallbackName = strings.ToLower(strings.TrimSpace(fallbackName))
-		if fallbackName == "" {
-			continue
-		}
-		if _, ok := seen[fallbackName]; ok {
-			continue
-		}
-		fallback, ok := h.cfg.Providers[fallbackName]
-		if !ok || fallback.Disabled || fallback.Protocol != provider.Protocol {
-			continue
-		}
-		seen[fallbackName] = struct{}{}
-		candidates = append(candidates, fallbackName)
-	}
-	return candidates
-}
-
-func shouldFallbackStatus(status int) bool {
-	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+func providerSupportsInboundPath(provider config.Provider, path string) bool {
+	return config.ProviderSupportsInboundPath(provider, path)
 }
 
 func (h *Handler) upstreamContext(parent context.Context, stream bool) (context.Context, context.CancelFunc) {
@@ -1069,105 +1139,73 @@ func joinUpstreamPath(basePath, incomingPath string) string {
 	return basePath + incomingPath
 }
 
-// resolveProviderName 仅按 body.model 的 models 规则匹配 provider。
+// resolveProviderName 按 model_catalog 权威解析 provider,并在访问上游前校验 requested operation。
 // 已禁用 X-AI-Provider / ?provider= / provider/model 显式选择。
-func (h *Handler) resolveProviderName(_ *http.Request, model string) (string, error) {
+func (h *Handler) resolveProviderName(r *http.Request, model string) (string, string, *APIError) {
 	model = strings.TrimSpace(model)
-	if model != "" {
-		if name, ok, err := h.findProviderByModel(model); ok || err != nil {
-			return name, err
-		}
-		if name, ok, err := h.defaultProvider(); ok || err != nil {
-			return name, err
-		}
-		return "", fmt.Errorf("no provider matches model %q; configure provider models patterns or default_provider", model)
+	operation := ""
+	if r != nil {
+		operation = OperationForPath(r.URL.Path)
 	}
-	if name, ok, err := h.defaultProvider(); ok || err != nil {
-		return name, err
-	}
-	return "", fmt.Errorf("model is required or set default_provider")
-}
-
-func (h *Handler) findProviderByModel(model string) (string, bool, error) {
-	// model 严格区分大小写,仅 trim,与 providers.*.models / model_catalog 原文匹配。
-	model = strings.TrimSpace(model)
 	if model == "" {
-		return "", false, nil
-	}
-	matches := make([]string, 0, 1)
-	for name, provider := range h.cfg.Providers {
-		if provider.Disabled {
-			continue
-		}
-		if providerMatchesModel(name, provider, model) {
-			matches = append(matches, name)
+		return "", operation, &APIError{
+			Code:      ErrorCodeModelRequired,
+			Message:   "model is required",
+			Operation: operation,
 		}
 	}
-	if len(matches) == 1 {
-		return matches[0], true, nil
+	info, ok := config.LookupModel(h.cfg, model)
+	if !ok {
+		return "", operation, &APIError{
+			Code:      ErrorCodeModelNotFound,
+			Message:   fmt.Sprintf("model %q was not found in model_catalog", model),
+			Model:     model,
+			Operation: operation,
+		}
 	}
-	if len(matches) > 1 {
-		return "", true, fmt.Errorf("multiple providers match model %q; disambiguate provider models patterns", model)
+	if operation != "" && !config.ModelSupportsOperation(info, operation) {
+		return "", operation, &APIError{
+			Code:      ErrorCodeOperationUnsupported,
+			Message:   fmt.Sprintf("model %q does not support operation %q", model, operation),
+			Model:     model,
+			Operation: operation,
+		}
 	}
-	return "", false, nil
+	owner := strings.TrimSpace(info.RouteOwner)
+	if owner == "" {
+		return "", operation, &APIError{
+			Code:      ErrorCodeRouteContractInvalid,
+			Message:   fmt.Sprintf("model %q has no resolved route owner", model),
+			Model:     model,
+			Operation: operation,
+		}
+	}
+	provider, ok := h.cfg.Providers[owner]
+	if !ok || provider.Disabled {
+		return "", operation, &APIError{
+			Code:      ErrorCodeProviderUnavailable,
+			Message:   fmt.Sprintf("provider %q for model %q is unavailable", owner, model),
+			Model:     model,
+			Operation: operation,
+		}
+	}
+	if r != nil && !providerSupportsInboundPath(provider, r.URL.Path) {
+		return "", operation, &APIError{
+			Code:      ErrorCodeEndpointUnsupported,
+			Message:   fmt.Sprintf("provider %q does not support inbound path %q for model %q", owner, r.URL.Path, model),
+			Model:     model,
+			Operation: operation,
+		}
+	}
+	return owner, operation, nil
 }
 
 func providerMatchesModel(name string, provider config.Provider, model string) bool {
-	patterns := provider.Models
-	if len(patterns) == 0 {
-		patterns = defaultModelPatterns(name, provider.Protocol)
-	}
-	for _, pattern := range patterns {
-		if matchModelPattern(model, pattern) {
-			return true
-		}
-	}
-	return false
-}
-
-func defaultModelPatterns(name, protocol string) []string {
-	switch strings.ToLower(name) {
-	case "deepseek":
-		return []string{"deepseek*"}
-	case "anthropic", "claude":
-		return []string{"claude*"}
-	case "openai":
-		return []string{"gpt-*", "chatgpt-*", "o*", "text-embedding-*", "dall-e-*"}
-	}
-	if protocol == "anthropic" {
-		return []string{"claude*"}
-	}
-	return nil
+	return config.ProviderMatchesModel(name, provider, model)
 }
 
 func matchModelPattern(model, pattern string) bool {
-	// model / pattern 均严格区分大小写。
-	pattern = strings.TrimSpace(pattern)
-	switch {
-	case pattern == "":
-		return false
-	case pattern == "*":
-		return true
-	case strings.HasSuffix(pattern, "*"):
-		return strings.HasPrefix(model, strings.TrimSuffix(pattern, "*"))
-	default:
-		return model == pattern
-	}
-}
-
-func (h *Handler) defaultProvider() (string, bool, error) {
-	name := strings.ToLower(strings.TrimSpace(h.cfg.DefaultProvider))
-	if name == "" {
-		return "", false, nil
-	}
-	provider, ok := h.cfg.Providers[name]
-	if !ok {
-		return "", false, fmt.Errorf("default_provider %q is not configured", name)
-	}
-	if provider.Disabled {
-		return "", false, fmt.Errorf("default_provider %q is disabled", name)
-	}
-	return name, true, nil
+	return config.MatchModelPattern(model, pattern)
 }
 
 func copyHeader(dst, src http.Header) {

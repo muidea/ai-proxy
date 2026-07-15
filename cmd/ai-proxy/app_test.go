@@ -30,10 +30,22 @@ func testConfig(dir string) config.Config {
 				BaseURL:  "https://api.openai.com",
 				APIKey:   "test",
 				Models:   []string{"gpt-4o", "gpt-*"},
+				EndpointCapabilities: []string{
+					config.EndpointCapabilityChatCompletions,
+					config.EndpointCapabilityResponses,
+					config.EndpointCapabilityCompletions,
+					config.EndpointCapabilityEmbeddings,
+				},
 			},
 		},
 		ModelCatalog: map[string]config.ModelInfo{
-			"gpt-4o": {ID: "gpt-4o", ContextWindowTokens: 128000},
+			"gpt-4o": {
+				ID:                  "gpt-4o",
+				ContextWindowTokens: 128000,
+				MaxOutputTokens:     16384,
+				Operations:          []string{config.ModelOperationChatCompletions},
+				RouteOwner:          "openai",
+			},
 		},
 	}
 }
