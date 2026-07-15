@@ -73,7 +73,7 @@ Prometheus: `ai_proxy_requests_total{...,status,outcome}`；`/stats` 含 `reques
   - OpenAI：`POST /v1/chat/completions`、`/v1/responses`、`/v1/completions`、`/v1/embeddings`，以及 `GET/POST /v1/models`
   - Anthropic：`POST /v1/messages`
   - 其它 `/v1/*` 返回 404
-- **纯 model 路由**：只根据 body 中的 `model` 与各 provider 的 `models` 规则匹配；已禁用 `X-AI-Provider`、`?provider=`、`provider/model` 前缀选择
+- **纯 model 路由**：请求期用 body 中的 exact `model` 查找 `model_catalog` 已解析的唯一 RouteOwner；provider `models` 只在启动期验证归属，不在请求期重新选 provider；已禁用 `X-AI-Provider`、`?provider=`、`provider/model` 前缀选择
 - **模型能力目录**：全局 `model_catalog` 配置上下文窗口与 `operations`；`GET /v1/models` 本地返回 `contextWindowTokens` / `maxOutputTokens` / `operations`（不透传上游）
 - 双向基础协议转换：
   - OpenAI 客户端 → Anthropic 上游：`POST /v1/chat/completions` 命中 `protocol: anthropic` 时转换
@@ -132,22 +132,36 @@ make run
 {"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}
 ```
 
-路由规则：
+路由规则（两阶段权威）：
 
-1. 从请求 body 读取 exact `model`（与 `model_catalog` 展示 ID 原文匹配）
-2. 在 `model_catalog` 中查找模型（启动时已保证唯一 RouteOwner）
-3. 校验入站 path 对应 operation 是否在模型 `operations` 中
-4. 校验 RouteOwner 的 `endpoint_capabilities`（含协议转换矩阵）是否支持该入站 path
-5. 仅请求该唯一上游；**无 provider fallback / default_provider**
-6. 无 model / 未登记 / operation 或 endpoint 不支持 → typed 4xx，不访问上游
+1. **启动期 `ResolvedModelRoute`**：`config.Load` 为每个 catalog model 写入唯一 RouteOwner 与 operations
+2. **请求期 `TransportPlan`**：`ResolveTransportPlan(cfg, method, path, model)` 固定入站协议/path、上游协议/path 与转换模式
+3. 从 body 读取 exact `model`（与 catalog 展示 ID 原文匹配；**严格区分大小写**）
+4. 校验 model 存在、operation 已声明、RouteOwner 可用
+5. 按固定转发矩阵生成 TransportPlan；矩阵外组合 → `endpoint_unsupported`
+6. 转换模式先做 feature preflight；超出保证范围 → `conversion_unsupported`，**不访问上游**
+7. 仅请求 TransportPlan 中的唯一 RouteOwner；**无 provider fallback / default_provider**
 
 **已废弃（忽略）：** `X-AI-Provider` 头、`?provider=` 查询参数、`provider/model` 前缀。
+
+本地 typed error（访问上游前）：
+
+| HTTP | code | 含义 |
+|------|------|------|
+| 400 | `model_required` | body 缺少 model |
+| 400 | `model_not_found` | model 不在 catalog |
+| 400 | `operation_unsupported` | model 未声明该 operation |
+| 400 | `endpoint_unsupported` | 无法生成 TransportPlan |
+| 400 | `conversion_unsupported` | 转换 payload 超出最低保证 |
+| 401 | `authentication_failed` | 入站 API Key 缺失或无效 |
+| 500 | `route_contract_invalid` | 运行期 authority 不完整 |
+| 503 | `provider_unavailable` | RouteOwner 缺失/disabled |
 
 ### 模型上下文查询（`GET /v1/models`）
 
 在配置中用**全局** `model_catalog` 登记具体模型能力（各 provider 共用）。`model_catalog` 是容量、operations 与确定路由的权威：
-- model id **case-fold 后全局唯一**（展示 ID 保留配置原文；`GPT-4o` 与 `gpt-4o` 不得并存）
-- 每个 catalog model 必须**唯一匹配**一个 enabled provider，作为 `owned_by` / RouteOwner
+- model id **严格区分大小写**且 exact 唯一（`DeepSeek-V4-Flash` 与 `deepseek-v4-flash` 是两个模型；仅完全相同 id 不得重复）
+- 每个 catalog model 必须**唯一匹配**一个 enabled provider，作为仅内部使用的 RouteOwner
 - `operations` **必填**，仅允许 `chat_completions` / `embeddings`（可多选，逗号分隔）
 - **operations 是执行合同**：请求在访问上游前按 exact model 与入站 path 对应 operation 校验
 
@@ -178,8 +192,6 @@ model_catalog:
     {
       "id": "gpt-4o",
       "object": "model",
-      "created": 0,
-      "owned_by": "openai",
       "contextWindowTokens": 128000,
       "maxOutputTokens": 16384,
       "operations": ["chat_completions"]
@@ -191,7 +203,8 @@ model_catalog:
 说明：
 
 - 仅 catalog 中登记的模型会出现在列表中；仅有 `gpt-*` 通配不会自动展开
-- `owned_by` 为启动校验写入的确定 RouteOwner（enabled provider 名）；不存在 `ai-proxy` 回退
+- RouteOwner 仅保留在内部路由、归档和受控观测中；`/v1/models` 不返回 provider 名称、base URL、认证信息或
+  其它内部路由细节
 - `contextWindowTokens` / `maxOutputTokens` 为扩展字段；值为 0 或未配置时省略
 - `operations` **始终输出**为非空数组；取值仅 `chat_completions` / `embeddings`
 - 请求前校验：model 必须在 catalog 中且声明了入站 path 对应 operation，否则返回 typed 400（`model_not_found` / `operation_unsupported` 等），**不访问上游**
@@ -202,20 +215,27 @@ model_catalog:
 - **不支持** `default_provider`；配置中声明将启动失败（路由仅使用 model_catalog RouteOwner）
 - `enabled: false` 的 provider 不参与 model 匹配
 - **不支持** `fallbacks`；配置中声明 `fallbacks` 将启动失败
-- 协议转换：
-  | 入站 path | 命中 provider.protocol | 行为 |
-  |---|---|---|
-  | OpenAI 路径 | openai（已显式声明当前 path 的 endpoint capability） | 直通 |
-  | `/v1/messages` | anthropic | 直通 |
-  | `/v1/chat/completions` | anthropic | OpenAI→Anthropic 文本转换（provider 须声明 `messages`）；tools/多模态/tool_calls 返回 400 |
-  | `/v1/messages` | openai | Anthropic→OpenAI 文本转换（provider 须声明 `chat_completions`）；tools/多模态/tool_use 返回 400 |
-  | 其它 OpenAI 路径 | anthropic | 400（不支持该端点转换） |
+- TransportPlan 转发矩阵（`endpoint_capabilities` 只表示上游直连能力，不含转换派生 path）：
+  | Client Endpoint | Upstream Protocol | 要求的 direct capability | Upstream Endpoint | Mode |
+  |---|---|---|---|---|
+  | `/v1/chat/completions` | openai | `chat_completions` | `/v1/chat/completions` | native |
+  | `/v1/chat/completions` | anthropic | `messages` | `/v1/messages` | `openai_to_anthropic` |
+  | `/v1/messages` | anthropic | `messages` | `/v1/messages` | native |
+  | `/v1/messages` | openai | `chat_completions` | `/v1/chat/completions` | `anthropic_to_openai` |
+  | `/v1/responses` | openai | `responses` | `/v1/responses` | native |
+  | `/v1/completions` | openai | `completions` | `/v1/completions` | native |
+  | `/v1/embeddings` | openai | `embeddings` | `/v1/embeddings` | native |
+
+  转换仅保证基础文本（system/user/assistant、max_tokens/temperature/top_p/stop、非流式与基础 SSE）。tools、function calling、多模态、`response_format` 等在访问上游前返回 `conversion_unsupported`。responses/completions/embeddings **不允许**通过 chat/messages 转换获得。
 
 如果 `base_url` 已包含 `/v1`（含嵌套如 `.../codex/v1`），代理会避免重复拼接版本路径。
 
-上游错误透传；`usage.csv` / `metadata.json` 记录实际 RouteOwner provider。流式响应在写出首包 SSE 前会探测首字节以便识别断流，但**不会**切换其它 provider。
+上游错误：native 路径透传；转换模式保留上游 HTTP status，并输出客户端协议兼容的安全错误 envelope。`usage.csv` / `metadata.json` 记录 RouteOwner、client endpoint、upstream protocol/path 与 conversion mode。流式响应在写出首包 SSE 前会探测首字节以便识别断流，但**不会**切换其它 provider。
 
 Provider 与 model_catalog 示例（`models` 互不重叠；catalog model 必须唯一命中）：
+
+每个 enabled provider 都必须显式配置 `models`；ai-proxy 不按 provider 名称、protocol 或常见模型家族
+推导默认 pattern。`models` 只参与 catalog model 的 RouteOwner 解析，不会自动生成 catalog 条目。
 
 ```yaml
 providers:
@@ -272,7 +292,8 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 # 或 ANTHROPIC_API_URL=http://127.0.0.1:8080
 ```
 
-只需发送裸模型名；代理按 `models` 规则选上游，必要时自动做 OpenAI ↔ Anthropic 基础协议转换。
+只需发送裸模型名；代理按 `model_catalog` 已解析的唯一 RouteOwner 转发，必要时自动做 OpenAI ↔ Anthropic
+基础协议转换。provider `models` 仅用于启动期解析和验证该 RouteOwner。
 
 健康检查：
 
@@ -384,3 +405,18 @@ interactions/
 调试日志默认输出到终端，包含每轮 round id、客户端请求摘要、provider/model 选择、上游请求、上游响应和最终 token 摘要。`Authorization`、`X-API-Key`、`Cookie` 等敏感头会显示为 `<redacted>`。
 最终 token 摘要也会带 `round`，并在流式读取中断、客户端写入失败等场景附带 `error`；对应错误也会写入该轮 `metadata.json`，便于并发请求交错时追踪完整生命周期。
 默认日志格式为 JSON，便于日志系统采集；在 `server.log_format` 中设置 `text`，或设置 `AI_PROXY_LOG_FORMAT=text` / `LOG_FORMAT=text` 后，会输出人类可读日志，并仅对 `level=DEBUG`/`INFO`/`WARN`/`ERROR` 字段按等级着色。
+
+
+## Provider live probe（运维）
+
+独立入口，不在服务启动时执行：
+
+```bash
+go run ./cmd/ai-proxy-probe -config config.yaml \
+  -provider <route-owner> -capability chat_completions -model <exact-model-id>
+```
+
+- 仅验证配置中声明的 direct endpoint capability。
+- 输出脱敏摘要（不记录 API Key / 完整敏感 body）。
+- 结论：`success` / `credential_issue` / `capability_drift` / `environment_undetermined`。
+- 审计结果写入 `docs/provider-capability-audit-*.md`。

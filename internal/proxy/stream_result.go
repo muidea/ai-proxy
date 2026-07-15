@@ -82,7 +82,15 @@ func streamFailFromMessage(msg string) *streamFail {
 	if msg == "" {
 		return nil
 	}
-	return &streamFail{Kind: streamKindError, Message: msg, Err: errors.New(msg)}
+	kind := streamKindError
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "conversion") || strings.Contains(lower, "protocol conversion") || strings.Contains(lower, "conversion_unsupported"):
+		kind = streamKindConversion
+	case strings.Contains(lower, "invalid sse") || strings.Contains(lower, "protocol "):
+		kind = streamKindProtocol
+	}
+	return &streamFail{Kind: kind, Message: msg, Err: errors.New(msg)}
 }
 
 func streamFailFromTerminal(term terminalResult) *streamFail {

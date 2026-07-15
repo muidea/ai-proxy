@@ -39,8 +39,8 @@ func TestRegistryCounters(t *testing.T) {
 	}
 	out := buf.String()
 
-	mustContain(t, out, `ai_proxy_requests_total{provider="openai",model="gpt-4",route="chat_completions",status="2xx",outcome="success"} 2`)
-	mustContain(t, out, `ai_proxy_requests_total{provider="openai",model="gpt-4",route="chat_completions",status="5xx",outcome="success"} 1`)
+	mustContain(t, out, `ai_proxy_requests_total{provider="openai",model="gpt-4",route="chat_completions",status="2xx",outcome="success",client_endpoint="unknown",upstream_protocol="unknown",upstream_endpoint="unknown",conversion_mode="unknown"} 2`)
+	mustContain(t, out, `ai_proxy_requests_total{provider="openai",model="gpt-4",route="chat_completions",status="5xx",outcome="success",client_endpoint="unknown",upstream_protocol="unknown",upstream_endpoint="unknown",conversion_mode="unknown"} 1`)
 	mustContain(t, out, `ai_proxy_input_tokens_total{provider="openai",model="gpt-4"} 300`)
 	mustContain(t, out, `ai_proxy_output_tokens_total{provider="openai",model="gpt-4"} 150`)
 	mustContain(t, out, `ai_proxy_cached_input_tokens_total{provider="openai",model="gpt-4"} 30`)
@@ -60,9 +60,9 @@ func TestRegistryDurationSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	mustContain(t, out, `ai_proxy_request_duration_seconds_count{provider="p",model="m",route="chat_completions",status="2xx",outcome="success"} 2`)
+	mustContain(t, out, `ai_proxy_request_duration_seconds_count{provider="p",model="m",route="chat_completions",status="2xx",outcome="success",client_endpoint="unknown",upstream_protocol="unknown",upstream_endpoint="unknown",conversion_mode="unknown"} 2`)
 	// sum = 0.4s
-	if !strings.Contains(out, `ai_proxy_request_duration_seconds_sum{provider="p",model="m",route="chat_completions",status="2xx",outcome="success"} 0.4`) {
+	if !strings.Contains(out, `ai_proxy_request_duration_seconds_sum{provider="p",model="m",route="chat_completions",status="2xx",outcome="success",client_endpoint="unknown",upstream_protocol="unknown",upstream_endpoint="unknown",conversion_mode="unknown"} 0.4`) {
 		t.Fatalf("expected 0.4 in output: %s", out)
 	}
 }

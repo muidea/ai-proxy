@@ -20,6 +20,12 @@ func mustHandlerConfig(cfg config.Config) config.Config {
 		cfg.ModelCatalog = map[string]config.ModelInfo{}
 	}
 	seedCommonModels := len(cfg.ModelCatalog) == 0
+	enabledProviders := 0
+	for _, provider := range cfg.Providers {
+		if !provider.Disabled {
+			enabledProviders++
+		}
+	}
 	for name, provider := range cfg.Providers {
 		if provider.Name == "" {
 			provider.Name = name
@@ -42,6 +48,11 @@ func mustHandlerConfig(cfg config.Config) config.Config {
 					config.EndpointCapabilityEmbeddings,
 				}
 			}
+		}
+		// 仅测试 helper 兼容历史单 provider 夹具:显式补通配 pattern。
+		// 生产配置仍由 config.Load 强制要求 provider.models 显式声明。
+		if len(provider.Models) == 0 && !provider.Disabled && enabledProviders == 1 {
+			provider.Models = []string{"*"}
 		}
 		cfg.Providers[name] = provider
 	}

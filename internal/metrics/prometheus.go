@@ -33,7 +33,7 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 	r.mu.Unlock()
 
 	writeCounter(w, "ai_proxy_requests_total",
-		"Total number of LLM requests by provider, model, route, HTTP status class, and outcome.",
+		"Total number of LLM requests by provider, model, route, status, outcome, and TransportPlan labels.",
 		snapshot.requestCount, requestKeyLabels)
 
 	writeCounterFloat(w, "ai_proxy_request_duration_seconds_sum",
@@ -173,6 +173,10 @@ func requestKeyLabels(k requestKey) string {
 		"route", k.Route,
 		"status", k.Status,
 		"outcome", k.Outcome,
+		"client_endpoint", k.ClientEndpoint,
+		"upstream_protocol", k.UpstreamProtocol,
+		"upstream_endpoint", k.UpstreamEndpoint,
+		"conversion_mode", k.ConversionMode,
 	)
 }
 

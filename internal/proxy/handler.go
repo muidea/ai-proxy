@@ -58,7 +58,6 @@ func requireResolvedConfig(cfg config.Config) error {
 	if cfg.ModelCatalog == nil {
 		cfg.ModelCatalog = map[string]config.ModelInfo{}
 	}
-	seenFold := map[string]string{}
 	for name, provider := range cfg.Providers {
 		if provider.Disabled {
 			continue
@@ -69,6 +68,9 @@ func requireResolvedConfig(cfg config.Config) error {
 			return fmt.Errorf("provider %q: protocol unresolved", name)
 		default:
 			return fmt.Errorf("provider %q: unknown protocol %q", name, provider.Protocol)
+		}
+		if len(provider.Models) == 0 {
+			return fmt.Errorf("provider %q: models unresolved", name)
 		}
 		if len(provider.EndpointCapabilities) == 0 {
 			return fmt.Errorf("provider %q: endpoint_capabilities unresolved", name)
@@ -98,11 +100,6 @@ func requireResolvedConfig(cfg config.Config) error {
 		if info.ID != id {
 			return fmt.Errorf("model_catalog.%s: id mismatch %q", id, info.ID)
 		}
-		fold := strings.ToLower(id)
-		if prev, ok := seenFold[fold]; ok {
-			return fmt.Errorf("model_catalog: case-fold duplicate %q and %q", prev, id)
-		}
-		seenFold[fold] = id
 		if info.ContextWindowTokens <= 0 || info.MaxOutputTokens <= 0 {
 			return fmt.Errorf("model_catalog.%s: capacity unresolved", id)
 		}
@@ -201,7 +198,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// 入站认证:配置了 InboundAPIKey 时,所有 /v1/* 代理入口均需校验。
 	if !h.authorizeInbound(r) {
-		http.Error(w, "unauthorized: missing or invalid inbound api key", http.StatusUnauthorized)
+		writeClientProtocolError(w, http.StatusUnauthorized, clientProtocolFromRequest(r), APIError{
+			Code:           ErrorCodeAuthenticationFailed,
+			Message:        "missing or invalid inbound api key",
+			ClientProtocol: clientProtocolFromRequest(r),
+			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path),
+			Operation:      OperationForPath(r.URL.Path),
+		})
 		return
 	}
 	switch {
@@ -341,17 +344,26 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	bodyBytes, err := h.readLimitedBody(w, r)
 	if err != nil {
 		status := http.StatusBadRequest
+		code := ErrorCodeInvalidRequest
 		if isRequestTooLarge(err) {
 			status = http.StatusRequestEntityTooLarge
+			code = ErrorCodeRequestTooLarge
 		}
-		http.Error(w, err.Error(), status)
+		writeClientProtocolError(w, status, clientProtocolFromRequest(r), APIError{
+			Code: code, Message: err.Error(), ClientProtocol: clientProtocolFromRequest(r),
+			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
+		})
 		return
 	}
 	defer r.Body.Close()
 
 	round, err := h.startRound()
 	if err != nil {
-		http.Error(w, "start interaction archive failed", http.StatusInternalServerError)
+		writeClientProtocolError(w, http.StatusInternalServerError, clientProtocolFromRequest(r), APIError{
+			Code: ErrorCodeProxyInternalError, Message: "start interaction archive failed",
+			ClientProtocol: clientProtocolFromRequest(r),
+			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
+		})
 		return
 	}
 	if round != nil {
@@ -376,36 +388,57 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 
 	model, _ := body["model"].(string)
 	stream, _ := body["stream"].(bool)
-	providerName, _, apiErr := h.resolveProviderName(r, model)
+	plan, apiErr := h.resolveTransportPlan(r, model)
 	if apiErr != nil {
 		h.writeArchivedAPIError(w, round, r, start, "", model, stream, statusForAPIError(apiErr), *apiErr)
 		return
 	}
-	provider, ok := h.cfg.Providers[providerName]
+	provider, ok := h.cfg.Providers[plan.RouteOwner]
 	if !ok {
-		h.writeArchivedAPIError(w, round, r, start, providerName, model, stream, http.StatusServiceUnavailable, APIError{
-			Code:    ErrorCodeProviderUnavailable,
-			Message: fmt.Sprintf("provider %q is not configured", providerName),
-			Model:   model,
+		h.writeArchivedAPIError(w, round, r, start, plan.RouteOwner, model, stream, http.StatusServiceUnavailable, APIError{
+			Code:             ErrorCodeProviderUnavailable,
+			Message:          fmt.Sprintf("provider %q is not configured", plan.RouteOwner),
+			Model:            model,
+			Operation:        plan.Operation,
+			ClientEndpoint:   plan.ClientEndpoint,
+			ClientProtocol:   plan.ClientProtocol,
+			UpstreamProtocol: plan.UpstreamProtocol,
 		})
 		return
 	}
-	// model 路由仅使用 body.model + model_catalog authority。
-	h.archiveAndLogProviderSelection(round, r, providerName, provider, model, stream)
+	// model 路由仅使用 body.model + ResolvedModelRoute + TransportPlan authority。
+	h.archiveAndLogTransportPlan(round, r, plan, provider, stream)
 
-	if provider.Protocol == "anthropic" {
-		h.handleAnthropicChatCompletions(w, r, round, start, providerName, provider, bodyBytes, body, model, stream)
+	switch plan.Mode {
+	case TransportModeOpenAIToAnthropic:
+		if apiErr := ValidateConversionRequest(plan, body); apiErr != nil {
+			h.writeArchivedAPIError(w, round, r, start, plan.RouteOwner, model, stream, statusForAPIError(apiErr), *apiErr)
+			return
+		}
+		h.handleAnthropicChatCompletions(w, r, round, start, plan, provider, bodyBytes, body, model, stream)
+		return
+	case TransportModeNative:
+		// OpenAI client → OpenAI upstream native
+	default:
+		h.writeArchivedAPIError(w, round, r, start, plan.RouteOwner, model, stream, http.StatusBadRequest, APIError{
+			Code:             ErrorCodeEndpointUnsupported,
+			Message:          fmt.Sprintf("transport mode %q is not valid for %s", plan.Mode, plan.ClientEndpoint),
+			Model:            model,
+			Operation:        plan.Operation,
+			ClientEndpoint:   plan.ClientEndpoint,
+			ClientProtocol:   plan.ClientProtocol,
+			UpstreamProtocol: plan.UpstreamProtocol,
+		})
 		return
 	}
 
-	result, err := h.doUpstream(r, round, providerName, provider, bodyBytes, len(bodyBytes), stream)
+	result, err := h.doUpstreamPath(r, round, plan.RouteOwner, provider, bodyBytes, len(bodyBytes), stream, plan.UpstreamEndpoint, r.URL.RawQuery, r.Method)
 	if err != nil {
-		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
+		h.writeArchivedError(w, round, r, start, plan.RouteOwner, model, stream, http.StatusBadGateway, err.Error())
 		return
 	}
 	resp := result.Response
-	providerName = result.ProviderName
-	provider = result.Provider
+	providerName := result.ProviderName
 	if result.Cancel != nil {
 		defer result.Cancel()
 	}
@@ -426,20 +459,81 @@ func (h *Handler) startRound() (*archive.Round, error) {
 }
 
 func (h *Handler) writeArchivedError(w http.ResponseWriter, round *archive.Round, r *http.Request, start time.Time, provider, model string, stream bool, status int, message string) {
-	http.Error(w, message, status)
-	responseBody := []byte(message + "\n")
-	if err := round.WriteResponse("response.txt", responseBody); err != nil {
-		log.Printf("archive error response: %v", err)
+	// 自由文本失败统一收敛为 typed envelope,避免 text/plain。
+	code := ErrorCodeInvalidRequest
+	switch status {
+	case http.StatusRequestEntityTooLarge:
+		code = ErrorCodeRequestTooLarge
+	case http.StatusInternalServerError:
+		code = ErrorCodeProxyInternalError
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		code = ErrorCodeUpstreamUnavailable
+	default:
+		if strings.Contains(strings.ToLower(message), "conversion") {
+			code = ErrorCodeConversionUnsupported
+		} else if status >= 500 {
+			code = ErrorCodeProxyInternalError
+		}
 	}
-	duration := time.Since(start)
-	usage := tokenUsage{}
-	h.recordAndPrint(round, r, provider, model, stream, status, duration, usage, message)
-	h.writeArchiveMetadata(round, provider, model, stream, status, duration, usage, "response.txt", message, "", "")
+	apiErr := APIError{
+		Code:           code,
+		Message:        message,
+		Model:          model,
+		ClientEndpoint: "",
+		ClientProtocol: clientProtocolFromRequest(r),
+	}
+	if r != nil && r.URL != nil {
+		apiErr.ClientEndpoint = NormalizeClientEndpoint(r.URL.Path)
+		apiErr.Operation = OperationForPath(r.URL.Path)
+	}
+	if round != nil {
+		if apiErr.Operation == "" {
+			apiErr.Operation = round.Operation
+		}
+		if apiErr.ClientEndpoint == "" {
+			apiErr.ClientEndpoint = round.ClientEndpoint
+		}
+		if round.ClientProtocol != "" {
+			apiErr.ClientProtocol = round.ClientProtocol
+		}
+		apiErr.UpstreamProtocol = round.UpstreamProtocol
+	}
+	h.writeArchivedAPIError(w, round, r, start, provider, model, stream, status, apiErr)
 }
 
 func (h *Handler) writeArchivedAPIError(w http.ResponseWriter, round *archive.Round, r *http.Request, start time.Time, provider, model string, stream bool, status int, apiErr APIError) {
-	writeAPIError(w, status, apiErr.Code, apiErr.Message, apiErr.Model, apiErr.Operation)
-	body, _ := json.Marshal(APIErrorResponse{Error: apiErr})
+	if apiErr.ClientProtocol == "" {
+		apiErr.ClientProtocol = clientProtocolFromRequest(r)
+	}
+	if apiErr.ClientEndpoint == "" && r != nil && r.URL != nil {
+		apiErr.ClientEndpoint = NormalizeClientEndpoint(r.URL.Path)
+	}
+	if apiErr.Operation == "" && apiErr.ClientEndpoint != "" {
+		apiErr.Operation = OperationForPath(apiErr.ClientEndpoint)
+	}
+	if apiErr.Model == "" {
+		apiErr.Model = model
+	}
+	writeClientProtocolError(w, status, apiErr.ClientProtocol, apiErr)
+	var body []byte
+	if strings.EqualFold(apiErr.ClientProtocol, ClientProtocolAnthropic) {
+		msg := apiErr.Message
+		if apiErr.Code != "" && !strings.Contains(msg, apiErr.Code) {
+			msg = apiErr.Code + ": " + msg
+		}
+		body, _ = json.Marshal(AnthropicErrorResponse{
+			Type: "error",
+			Error: AnthropicError{
+				Type:    anthropicErrorType(apiErr.Code),
+				Message: msg,
+			},
+		})
+	} else {
+		if apiErr.Type == "" {
+			apiErr.Type = openAIErrorType(apiErr.Code)
+		}
+		body, _ = json.Marshal(APIErrorResponse{Error: apiErr})
+	}
 	body = append(body, '\n')
 	if err := round.WriteResponse("response.json", body); err != nil {
 		log.Printf("archive api error response: %v", err)
@@ -451,36 +545,31 @@ func (h *Handler) writeArchivedAPIError(w http.ResponseWriter, round *archive.Ro
 	h.writeArchiveMetadata(round, provider, model, stream, status, duration, usage, "response.json", msg, "", "")
 }
 
-func statusForAPIError(apiErr *APIError) int {
-	if apiErr == nil {
-		return http.StatusBadRequest
-	}
-	switch apiErr.Code {
-	case ErrorCodeProviderUnavailable:
-		return http.StatusServiceUnavailable
-	case ErrorCodeRouteContractInvalid:
-		return http.StatusInternalServerError
-	default:
-		return http.StatusBadRequest
-	}
-}
-
 func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID string) {
 	start := time.Now()
 	body, err := h.readLimitedBody(w, r)
 	if err != nil {
 		status := http.StatusBadRequest
+		code := ErrorCodeInvalidRequest
 		if isRequestTooLarge(err) {
 			status = http.StatusRequestEntityTooLarge
+			code = ErrorCodeRequestTooLarge
 		}
-		http.Error(w, err.Error(), status)
+		writeClientProtocolError(w, status, clientProtocolFromRequest(r), APIError{
+			Code: code, Message: err.Error(), ClientProtocol: clientProtocolFromRequest(r),
+			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
+		})
 		return
 	}
 	defer r.Body.Close()
 	rawBody, rawModel, rawStream := parseRawRequestBody(body)
 	round, err := h.startRound()
 	if err != nil {
-		http.Error(w, "start interaction archive failed", http.StatusInternalServerError)
+		writeClientProtocolError(w, http.StatusInternalServerError, clientProtocolFromRequest(r), APIError{
+			Code: ErrorCodeProxyInternalError, Message: "start interaction archive failed",
+			ClientProtocol: clientProtocolFromRequest(r),
+			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
+		})
 		return
 	}
 	if round != nil {
@@ -492,37 +581,51 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID s
 		log.Printf("archive raw request: %v", err)
 	}
 	h.archiveAndLogClientRequest(round, r, len(body))
-	providerName, _, apiErr := h.resolveProviderName(r, rawModel)
+	// responses/completions/embeddings 仅允许矩阵中的 native 组合;TransportPlan 统一裁决。
+	plan, apiErr := h.resolveTransportPlan(r, rawModel)
 	if apiErr != nil {
 		h.writeArchivedAPIError(w, round, r, start, "", rawModel, rawStream, statusForAPIError(apiErr), *apiErr)
 		return
 	}
-	provider, ok := h.cfg.Providers[providerName]
-	if !ok {
-		h.writeArchivedAPIError(w, round, r, start, providerName, rawModel, rawStream, http.StatusServiceUnavailable, APIError{
-			Code:    ErrorCodeProviderUnavailable,
-			Message: fmt.Sprintf("provider %q is not configured", providerName),
-			Model:   rawModel,
+	if plan.Mode != TransportModeNative {
+		h.writeArchivedAPIError(w, round, r, start, plan.RouteOwner, rawModel, rawStream, http.StatusBadRequest, APIError{
+			Code:             ErrorCodeEndpointUnsupported,
+			Message:          fmt.Sprintf("endpoint %q only supports native transport; conversion is not available", plan.ClientEndpoint),
+			Model:            rawModel,
+			Operation:        plan.Operation,
+			ClientEndpoint:   plan.ClientEndpoint,
+			ClientProtocol:   plan.ClientProtocol,
+			UpstreamProtocol: plan.UpstreamProtocol,
 		})
 		return
 	}
-	if provider.Protocol == "anthropic" {
-		h.writeArchivedError(w, round, r, start, providerName, rawModel, rawStream, http.StatusBadRequest,
-			fmt.Sprintf("provider %q uses anthropic protocol; only POST /v1/chat/completions supports OpenAI->Anthropic conversion", providerName))
+	provider, ok := h.cfg.Providers[plan.RouteOwner]
+	if !ok {
+		h.writeArchivedAPIError(w, round, r, start, plan.RouteOwner, rawModel, rawStream, http.StatusServiceUnavailable, APIError{
+			Code:             ErrorCodeProviderUnavailable,
+			Message:          fmt.Sprintf("provider %q is not configured", plan.RouteOwner),
+			Model:            rawModel,
+			Operation:        plan.Operation,
+			ClientEndpoint:   plan.ClientEndpoint,
+			ClientProtocol:   plan.ClientProtocol,
+			UpstreamProtocol: plan.UpstreamProtocol,
+		})
 		return
 	}
-	h.debugfRound(round, r, "raw proxy client request method=%s path=%s query=%q provider=%s remote=%s body_bytes=%d headers=%s",
+	providerName := plan.RouteOwner
+	h.debugfRound(round, r, "raw proxy client request method=%s path=%s query=%q provider=%s mode=%s remote=%s body_bytes=%d headers=%s",
 		r.Method,
 		r.URL.Path,
 		r.URL.RawQuery,
 		providerName,
+		plan.Mode,
 		r.RemoteAddr,
 		len(body),
 		headerSummary(sanitizeHeaders(r.Header)),
 	)
-	h.archiveAndLogProviderSelection(round, r, providerName, provider, rawModel, rawStream)
+	h.archiveAndLogTransportPlan(round, r, plan, provider, rawStream)
 	streamRequest := rawStream || acceptsEventStream(r.Header)
-	result, err := h.doUpstream(r, round, providerName, provider, body, len(body), streamRequest)
+	result, err := h.doUpstreamPath(r, round, providerName, provider, body, len(body), streamRequest, plan.UpstreamEndpoint, r.URL.RawQuery, r.Method)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, rawModel, rawStream, http.StatusBadGateway, err.Error())
 		return
@@ -546,7 +649,7 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID s
 	if strings.HasSuffix(responsePath, ".sse") {
 		copyResponseHeader(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		usage, fullPath, streamErr := h.copyAndArchiveRawStream(w, resp, round, providerName, provider, rawModel, rawBody, r.Context(), result.Cancel, r.URL.Path)
+		usage, fullPath, streamErr := h.copyAndArchiveRawStream(w, resp, round, providerName, provider, rawModel, rawBody, r.Context(), result.Cancel, plan.UpstreamEndpoint)
 		duration := time.Since(start)
 		errMsg := ""
 		if streamErr != nil {
@@ -1060,6 +1163,7 @@ func (h *Handler) newUpstreamRequest(ctx context.Context, r *http.Request, provi
 }
 
 // newUpstreamRequestForPath 按指定上游 path 构建请求,用于协议转换时改写目标路径。
+// 请求头使用 upstream protocol allowlist 构造,不得先复制全部入站 header 再 blocklist 删除。
 func (h *Handler) newUpstreamRequestForPath(ctx context.Context, r *http.Request, provider config.Provider, body []byte, path, rawQuery, method string, stream bool) (*http.Request, error) {
 	incoming := *r.URL
 	incoming.Path = path
@@ -1075,35 +1179,87 @@ func (h *Handler) newUpstreamRequestForPath(ctx context.Context, r *http.Request
 	if err != nil {
 		return nil, err
 	}
-	copyHeader(req.Header, r.Header)
-	removeHopByHop(req.Header)
-	req.Header.Del("Accept-Encoding")
-	req.Header.Del("Content-Length")
-	req.Header.Del("X-AI-Provider")
-	// 无条件剥离入站认证头,避免把代理密钥泄露给上游;再按 provider 配置注入。
-	req.Header.Del("Authorization")
-	req.Header.Del("X-API-Key")
-	req.Header.Del("Api-Key")
-	if len(body) > 0 && req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if provider.Protocol == "anthropic" {
-		if req.Header.Get("Anthropic-Version") == "" {
-			req.Header.Set("Anthropic-Version", "2023-06-01")
-		}
-		if stream {
-			req.Header.Set("Accept", "text/event-stream")
-		} else if req.Header.Get("Accept") == "" {
-			req.Header.Set("Accept", "application/json")
-		}
-		if provider.APIKey != "" {
-			req.Header.Set("X-API-Key", provider.APIKey)
-		}
-	} else if provider.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
-	}
+	applyUpstreamHeaders(req, r, provider, body, stream)
 	req.ContentLength = int64(len(body))
 	return req, nil
+}
+
+// applyUpstreamHeaders 按 upstream protocol 重建认证与版本头,仅透传白名单语义 header。
+// 允许透传: Content-Type、Accept、X-Request-ID(已校验)。其它 header 不从客户端复制。
+func applyUpstreamHeaders(req *http.Request, client *http.Request, provider config.Provider, body []byte, stream bool) {
+	if req == nil {
+		return
+	}
+	// 从干净 header 开始。
+	req.Header = make(http.Header)
+
+	contentType := ""
+	accept := ""
+	requestID := ""
+	if client != nil {
+		contentType = strings.TrimSpace(client.Header.Get("Content-Type"))
+		accept = strings.TrimSpace(client.Header.Get("Accept"))
+		requestID = strings.TrimSpace(client.Header.Get("X-Request-ID"))
+	}
+	if contentType == "" && len(body) > 0 {
+		contentType = "application/json"
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if requestID != "" && isSafeRequestID(requestID) {
+		req.Header.Set("X-Request-ID", requestID)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(provider.Protocol)) {
+	case "anthropic":
+		// Anthropic-Version 由 ai-proxy 固定生成,不信任客户端。
+		req.Header.Set("Anthropic-Version", "2023-06-01")
+		if stream {
+			req.Header.Set("Accept", "text/event-stream")
+		} else if accept != "" && isSafeAccept(accept) {
+			req.Header.Set("Accept", accept)
+		} else {
+			req.Header.Set("Accept", "application/json")
+		}
+		if strings.TrimSpace(provider.APIKey) != "" {
+			req.Header.Set("X-API-Key", provider.APIKey)
+		}
+	default: // openai
+		if stream {
+			req.Header.Set("Accept", "text/event-stream")
+		} else if accept != "" && isSafeAccept(accept) {
+			req.Header.Set("Accept", accept)
+		} else if accept == "" {
+			req.Header.Set("Accept", "application/json")
+		}
+		if strings.TrimSpace(provider.APIKey) != "" {
+			req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+		}
+	}
+}
+
+func isSafeRequestID(id string) bool {
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isSafeAccept(accept string) bool {
+	// 仅允许常见 JSON/SSE accept,避免透传任意客户端值。
+	lower := strings.ToLower(accept)
+	return strings.Contains(lower, "application/json") ||
+		strings.Contains(lower, "text/event-stream") ||
+		strings.Contains(lower, "*/*")
 }
 
 func acceptsEventStream(header http.Header) bool {
@@ -1139,65 +1295,28 @@ func joinUpstreamPath(basePath, incomingPath string) string {
 	return basePath + incomingPath
 }
 
-// resolveProviderName 按 model_catalog 权威解析 provider,并在访问上游前校验 requested operation。
-// 已禁用 X-AI-Provider / ?provider= / provider/model 显式选择。
-func (h *Handler) resolveProviderName(r *http.Request, model string) (string, string, *APIError) {
-	model = strings.TrimSpace(model)
-	operation := ""
+// resolveTransportPlan 是执行端点的唯一路由入口:解析 ResolvedModelRoute + TransportPlan。
+// 已禁用 X-AI-Provider / ?provider= / provider/model 显式选择;不允许修改 RouteOwner。
+func (h *Handler) resolveTransportPlan(r *http.Request, model string) (TransportPlan, *APIError) {
+	method := ""
+	path := ""
 	if r != nil {
-		operation = OperationForPath(r.URL.Path)
-	}
-	if model == "" {
-		return "", operation, &APIError{
-			Code:      ErrorCodeModelRequired,
-			Message:   "model is required",
-			Operation: operation,
+		method = r.Method
+		if r.URL != nil {
+			path = r.URL.Path
 		}
 	}
-	info, ok := config.LookupModel(h.cfg, model)
-	if !ok {
-		return "", operation, &APIError{
-			Code:      ErrorCodeModelNotFound,
-			Message:   fmt.Sprintf("model %q was not found in model_catalog", model),
-			Model:     model,
-			Operation: operation,
-		}
+	return ResolveTransportPlan(h.cfg, method, path, model)
+}
+
+// resolveProviderName 保留为兼容包装:返回 RouteOwner 与 operation。
+// 新代码应使用 resolveTransportPlan。
+func (h *Handler) resolveProviderName(r *http.Request, model string) (string, string, *APIError) {
+	plan, apiErr := h.resolveTransportPlan(r, model)
+	if apiErr != nil {
+		return "", apiErr.Operation, apiErr
 	}
-	if operation != "" && !config.ModelSupportsOperation(info, operation) {
-		return "", operation, &APIError{
-			Code:      ErrorCodeOperationUnsupported,
-			Message:   fmt.Sprintf("model %q does not support operation %q", model, operation),
-			Model:     model,
-			Operation: operation,
-		}
-	}
-	owner := strings.TrimSpace(info.RouteOwner)
-	if owner == "" {
-		return "", operation, &APIError{
-			Code:      ErrorCodeRouteContractInvalid,
-			Message:   fmt.Sprintf("model %q has no resolved route owner", model),
-			Model:     model,
-			Operation: operation,
-		}
-	}
-	provider, ok := h.cfg.Providers[owner]
-	if !ok || provider.Disabled {
-		return "", operation, &APIError{
-			Code:      ErrorCodeProviderUnavailable,
-			Message:   fmt.Sprintf("provider %q for model %q is unavailable", owner, model),
-			Model:     model,
-			Operation: operation,
-		}
-	}
-	if r != nil && !providerSupportsInboundPath(provider, r.URL.Path) {
-		return "", operation, &APIError{
-			Code:      ErrorCodeEndpointUnsupported,
-			Message:   fmt.Sprintf("provider %q does not support inbound path %q for model %q", owner, r.URL.Path, model),
-			Model:     model,
-			Operation: operation,
-		}
-	}
-	return owner, operation, nil
+	return plan.RouteOwner, plan.Operation, nil
 }
 
 func providerMatchesModel(name string, provider config.Provider, model string) bool {
@@ -1311,11 +1430,19 @@ func (h *Handler) recordAndPrintFail(round *archive.Round, r *http.Request, prov
 		HTTPStatus:               status,
 		Outcome:                  outcome,
 	}
+	if round != nil {
+		record.Operation = round.Operation
+		record.ClientEndpoint = round.ClientEndpoint
+		record.UpstreamProtocol = round.UpstreamProtocol
+		record.UpstreamEndpoint = round.UpstreamEndpoint
+		record.ConversionMode = round.ConversionMode
+	}
 	if err := h.recorder.Append(record); err != nil {
 		log.Printf("append usage record: %v", err)
 	}
 	route := RouteLabel(r)
-	h.metricsRegistry.RecordRequest(provider, model, route, status, duration, outcome)
+	h.metricsRegistry.RecordRequestPlan(provider, model, route, status, duration, outcome,
+		record.ClientEndpoint, record.UpstreamProtocol, record.UpstreamEndpoint, record.ConversionMode)
 	// 仅流式 midflight 上游读失败计入 provider 错误率,避免非流式状态码/本地错误重复计数。
 	if shouldCountUpstreamError(fail, stream) {
 		h.metricsRegistry.RecordUpstreamError(provider, -2) // -2 = stream_midflight
@@ -1329,6 +1456,14 @@ func (h *Handler) writeArchiveMetadata(round *archive.Round, provider, model str
 	fullContent := round == nil || round.FullContent()
 	if outcome == "" {
 		outcome = outcomeFromStreamFail(streamFailFromMessage(message), status)
+	}
+	// 转换路径中途失败时 outcome 必须显式为 conversion,避免伪造成功终止。
+	if outcome == "" || outcome == "error" {
+		if round != nil && round.ConversionMode != "" && round.ConversionMode != TransportModeNative && message != "" {
+			if strings.Contains(message, "conversion") || strings.Contains(message, ErrorCodeConversionUnsupported) {
+				outcome = "conversion"
+			}
+		}
 	}
 	meta := archive.Metadata{
 		FinishedAt:               time.Now(),
@@ -1351,6 +1486,14 @@ func (h *Handler) writeArchiveMetadata(round *archive.Round, provider, model str
 		Estimated:                usage.Estimated,
 		FullContentEnabled:       fullContent,
 		Error:                    message,
+	}
+	if round != nil {
+		meta.Operation = round.Operation
+		meta.ClientEndpoint = round.ClientEndpoint
+		meta.ClientProtocol = round.ClientProtocol
+		meta.UpstreamProtocol = round.UpstreamProtocol
+		meta.UpstreamEndpoint = round.UpstreamEndpoint
+		meta.ConversionMode = round.ConversionMode
 	}
 	if round != nil {
 		if round.HasFile("request.meta.json") {

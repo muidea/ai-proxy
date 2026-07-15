@@ -14,6 +14,11 @@ var currentCSVHeader = []string{
 	"time",
 	"provider",
 	"model",
+	"operation",
+	"client_endpoint",
+	"upstream_protocol",
+	"upstream_endpoint",
+	"conversion_mode",
 	"input_tokens",
 	"output_tokens",
 	"total_tokens",
@@ -31,6 +36,11 @@ type Record struct {
 	Time                     time.Time
 	Provider                 string
 	Model                    string
+	Operation                string
+	ClientEndpoint           string
+	UpstreamProtocol         string
+	UpstreamEndpoint         string
+	ConversionMode           string
 	InputTokens              int
 	OutputTokens             int
 	CachedInputTokens        int
@@ -98,6 +108,11 @@ func (r *CSVRecorder) Append(record Record) error {
 		record.Time.Format(time.RFC3339),
 		record.Provider,
 		record.Model,
+		record.Operation,
+		record.ClientEndpoint,
+		record.UpstreamProtocol,
+		record.UpstreamEndpoint,
+		record.ConversionMode,
 		fmt.Sprintf("%d", record.InputTokens),
 		fmt.Sprintf("%d", record.OutputTokens),
 		fmt.Sprintf("%d", total),

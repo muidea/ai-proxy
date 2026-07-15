@@ -30,8 +30,15 @@ type Round struct {
 	RequestID          string    `json:"request_id,omitempty"`
 	StablePrefixHash   string    `json:"stable_prefix_hash,omitempty"`
 	RequestFingerprint string    `json:"request_fingerprint,omitempty"`
-	recorder           *Recorder
-	written            map[string]struct{} // basename -> present
+	// Transport plan fields (in-memory only; written into Metadata at finish).
+	Operation        string
+	ClientEndpoint   string
+	ClientProtocol   string
+	UpstreamProtocol string
+	UpstreamEndpoint string
+	ConversionMode   string
+	recorder         *Recorder
+	written          map[string]struct{} // basename -> present
 }
 
 func (r *Round) markWritten(name string) {
@@ -68,19 +75,39 @@ func (r *Round) SetFingerprint(stableHash, fingerprint string) {
 	r.RequestFingerprint = fingerprint
 }
 
+// SetTransportPlan 记录本次请求的 TransportPlan 权威字段,供 Metadata 统一落盘。
+func (r *Round) SetTransportPlan(operation, clientEndpoint, clientProtocol, upstreamProtocol, upstreamEndpoint, conversionMode string) {
+	if r == nil {
+		return
+	}
+	r.Operation = operation
+	r.ClientEndpoint = clientEndpoint
+	r.ClientProtocol = clientProtocol
+	r.UpstreamProtocol = upstreamProtocol
+	r.UpstreamEndpoint = upstreamEndpoint
+	r.ConversionMode = conversionMode
+}
+
 type Metadata struct {
-	ID                     int       `json:"id"`
-	StartedAt              time.Time `json:"started_at"`
-	FinishedAt             time.Time `json:"finished_at"`
-	RequestID              string    `json:"request_id,omitempty"`
-	Provider               string    `json:"provider"`
-	Model                  string    `json:"model"`
-	StablePrefixHash       string    `json:"stable_prefix_hash,omitempty"`
-	RequestFingerprint     string    `json:"request_fingerprint,omitempty"`
-	StablePrefixDrift      bool      `json:"stable_prefix_drift,omitempty"`
-	StablePrefixDriftCount int       `json:"stable_prefix_drift_count,omitempty"`
-	Stream                 bool      `json:"stream"`
-	HTTPStatus             int       `json:"http_status"`
+	ID         int       `json:"id"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at"`
+	RequestID  string    `json:"request_id,omitempty"`
+	Provider   string    `json:"provider"`
+	Model      string    `json:"model"`
+	// Operation / ClientEndpoint / Upstream* / ConversionMode 记录 TransportPlan 权威字段。
+	Operation              string `json:"operation,omitempty"`
+	ClientEndpoint         string `json:"client_endpoint,omitempty"`
+	ClientProtocol         string `json:"client_protocol,omitempty"`
+	UpstreamProtocol       string `json:"upstream_protocol,omitempty"`
+	UpstreamEndpoint       string `json:"upstream_endpoint,omitempty"`
+	ConversionMode         string `json:"conversion_mode,omitempty"`
+	StablePrefixHash       string `json:"stable_prefix_hash,omitempty"`
+	RequestFingerprint     string `json:"request_fingerprint,omitempty"`
+	StablePrefixDrift      bool   `json:"stable_prefix_drift,omitempty"`
+	StablePrefixDriftCount int    `json:"stable_prefix_drift_count,omitempty"`
+	Stream                 bool   `json:"stream"`
+	HTTPStatus             int    `json:"http_status"`
 	// Outcome 与 CSV/Prometheus 对齐的业务结果枚举。
 	Outcome                  string  `json:"outcome,omitempty"`
 	DurationMS               int64   `json:"duration_ms"`

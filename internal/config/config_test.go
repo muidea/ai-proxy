@@ -22,18 +22,23 @@ server:
   stream_idle_timeout_seconds: 900
 providers:
   deepseek:
+    protocol: openai
     base_url: https://api.deepseek.com
     api_key: ${OPENAI_API_KEY}
     endpoint_capabilities: chat_completions, responses, completions, embeddings
     models: deepseek*
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
   custom:
+    protocol: openai
     base_url: https://custom.example
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: custom-*
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -71,14 +76,17 @@ func TestLoadDisabledProvider(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
   deepseek:
     base_url: https://api.deepseek.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
     enabled: false
+    protocol: openai
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -100,6 +108,7 @@ func TestLoadModelCatalog(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -161,9 +170,11 @@ server:
   interaction_retention: 123
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -185,9 +196,11 @@ server:
   stream_idle_timeout_seconds: 120
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -206,6 +219,7 @@ func TestLoadRejectsDefaultProviderConfig(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions
@@ -232,6 +246,7 @@ func TestLoadIgnoresAIProxyDefaultProviderEnv(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions
@@ -258,6 +273,7 @@ server:
   default_provider: openai
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions
@@ -284,9 +300,11 @@ func TestLoadParsesMetricsFields(t *testing.T) {
   metrics_allowed_cidrs: 10.0.0.0/8, 192.168.0.0/16
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
 `
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
@@ -313,9 +331,11 @@ server:
   listen_addr: 0.0.0.0:8080
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -336,9 +356,11 @@ server:
   inbound_api_key: secret-key
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -358,9 +380,11 @@ server:
   typo_key: true
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -380,9 +404,11 @@ server:
   debug_log: maybe
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -421,6 +447,7 @@ func TestLoadRejectsFallbacksConfig(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions
@@ -457,9 +484,11 @@ func TestLoadMetricsRemoteAccessFromEnv(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -480,9 +509,11 @@ server:
   log_format: text
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -501,6 +532,7 @@ func TestLoadRejectsInvalidEnv(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -522,6 +554,7 @@ func TestLoadRejectsInvalidMaxBodyEnv(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -554,6 +587,7 @@ func TestLoadRejectsInvalidBaseURL(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   bad:
+    protocol: openai
     base_url: not-a-url
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -574,6 +608,7 @@ func TestLoadRejectsNonHTTPBaseURL(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   bad:
+    protocol: openai
     base_url: ftp://example.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -600,20 +635,87 @@ func TestLoadRejectsCaseFoldProviderDuplicate(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsCaseFoldModelCatalogDuplicate(t *testing.T) {
-	// WorkOrch case-fold 唯一:仅大小写不同的 id 不得并存。
+func TestLoadAllowsCaseDifferentModelCatalogIDs(t *testing.T) {
+	// model ID 严格区分大小写:DeepSeek-V4-Flash 与 deepseek-v4-flash / GPT-4o 与 gpt-4o 是不同模型。
 	cfg := Config{
 		ListenAddr: "127.0.0.1:8080",
 		Providers: map[string]Provider{
-			"openai": {Name: "openai", Protocol: "openai", BaseURL: "https://api.openai.com", APIKey: "a", Models: []string{"gpt-*"}},
+			"openai": {
+				Name: "openai", Protocol: "openai", BaseURL: "https://api.openai.com", APIKey: "a",
+				Models:               []string{"gpt-*", "GPT-*"},
+				EndpointCapabilities: []string{EndpointCapabilityChatCompletions, EndpointCapabilityEmbeddings},
+			},
 		},
 		ModelCatalog: map[string]ModelInfo{
-			"GPT-4o": {ID: "GPT-4o", Operations: []string{ModelOperationChatCompletions}},
-			"gpt-4o": {ID: "gpt-4o", Operations: []string{ModelOperationEmbeddings}},
+			"GPT-4o": {
+				ID: "GPT-4o", ContextWindowTokens: 128000, MaxOutputTokens: 16384,
+				Operations: []string{ModelOperationChatCompletions},
+			},
+			"gpt-4o": {
+				ID: "gpt-4o", ContextWindowTokens: 8192, MaxOutputTokens: 4096,
+				Operations: []string{ModelOperationEmbeddings},
+			},
 		},
 	}
-	if err := normalize(&cfg); err == nil {
-		t.Fatal("expected case-fold duplicate model error")
+	if err := normalize(&cfg); err != nil {
+		t.Fatalf("normalize case-different models: %v", err)
+	}
+	if err := validate(cfg); err != nil {
+		t.Fatalf("validate case-different models: %v", err)
+	}
+	if _, ok := cfg.ModelCatalog["GPT-4o"]; !ok {
+		t.Fatal("missing GPT-4o")
+	}
+	if _, ok := cfg.ModelCatalog["gpt-4o"]; !ok {
+		t.Fatal("missing gpt-4o")
+	}
+	if cfg.ModelCatalog["GPT-4o"].RouteOwner != "openai" || cfg.ModelCatalog["gpt-4o"].RouteOwner != "openai" {
+		t.Fatalf("route owners = %#v %#v", cfg.ModelCatalog["GPT-4o"].RouteOwner, cfg.ModelCatalog["gpt-4o"].RouteOwner)
+	}
+}
+
+func TestCatalogModelsSortedUsesExactIDTieBreak(t *testing.T) {
+	catalog := map[string]ModelInfo{
+		"deepseek-v4-flash": {ID: "deepseek-v4-flash"},
+		"DeepSeek-V4-Flash": {ID: "DeepSeek-V4-Flash"},
+	}
+	for range 100 {
+		items := CatalogModelsSorted(catalog)
+		if len(items) != 2 {
+			t.Fatalf("items = %#v", items)
+		}
+		if items[0].ID != "DeepSeek-V4-Flash" || items[1].ID != "deepseek-v4-flash" {
+			t.Fatalf("unstable exact-id order = %q, %q", items[0].ID, items[1].ID)
+		}
+	}
+}
+
+func TestProviderMatchesModelRequiresExplicitPatterns(t *testing.T) {
+	provider := Provider{Name: "deepseek", Protocol: "openai"}
+	if ProviderMatchesModel("deepseek", provider, "deepseek-chat") {
+		t.Fatal("provider name/protocol must not infer model patterns")
+	}
+	provider.Models = []string{"deepseek-*"}
+	if !ProviderMatchesModel("deepseek", provider, "deepseek-chat") {
+		t.Fatal("explicit case-sensitive model pattern should match")
+	}
+}
+
+func TestLoadRejectsEnabledProviderWithoutModels(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  openai:
+    protocol: openai
+    base_url: https://api.openai.com
+    api_key: test
+    endpoint_capabilities: chat_completions
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "models is required") {
+		t.Fatalf("error = %v, want explicit models requirement", err)
 	}
 }
 
@@ -643,9 +745,11 @@ server:
   slo_violation_webhook: not-a-url
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -666,6 +770,7 @@ server:
   slo_violation_webhook: ftp://hooks.example/secret
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -683,6 +788,7 @@ func TestLoadRejectsMissingModelOperations(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -704,6 +810,7 @@ func TestLoadRejectsUnknownModelOperations(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -726,6 +833,7 @@ func TestLoadNormalizesModelOperationsOrderAndDedupe(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -753,6 +861,7 @@ func TestLoadRejectsCatalogModelWithoutRoute(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -776,11 +885,13 @@ func TestLoadRejectsCatalogModelWithAmbiguousRoute(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   primary:
+    protocol: openai
     base_url: https://a.example
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
     models: shared-*
   backup:
+    protocol: openai
     base_url: https://b.example
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -804,6 +915,7 @@ func TestLoadRejectsInvalidCatalogCapacity(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 providers:
   openai:
+    protocol: openai
     base_url: https://api.openai.com
     api_key: test
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -966,6 +1078,108 @@ model_catalog:
 	}
 	_, err := Load(path)
 	if err == nil || !strings.Contains(err.Error(), "anthropic") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadRejectsRemoteEmptyAPIKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  remote:
+    protocol: openai
+    base_url: https://api.example.com
+    endpoint_capabilities: chat_completions
+    models: m-*
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "empty api_key") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadRejectsAllowUnauthenticatedOnRemote(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  remote:
+    protocol: openai
+    base_url: https://api.example.com
+    allow_unauthenticated: true
+    endpoint_capabilities: chat_completions
+    models: m-*
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadRejectsAllowUnauthenticatedWithAPIKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  local:
+    protocol: openai
+    base_url: http://127.0.0.1:9000/v1
+    api_key: should-not-be-set
+    allow_unauthenticated: true
+    endpoint_capabilities: chat_completions
+    models: local-*
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadAllowsLoopbackUnauthenticated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  local:
+    protocol: openai
+    base_url: http://127.0.0.1:9000/v1
+    allow_unauthenticated: true
+    endpoint_capabilities: chat_completions
+    models: local-*
+model_catalog:
+  local-model:
+    context_window_tokens: 8000
+    max_output_tokens: 1000
+    operations: chat_completions
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Providers["local"].AllowUnauthenticated {
+		t.Fatal("expected allow_unauthenticated")
+	}
+}
+
+func TestLoadRejectsMissingProtocol(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: test
+    endpoint_capabilities: chat_completions
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// raw file has no protocol field
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "protocol is required") {
 		t.Fatalf("error = %v", err)
 	}
 }

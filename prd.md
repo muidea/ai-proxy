@@ -10,7 +10,7 @@
 ### 2.1 产品目标
 
 *   **本地统一入口**：为 NextChat、LobeChat、ChatBox、IDE Agent 等客户端提供一个本地 `API_BASE_URL`，屏蔽不同上游 provider 的 Base URL、API Key 与协议差异。
-*   **标准 path + 纯 model 路由**：客户端只访问 OpenAI/Anthropic 标准入站 path；代理仅按请求 `model` 与 provider `models` 规则匹配上游，不再使用 `X-AI-Provider` / `?provider=` / `provider/model`。
+*   **标准 path + 纯 model 路由**：客户端只访问 OpenAI/Anthropic 标准入站 path；请求期按 exact `model` 查找 `model_catalog` 已解析的唯一 RouteOwner，provider `models` 只在启动期验证归属，不再使用 `X-AI-Provider` / `?provider=` / `provider/model`。
 *   **双向协议兼容**：OpenAI chat ↔ Anthropic messages 提供基础协议转换；其余 OpenAI 端点仅在 RouteOwner 显式声明对应 `endpoint_capabilities` 时对 openai provider 直通。
 *   **用量与成本可见**：对每个经代理处理的标准 `/v1/*` 请求记录 provider、model、HTTP 状态、耗时、流式/非流式、输入/输出 token、缓存读写 token、缓存命中率；没有模型或 token 语义的请求保留空模型与 0 token，不能阻塞流水记录。
 *   **问题可追踪**：每个经代理处理的请求生成独立交互归档，保留请求、上游请求、上游响应、最终响应、元数据、request_id 和请求指纹，便于复盘异常、并发交错和 prompt 漂移。
@@ -22,6 +22,7 @@
 
 *   **Provider 配置**：通过 `config.yaml` 与环境变量配置端口、超时、usage 文件、交互归档目录、保留轮数、debug 日志、metrics 访问策略、SLO 阈值和 provider 列表。
 *   **Provider 选择**：仅 `model_catalog` exact model → 唯一 RouteOwner；无 default_provider / fallback。
+*   **Provider 模型范围**：每个 enabled provider 必须显式声明 `models`；不按 provider 名、protocol 或常见模型家族推导默认 pattern，pattern 也不自动生成 catalog。
 *   **转发能力**：标准 OpenAI path 与 Anthropic `/v1/messages`；非白名单 path 404；OpenAI chat ↔ Anthropic messages 基础双向转换。
 *   **记录能力**：`usage.csv` 作为结构化流水账，`interactions/{round_id}/` 作为完整交互归档；归档需要脱敏敏感请求头。
 *   **监控能力**：`/metrics` 输出 Prometheus text exposition format，`/stats` 输出 JSON 聚合快照，`/stats/stream` 输出 SSE 快照流；默认仅允许 loopback 访问，可通过 `metrics_remote_access` 显式开放远程访问。
@@ -64,6 +65,7 @@
 - [x] 无 provider fallback；无 model 未命中时的 default_provider 兜底。
 - [x] provider `enabled: false` 后不参与 model 匹配。
 - [x] 当多个 provider 的 models 同时命中同一 model 时配置加载启动失败，提示调整 `models` 规则。
+- [x] enabled provider 的 `models` 必须显式配置；空 `models` 不按 provider 名或 protocol 自动补默认值。
 
 ### 3.3 Token、cache 与用量统计
 
@@ -111,12 +113,23 @@
 
 ## model_catalog operation 合同（WorkOrch 对齐）
 
-- [x] `model_catalog` 每项必填 `operations`（`chat_completions` / `embeddings`），case-fold 后 model id 唯一。
-- [x] 每个 catalog model 唯一匹配 enabled provider；`GET /v1/models` 使用具体 DTO，`owned_by` 为确定 RouteOwner。
+- [x] `model_catalog` 每项必填 `operations`（`chat_completions` / `embeddings`）；model id **严格区分大小写**且 exact 唯一。
+- [x] 每个 catalog model 唯一匹配 enabled provider；`GET /v1/models` 使用具体 DTO，只发布模型业务能力，
+  不暴露 RouteOwner。
 - [x] 请求前按 exact model + path operation 校验；`operation_unsupported` / `model_not_found` 不访问上游。
 
 ### Provider endpoint_capabilities
 
-- [x] enabled provider 必须显式配置 `endpoint_capabilities`。
+- [x] enabled provider 必须显式配置 `endpoint_capabilities`（仅表示上游直连能力）。
 - [x] 不支持 env 注入 provider；不支持 `fallbacks`。
 - [x] 请求前校验 endpoint capability，失败返回 `endpoint_unsupported`。
+
+### Provider Capability Contract（TransportPlan）
+
+- [x] 启动期 `ResolvedModelRoute` 与请求期 `TransportPlan` 两阶段权威。
+- [x] 单一入口 `ResolveTransportPlan` 应用固定转发矩阵（native / openai_to_anthropic / anthropic_to_openai）。
+- [x] 转换前 feature preflight 返回 `conversion_unsupported`，不访问上游。
+- [x] 转换模式下游错误保留 status，输出客户端协议兼容安全 envelope。
+- [x] metadata 记录 operation、client endpoint/protocol、upstream protocol/path、conversion mode。
+- [x] `go test ./...` 覆盖矩阵、typed error、conversion preflight、SDK 验收与错误 envelope。
+- [x] 独立 `cmd/ai-proxy-probe` 运维入口与脱敏审计记录。

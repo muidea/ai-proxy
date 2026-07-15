@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -147,5 +148,79 @@ func TestLogStreamFailPreservesProtocolKind(t *testing.T) {
 	// 模拟产生点赋值后 outcome 仍为 protocol
 	if outcomeFromStreamFail(fail, 200) != "protocol" {
 		t.Fatalf("outcome = %s", outcomeFromStreamFail(fail, 200))
+	}
+}
+
+func TestConvertOpenAIResponseAllowsEmptyToolCalls(t *testing.T) {
+	body := []byte(`{"id":"1","model":"gpt","choices":[{"message":{"role":"assistant","content":"pong","tool_calls":[],"function_call":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	out, _, err := convertOpenAIChatToAnthropicResponse(body, "gpt")
+	if err != nil {
+		t.Fatalf("empty tool_calls should be allowed: %v", err)
+	}
+	if !strings.Contains(string(out), "pong") {
+		t.Fatalf("response = %s", out)
+	}
+}
+
+func TestHasNonEmptyConversionFeature(t *testing.T) {
+	if hasNonEmptyConversionFeature(nil) {
+		t.Fatal("nil")
+	}
+	if hasNonEmptyConversionFeature([]any{}) {
+		t.Fatal("empty array")
+	}
+	if hasNonEmptyConversionFeature(map[string]any{}) {
+		t.Fatal("empty object")
+	}
+	if !hasNonEmptyConversionFeature([]any{map[string]any{"id": "x"}}) {
+		t.Fatal("non-empty array")
+	}
+}
+
+func TestNormalizeStopSequences(t *testing.T) {
+	if got, err := normalizeStopSequences("END"); err != nil || !reflect.DeepEqual(got, []string{"END"}) {
+		t.Fatalf("string stop = %#v err=%v", got, err)
+	}
+	if got, err := normalizeStopSequences([]any{"a", " b ", ""}); err != nil || !reflect.DeepEqual(got, []string{"a", "b"}) {
+		t.Fatalf("array stop = %#v err=%v", got, err)
+	}
+	if got, err := normalizeStopSequences(""); err != nil || got != nil {
+		t.Fatalf("empty string = %#v err=%v", got, err)
+	}
+	if got, err := normalizeStopSequences(nil); err != nil || got != nil {
+		t.Fatalf("nil = %#v err=%v", got, err)
+	}
+	if _, err := normalizeStopSequences([]any{"END", 1}); err == nil {
+		t.Fatal("expected mixed stop array to be rejected")
+	}
+	if _, err := normalizeStopSequences(1); err == nil {
+		t.Fatal("expected numeric stop to be rejected")
+	}
+	if _, err := normalizeStopSequences(map[string]any{"value": "END"}); err == nil {
+		t.Fatal("expected object stop to be rejected")
+	}
+}
+
+func TestConversionStreamTextDeltaRejectsNonText(t *testing.T) {
+	if _, err := conversionStreamTextDelta([]any{map[string]any{"type": "image_url"}}); err == nil {
+		t.Fatal("expected rejection for non-text stream content")
+	}
+	got, err := conversionStreamTextDelta("hello")
+	if err != nil || got != "hello" {
+		t.Fatalf("string delta = %q err=%v", got, err)
+	}
+	got, err = conversionStreamTextDelta(nil)
+	if err != nil || got != "" {
+		t.Fatalf("nil delta = %q err=%v", got, err)
+	}
+}
+
+func TestStreamFailFromMessageConversionOutcome(t *testing.T) {
+	fail := streamFailFromMessage("protocol conversion does not support response tool_calls; use a native provider")
+	if fail == nil || fail.Kind != streamKindConversion {
+		t.Fatalf("kind = %#v", fail)
+	}
+	if outcomeFromStreamFail(fail, 502) != "conversion" {
+		t.Fatalf("outcome = %q", outcomeFromStreamFail(fail, 502))
 	}
 }

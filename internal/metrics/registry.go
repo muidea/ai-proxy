@@ -33,6 +33,8 @@ const otherModelLabel = "_other"
 // 计入 upstream error rate 的: upstream_truncated, upstream_failed, idle_timeout, protocol(上游损坏)。
 type requestKey struct {
 	Provider, Model, Route, Status, Outcome string
+	// TransportPlan 有界枚举 label(空值归一为 unknown,避免基数爆炸)。
+	ClientEndpoint, UpstreamProtocol, UpstreamEndpoint, ConversionMode string
 }
 
 // tokenKey 是 token 计数器的复合 label。
@@ -168,6 +170,11 @@ func (r *Registry) ReserveModels(provider string, models []string) {
 // RecordRequest 记录一次完成的请求(包含 duration)。
 // status 归一为 2xx/3xx/4xx/5xx;outcome 描述业务结果(空则 success)。
 func (r *Registry) RecordRequest(provider, model, route string, status int, duration time.Duration, outcome string) {
+	r.RecordRequestPlan(provider, model, route, status, duration, outcome, "", "", "", "")
+}
+
+// RecordRequestPlan 记录请求,并附带 TransportPlan 有界 label。
+func (r *Registry) RecordRequestPlan(provider, model, route string, status int, duration time.Duration, outcome, clientEndpoint, upstreamProtocol, upstreamEndpoint, conversionMode string) {
 	if r == nil {
 		return
 	}
@@ -177,7 +184,11 @@ func (r *Registry) RecordRequest(provider, model, route string, status int, dura
 	if outcome == "" {
 		outcome = "success"
 	}
-	key := requestKey{Provider: provider, Model: model, Route: route, Status: statusBucket(status), Outcome: outcome}
+	key := requestKey{
+		Provider: provider, Model: model, Route: route, Status: statusBucket(status), Outcome: outcome,
+		ClientEndpoint: boundEndpointLabel(clientEndpoint), UpstreamProtocol: boundProtocolLabel(upstreamProtocol),
+		UpstreamEndpoint: boundEndpointLabel(upstreamEndpoint), ConversionMode: boundModeLabel(conversionMode),
+	}
 	r.requestCount[key]++
 	seconds := duration.Seconds()
 	r.requestDurationSum[key] += seconds
@@ -500,4 +511,38 @@ func (r *Registry) snapshotForSLO() sloSnapshot {
 		}
 	}
 	return sloSnapshot{byProvider: byProvider}
+}
+
+func boundEndpointLabel(path string) string {
+	path = strings.TrimSpace(path)
+	switch path {
+	case "", "unknown":
+		return "unknown"
+	case "/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/completions", "/v1/embeddings", "/v1/models":
+		return path
+	default:
+		return "other"
+	}
+}
+
+func boundProtocolLabel(p string) string {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case "openai", "anthropic":
+		return strings.ToLower(strings.TrimSpace(p))
+	case "":
+		return "unknown"
+	default:
+		return "other"
+	}
+}
+
+func boundModeLabel(m string) string {
+	switch strings.TrimSpace(m) {
+	case "native", "openai_to_anthropic", "anthropic_to_openai":
+		return strings.TrimSpace(m)
+	case "":
+		return "unknown"
+	default:
+		return "other"
+	}
 }

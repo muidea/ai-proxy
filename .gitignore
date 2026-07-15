@@ -1,5 +1,7 @@
 /ai-proxy
+/bin/
 config.yaml
 usage.csv
+usage.csv.bak.*
 interactions/
 logs/

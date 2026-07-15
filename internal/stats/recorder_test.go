@@ -86,8 +86,27 @@ func TestCSVRecorderMigratesOldSchema(t *testing.T) {
 	if len(header) != len(currentCSVHeader) {
 		t.Fatalf("header len = %d, want %d", len(header), len(currentCSVHeader))
 	}
-	if header[10] != "outcome" {
-		t.Fatalf("col10 = %q, want outcome", header[10])
+	foundOutcome := false
+	for _, col := range header {
+		if col == "outcome" {
+			foundOutcome = true
+			break
+		}
+	}
+	if !foundOutcome {
+		t.Fatalf("header missing outcome: %v", header)
+	}
+	for _, want := range []string{"operation", "client_endpoint", "upstream_protocol", "upstream_endpoint", "conversion_mode"} {
+		ok := false
+		for _, col := range header {
+			if col == want {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			t.Fatalf("header missing %s: %v", want, header)
+		}
 	}
 }
 

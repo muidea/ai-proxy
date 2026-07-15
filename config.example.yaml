@@ -39,13 +39,16 @@ server:
   slo_check_interval_seconds: 60
   slo_violation_webhook:
 
-# 路由仅按 models 匹配 body.model；请保证各 provider 的 models 互不重叠。
+# 路由仅按 model_catalog exact model → 唯一 RouteOwner；请保证各 provider 的 models 互不重叠。
 # 客户端使用标准 path:
 #   OpenAI:  POST /v1/chat/completions|/v1/responses|/v1/completions|/v1/embeddings, GET/POST /v1/models
 #   Anthropic: POST /v1/messages
 # 已禁用 X-AI-Provider / ?provider= / provider/model 显式选择。
+# endpoint_capabilities 仅声明上游直连能力;客户端可服务 path 由 TransportPlan 矩阵决定
+# (含 OpenAI chat ↔ Anthropic messages 基础文本转换)。
 providers:
-  # 每个 enabled provider 必须显式声明 endpoint_capabilities(不从 protocol 推断)
+  # 每个 enabled provider 必须显式声明 protocol、base_url、endpoint_capabilities。
+  # 远程空 api_key 启动失败；仅 loopback 上游可设 allow_unauthenticated: true。
   openai:
     enabled: true
     protocol: openai
@@ -70,7 +73,8 @@ providers:
     endpoint_capabilities: messages
     models: claude*
 
-# 全局模型目录(各 provider 共用)。GET /v1/models 仅返回此处登记的模型,
+# 全局模型目录(各 provider 共用)。model ID 严格区分大小写(exact match)。
+# GET /v1/models 仅返回此处登记的模型,
 # 并附带 contextWindowTokens / maxOutputTokens / operations。model_catalog 是路由与能力的共同 authority。
 model_catalog:
   gpt-4o:

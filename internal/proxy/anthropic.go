@@ -32,24 +32,36 @@ type anthropicRequest struct {
 }
 
 // handleAnthropicMessages 处理客户端 POST /v1/messages。
-// anthropic provider: 直通; openai provider: 转换为 chat/completions 再回写 Anthropic 形状。
+// 通过 TransportPlan 决定 native 或 anthropic_to_openai 转换。
 func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request, requestID string) {
 	start := time.Now()
 	bodyBytes, err := h.readLimitedBody(w, r)
 	if err != nil {
 		status := http.StatusBadRequest
+		code := ErrorCodeInvalidRequest
 		if isRequestTooLarge(err) {
 			status = http.StatusRequestEntityTooLarge
+			code = ErrorCodeRequestTooLarge
 		}
-		http.Error(w, err.Error(), status)
+		writeClientProtocolError(w, status, clientProtocolFromRequest(r), APIError{
+			Code: code, Message: err.Error(), ClientProtocol: clientProtocolFromRequest(r),
+			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
+		})
 		return
 	}
 	defer r.Body.Close()
 
 	round, err := h.startRound()
 	if err != nil {
-		http.Error(w, "start interaction archive failed", http.StatusInternalServerError)
+		writeClientProtocolError(w, http.StatusInternalServerError, clientProtocolFromRequest(r), APIError{
+			Code: ErrorCodeProxyInternalError, Message: "start interaction archive failed",
+			ClientProtocol: clientProtocolFromRequest(r),
+			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
+		})
 		return
+	}
+	if round != nil {
+		defer round.Abort()
 	}
 	round.SetRequestID(requestID)
 	if err := round.WriteRequest(bodyBytes); err != nil {
@@ -64,37 +76,52 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	}
 	model, _ := body["model"].(string)
 	stream, _ := body["stream"].(bool)
-	providerName, _, apiErr := h.resolveProviderName(r, model)
+	plan, apiErr := h.resolveTransportPlan(r, model)
 	if apiErr != nil {
 		h.writeArchivedAPIError(w, round, r, start, "", model, stream, statusForAPIError(apiErr), *apiErr)
 		return
 	}
-	provider, ok := h.cfg.Providers[providerName]
+	provider, ok := h.cfg.Providers[plan.RouteOwner]
 	if !ok {
-		h.writeArchivedAPIError(w, round, r, start, providerName, model, stream, http.StatusServiceUnavailable, APIError{
-			Code:    ErrorCodeProviderUnavailable,
-			Message: fmt.Sprintf("provider %q is not configured", providerName),
-			Model:   model,
+		h.writeArchivedAPIError(w, round, r, start, plan.RouteOwner, model, stream, http.StatusServiceUnavailable, APIError{
+			Code:             ErrorCodeProviderUnavailable,
+			Message:          fmt.Sprintf("provider %q is not configured", plan.RouteOwner),
+			Model:            model,
+			Operation:        plan.Operation,
+			ClientEndpoint:   plan.ClientEndpoint,
+			ClientProtocol:   plan.ClientProtocol,
+			UpstreamProtocol: plan.UpstreamProtocol,
 		})
 		return
 	}
-	h.archiveAndLogProviderSelection(round, r, providerName, provider, model, stream)
+	h.archiveAndLogTransportPlan(round, r, plan, provider, stream)
 
-	if provider.Protocol == "anthropic" {
-		h.forwardAnthropicNative(w, r, round, start, providerName, provider, bodyBytes, body, model, stream)
-		return
+	switch plan.Mode {
+	case TransportModeNative:
+		h.forwardAnthropicNative(w, r, round, start, plan, provider, bodyBytes, body, model, stream)
+	case TransportModeAnthropicToOpenAI:
+		if apiErr := ValidateConversionRequest(plan, body); apiErr != nil {
+			h.writeArchivedAPIError(w, round, r, start, plan.RouteOwner, model, stream, statusForAPIError(apiErr), *apiErr)
+			return
+		}
+		h.convertAnthropicMessagesToOpenAI(w, r, round, start, plan, provider, body, model, stream)
+	default:
+		h.writeArchivedAPIError(w, round, r, start, plan.RouteOwner, model, stream, http.StatusBadRequest, APIError{
+			Code:             ErrorCodeEndpointUnsupported,
+			Message:          fmt.Sprintf("transport mode %q is not valid for %s", plan.Mode, plan.ClientEndpoint),
+			Model:            model,
+			Operation:        plan.Operation,
+			ClientEndpoint:   plan.ClientEndpoint,
+			ClientProtocol:   plan.ClientProtocol,
+			UpstreamProtocol: plan.UpstreamProtocol,
+		})
 	}
-	if provider.Protocol != "openai" {
-		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadRequest,
-			fmt.Sprintf("unsupported provider protocol %q for /v1/messages", provider.Protocol))
-		return
-	}
-	h.convertAnthropicMessagesToOpenAI(w, r, round, start, providerName, provider, body, model, stream)
 }
 
-func (h *Handler) forwardAnthropicNative(w http.ResponseWriter, r *http.Request, round *archive.Round, start time.Time, providerName string, provider config.Provider, bodyBytes []byte, body map[string]any, model string, stream bool) {
+func (h *Handler) forwardAnthropicNative(w http.ResponseWriter, r *http.Request, round *archive.Round, start time.Time, plan TransportPlan, provider config.Provider, bodyBytes []byte, body map[string]any, model string, stream bool) {
+	providerName := plan.RouteOwner
 	streamRequest := stream || acceptsEventStream(r.Header)
-	result, err := h.doUpstream(r, round, providerName, provider, bodyBytes, len(bodyBytes), streamRequest)
+	result, err := h.doUpstreamPath(r, round, providerName, provider, bodyBytes, len(bodyBytes), streamRequest, plan.UpstreamEndpoint, r.URL.RawQuery, r.Method)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 		return
@@ -111,7 +138,7 @@ func (h *Handler) forwardAnthropicNative(w http.ResponseWriter, r *http.Request,
 	if strings.HasSuffix(responsePath, ".sse") {
 		copyResponseHeader(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		usage, fullPath, streamErr := h.copyAndArchiveRawStream(w, resp, round, providerName, provider, model, body, r.Context(), result.Cancel, r.URL.Path)
+		usage, fullPath, streamErr := h.copyAndArchiveRawStream(w, resp, round, providerName, provider, model, body, r.Context(), result.Cancel, plan.UpstreamEndpoint)
 		duration := time.Since(start)
 		errMsg := ""
 		if streamErr != nil {
@@ -148,13 +175,15 @@ func (h *Handler) forwardAnthropicNative(w http.ResponseWriter, r *http.Request,
 	h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, usage, responsePath, "", "", "")
 }
 
-func (h *Handler) convertAnthropicMessagesToOpenAI(w http.ResponseWriter, r *http.Request, round *archive.Round, start time.Time, providerName string, provider config.Provider, body map[string]any, model string, stream bool) {
+func (h *Handler) convertAnthropicMessagesToOpenAI(w http.ResponseWriter, r *http.Request, round *archive.Round, start time.Time, plan TransportPlan, provider config.Provider, body map[string]any, model string, stream bool) {
+	providerName := plan.RouteOwner
 	openAIBody, err := buildOpenAIChatFromAnthropic(body, model, stream)
 	if err != nil {
-		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadRequest, err.Error())
+		// 转换构造失败视为 conversion_unsupported(preflight 后仍可能因消息结构失败)。
+		h.writeArchivedAPIError(w, round, r, start, providerName, model, stream, http.StatusBadRequest, conversionAPIError(plan, err))
 		return
 	}
-	result, err := h.doUpstreamPath(r, round, providerName, provider, openAIBody, len(openAIBody), stream, "/v1/chat/completions", "", http.MethodPost)
+	result, err := h.doUpstreamPath(r, round, providerName, provider, openAIBody, len(openAIBody), stream, plan.UpstreamEndpoint, "", http.MethodPost)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 		return
@@ -167,21 +196,7 @@ func (h *Handler) convertAnthropicMessagesToOpenAI(w http.ResponseWriter, r *htt
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		responseBody, err := h.readLimitedUpstream(resp.Body)
-		if err != nil {
-			h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
-			return
-		}
-		copyResponseHeader(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(responseBody)
-		responsePath := responseFileName(resp.Header.Get("Content-Type"), false)
-		if err := round.WriteResponse(responsePath, responseBody); err != nil {
-			log.Printf("archive converted anthropic error response: %v", err)
-		}
-		duration := time.Since(start)
-		h.recordAndPrint(round, r, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, "")
-		h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, responsePath, "", "", "")
+		h.writeConversionUpstreamError(w, r, resp, round, start, plan, providerName, model, stream)
 		return
 	}
 	if stream {
@@ -192,10 +207,11 @@ func (h *Handler) convertAnthropicMessagesToOpenAI(w http.ResponseWriter, r *htt
 }
 
 // handleAnthropicChatCompletions: OpenAI 客户端 /v1/chat/completions → Anthropic 上游 /v1/messages。
-func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.Request, round *archive.Round, start time.Time, providerName string, provider config.Provider, _ []byte, body map[string]any, model string, stream bool) {
+func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.Request, round *archive.Round, start time.Time, plan TransportPlan, provider config.Provider, _ []byte, body map[string]any, model string, stream bool) {
+	providerName := plan.RouteOwner
 	payload, err := buildAnthropicRequest(body, model, stream)
 	if err != nil {
-		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadRequest, err.Error())
+		h.writeArchivedAPIError(w, round, r, start, providerName, model, stream, http.StatusBadRequest, conversionAPIError(plan, err))
 		return
 	}
 	encoded, err := json.Marshal(payload)
@@ -204,7 +220,7 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 		return
 	}
 
-	result, err := h.doUpstreamPath(r, round, providerName, provider, encoded, len(encoded), stream, "/v1/messages", "", http.MethodPost)
+	result, err := h.doUpstreamPath(r, round, providerName, provider, encoded, len(encoded), stream, plan.UpstreamEndpoint, "", http.MethodPost)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
 		return
@@ -217,21 +233,7 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		responseBody, err := h.readLimitedUpstream(resp.Body)
-		if err != nil {
-			h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
-			return
-		}
-		copyResponseHeader(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(responseBody)
-		responsePath := responseFileName(resp.Header.Get("Content-Type"), false)
-		if err := round.WriteResponse(responsePath, responseBody); err != nil {
-			log.Printf("archive anthropic error response: %v", err)
-		}
-		duration := time.Since(start)
-		h.recordAndPrint(round, r, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, "")
-		h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, responsePath, "", "", "")
+		h.writeConversionUpstreamError(w, r, resp, round, start, plan, providerName, model, stream)
 		return
 	}
 	if stream {
@@ -239,6 +241,210 @@ func (h *Handler) handleAnthropicChatCompletions(w http.ResponseWriter, r *http.
 		return
 	}
 	h.handleAnthropicBuffered(w, r, resp, round, start, providerName, model, body)
+}
+
+// ValidateConversionRequest 在访问上游前检查 payload 是否处于转换最低保证范围。
+// 失败返回 conversion_unsupported,不得创建上游请求。
+func ValidateConversionRequest(plan TransportPlan, body map[string]any) *APIError {
+	if !plan.IsConversion() {
+		return nil
+	}
+	direction := plan.Mode
+	if err := rejectUnsupportedConversionFeatures(body, direction); err != nil {
+		apiErr := conversionAPIError(plan, err)
+		return &apiErr
+	}
+	// 深度扫描 messages / system 中的非 text content 与 tool 角色。
+	if err := rejectUnsupportedConversionPayload(body, direction); err != nil {
+		apiErr := conversionAPIError(plan, err)
+		return &apiErr
+	}
+	return nil
+}
+
+func conversionAPIError(plan TransportPlan, err error) APIError {
+	feature := conversionFeatureFromError(err)
+	msg := err.Error()
+	if feature != "" {
+		msg = fmt.Sprintf("conversion does not support %q; simplify request or use a native endpoint contract", feature)
+	}
+	return APIError{
+		Code:             ErrorCodeConversionUnsupported,
+		Message:          msg,
+		Model:            plan.ModelID,
+		Operation:        plan.Operation,
+		ClientEndpoint:   plan.ClientEndpoint,
+		ClientProtocol:   plan.ClientProtocol,
+		UpstreamProtocol: plan.UpstreamProtocol,
+		Feature:          feature,
+	}
+}
+
+func conversionFeatureFromError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	// 从已知错误文案提取 feature 名。
+	for _, key := range []string{
+		"tools", "tool_choice", "functions", "function_call", "response_format",
+		"stop_sequences", "stop",
+		"tool_calls", "tool role", "tool_use", "tool_result",
+		"image", "image_url", "input_image", "audio", "input_audio", "document", "file",
+	} {
+		if strings.Contains(msg, key) || strings.Contains(msg, `"`+key+`"`) {
+			return key
+		}
+	}
+	if strings.Contains(msg, "role ") {
+		return "unsupported_role"
+	}
+	if strings.Contains(msg, "content type") {
+		return "unsupported_content"
+	}
+	return "unsupported_feature"
+}
+
+// rejectUnsupportedConversionPayload 扫描 messages/system 等结构,拒绝非文本与 tool 角色。
+func rejectUnsupportedConversionPayload(body map[string]any, direction string) error {
+	if messages, ok := body["messages"].([]any); ok {
+		for _, item := range messages {
+			message, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			role, _ := message["role"].(string)
+			if role == "tool" {
+				return fmt.Errorf("%s conversion does not support tool role messages; use a native provider", direction)
+			}
+			if hasNonEmptyConversionFeature(message["tool_calls"]) {
+				return fmt.Errorf("%s conversion does not support tool_calls; use a native provider", direction)
+			}
+			if _, err := extractTextContent(message["content"], direction); err != nil {
+				return err
+			}
+		}
+	}
+	if systemRaw, ok := body["system"]; ok && systemRaw != nil {
+		if _, err := extractTextContent(systemRaw, direction); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeConversionUpstreamError 保留上游 HTTP status,输出客户端协议兼容的安全错误 envelope。
+func (h *Handler) writeConversionUpstreamError(w http.ResponseWriter, r *http.Request, resp *http.Response, round *archive.Round, start time.Time, plan TransportPlan, providerName, model string, stream bool) {
+	responseBody, err := h.readLimitedUpstream(resp.Body)
+	if err != nil {
+		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
+		return
+	}
+	responseBody, responseHeader, err := h.decodedResponseBodyAndHeader(responseBody, resp.Header)
+	if err != nil {
+		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	// 按客户端协议转换错误 envelope;无法安全解析时输出 ai-proxy typed error。
+	outBody, contentType := convertUpstreamErrorForClient(plan, resp.StatusCode, responseBody, providerName)
+	header := responseHeader.Clone()
+	header.Del("Content-Length")
+	header.Del("Content-Encoding")
+	if contentType != "" {
+		header.Set("Content-Type", contentType)
+	}
+	copyResponseHeader(w.Header(), header)
+	w.WriteHeader(resp.StatusCode)
+	if len(outBody) > 0 {
+		_, _ = w.Write(outBody)
+	}
+	responsePath := responseFileName(contentType, false)
+	if err := round.WriteResponse(responsePath, outBody); err != nil {
+		log.Printf("archive converted upstream error: %v", err)
+	}
+	duration := time.Since(start)
+	h.recordAndPrint(round, r, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, "")
+	h.writeArchiveMetadata(round, providerName, model, stream, resp.StatusCode, duration, tokenUsage{}, responsePath, "", "", "")
+}
+
+// convertUpstreamErrorForClient 将上游错误体转换为客户端协议 envelope,并脱敏。
+func convertUpstreamErrorForClient(plan TransportPlan, status int, upstreamBody []byte, routeOwner string) ([]byte, string) {
+	safeMsg := summarizeUpstreamError(upstreamBody, status, routeOwner)
+	switch plan.ClientProtocol {
+	case ClientProtocolOpenAI:
+		// Anthropic upstream → OpenAI client
+		payload := map[string]any{
+			"error": map[string]any{
+				"message": safeMsg,
+				"type":    "upstream_error",
+				"code":    "upstream_error",
+				"param":   nil,
+			},
+		}
+		b, _ := json.Marshal(payload)
+		return b, "application/json"
+	case ClientProtocolAnthropic:
+		// OpenAI upstream → Anthropic client
+		payload := map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "api_error",
+				"message": safeMsg,
+			},
+		}
+		b, _ := json.Marshal(payload)
+		return b, "application/json"
+	default:
+		payload := APIErrorResponse{Error: APIError{
+			Code:             "upstream_error",
+			Message:          safeMsg,
+			Model:            plan.ModelID,
+			Operation:        plan.Operation,
+			ClientEndpoint:   plan.ClientEndpoint,
+			ClientProtocol:   plan.ClientProtocol,
+			UpstreamProtocol: plan.UpstreamProtocol,
+		}}
+		b, _ := json.Marshal(payload)
+		return b, "application/json"
+	}
+}
+
+func summarizeUpstreamError(body []byte, status int, routeOwner string) string {
+	// 不回传完整上游 body;仅提取安全 message 摘要。
+	msg := ""
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err == nil {
+		if errObj, ok := parsed["error"].(map[string]any); ok {
+			if m, ok := errObj["message"].(string); ok {
+				msg = m
+			} else if m, ok := errObj["type"].(string); ok {
+				msg = m
+			}
+		} else if m, ok := parsed["message"].(string); ok {
+			msg = m
+		}
+	}
+	msg = redactSecrets(msg)
+	if len(msg) > 240 {
+		msg = msg[:240] + "..."
+	}
+	if msg == "" {
+		msg = fmt.Sprintf("upstream returned HTTP %d", status)
+	}
+	if routeOwner != "" {
+		return fmt.Sprintf("%s (route_owner=%s)", msg, routeOwner)
+	}
+	return msg
+}
+
+func redactSecrets(s string) string {
+	// 粗粒度脱敏:去掉看起来像 Bearer/sk-/key 的片段。
+	lower := strings.ToLower(s)
+	if strings.Contains(lower, "bearer ") || strings.Contains(lower, "api_key") || strings.Contains(lower, "apikey") || strings.Contains(s, "sk-") {
+		return "upstream error (details redacted)"
+	}
+	return s
 }
 
 func buildAnthropicRequest(body map[string]any, model string, stream bool) (anthropicRequest, error) {
@@ -256,7 +462,11 @@ func buildAnthropicRequest(body map[string]any, model string, stream bool) (anth
 	req.Temperature = body["temperature"]
 	req.TopP = body["top_p"]
 	if stop, ok := body["stop"]; ok {
-		req.Stop = stop
+		normalizedStop, err := normalizeStopSequences(stop)
+		if err != nil {
+			return req, err
+		}
+		req.Stop = normalizedStop
 	}
 
 	messages, ok := body["messages"].([]any)
@@ -270,7 +480,7 @@ func buildAnthropicRequest(body map[string]any, model string, stream bool) (anth
 			return req, fmt.Errorf("each message must be an object")
 		}
 		role, _ := message["role"].(string)
-		if _, hasTools := message["tool_calls"]; hasTools {
+		if hasNonEmptyConversionFeature(message["tool_calls"]) {
 			return req, fmt.Errorf("protocol conversion does not support tool_calls; use a native openai provider")
 		}
 		if role == "tool" {
@@ -352,6 +562,83 @@ func buildOpenAIChatFromAnthropic(body map[string]any, model string, stream bool
 	}
 	openAI["messages"] = messages
 	return json.Marshal(openAI)
+}
+
+// hasNonEmptyConversionFeature 判断上游可选字段是否包含真实不支持内容。
+// null / 缺失 / 空数组 / 空对象视为无 feature,允许基础文本转换继续。
+
+// normalizeStopSequences 将 OpenAI stop(string|[]string) 规范为 Anthropic stop_sequences 数组。
+// nil/空字符串/空数组返回 nil(省略字段);其它类型在访问上游前拒绝。
+func normalizeStopSequences(stop any) (any, error) {
+	switch v := stop.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return nil, nil
+		}
+		return []string{s}, nil
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("openai->anthropic conversion requires stop to contain only strings")
+			}
+			s = strings.TrimSpace(s)
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		if len(out) == 0 {
+			return nil, nil
+		}
+		return out, nil
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, s := range v {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		if len(out) == 0 {
+			return nil, nil
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("openai->anthropic conversion requires stop to be a string or string array")
+	}
+}
+
+// conversionStreamTextDelta 仅接受字符串 content delta。
+// 数组/对象等多模态形态在转换流中必须终止,不得 flatten 成伪文本。
+func conversionStreamTextDelta(value any) (string, error) {
+	switch v := value.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return v, nil
+	default:
+		return "", fmt.Errorf("protocol conversion does not support non-text stream content; use a native provider")
+	}
+}
+
+func hasNonEmptyConversionFeature(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(v) != ""
+	case []any:
+		return len(v) > 0
+	case map[string]any:
+		return len(v) > 0
+	default:
+		// 其它 JSON 类型(数字/bool 等)视为存在 feature。
+		return true
+	}
 }
 
 // rejectUnsupportedConversionFeatures 拒绝协议转换无法保真的能力,避免静默破坏语义。
@@ -555,10 +842,11 @@ func convertOpenAIChatToAnthropicResponse(body []byte, fallbackModel string) ([]
 	stopReason := "end_turn"
 	if len(payload.Choices) > 0 {
 		msg := payload.Choices[0].Message
-		if msg.ToolCalls != nil {
+		// 上游常回传 "tool_calls": [] / "function_call": null;仅非空才视为不支持。
+		if hasNonEmptyConversionFeature(msg.ToolCalls) {
 			return nil, tokenUsage{}, fmt.Errorf("protocol conversion does not support response tool_calls; use a native provider")
 		}
-		if msg.FunctionCall != nil {
+		if hasNonEmptyConversionFeature(msg.FunctionCall) {
 			return nil, tokenUsage{}, fmt.Errorf("protocol conversion does not support response function_call; use a native provider")
 		}
 		text, err := extractTextContent(msg.Content, "openai->anthropic response")
@@ -880,11 +1168,16 @@ func (h *Handler) handleOpenAIToAnthropicStream(w http.ResponseWriter, r *http.R
 			if choices, ok := chunk["choices"].([]any); ok && len(choices) > 0 {
 				choice, _ := choices[0].(map[string]any)
 				if delta, ok := choice["delta"].(map[string]any); ok {
-					if delta["tool_calls"] != nil || delta["function_call"] != nil {
+					if hasNonEmptyConversionFeature(delta["tool_calls"]) || hasNonEmptyConversionFeature(delta["function_call"]) {
 						streamErr = h.logStreamIssue(round, providerName, model, "convert openai→anthropic stream", fmt.Errorf("protocol conversion does not support streaming tool_calls/function_call; use a native provider"), requestContext, nil)
 						break
 					}
-					if textDelta := flattenValue(delta["content"]); textDelta != "" {
+					textDelta, cerr := conversionStreamTextDelta(delta["content"])
+					if cerr != nil {
+						streamErr = h.logStreamIssue(round, providerName, model, "convert openai→anthropic stream", cerr, requestContext, nil)
+						break
+					}
+					if textDelta != "" {
 						content.WriteString(textDelta)
 						writeEvent("content_block_delta", map[string]any{
 							"type":  "content_block_delta",

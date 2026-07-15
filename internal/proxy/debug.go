@@ -117,15 +117,38 @@ func (h *Handler) archiveAndLogClientRequest(round *archive.Round, r *http.Reque
 }
 
 func (h *Handler) archiveAndLogProviderSelection(round *archive.Round, r *http.Request, providerName string, provider config.Provider, model string, stream bool) {
+	h.archiveAndLogTransportPlan(round, r, TransportPlan{
+		ModelID:          model,
+		RouteOwner:       providerName,
+		UpstreamProtocol: provider.Protocol,
+		Mode:             TransportModeNative,
+	}, provider, stream)
+}
+
+// archiveAndLogTransportPlan 记录 RouteOwner 选择与 TransportPlan 权威字段。
+func (h *Handler) archiveAndLogTransportPlan(round *archive.Round, r *http.Request, plan TransportPlan, provider config.Provider, stream bool) {
+	if round != nil {
+		round.SetTransportPlan(
+			plan.Operation,
+			plan.ClientEndpoint,
+			plan.ClientProtocol,
+			plan.UpstreamProtocol,
+			plan.UpstreamEndpoint,
+			plan.Mode,
+		)
+	}
 	if round == nil {
 		return
 	}
-	h.debugfRound(round, r, "round=%06d selected provider=%s protocol=%s model=%s stream=%t base_url=%s",
+	h.debugfRound(round, r, "round=%06d selected provider=%s protocol=%s model=%s stream=%t mode=%s client_endpoint=%s upstream_endpoint=%s base_url=%s",
 		round.ID,
-		providerName,
-		provider.Protocol,
-		model,
+		plan.RouteOwner,
+		plan.UpstreamProtocol,
+		plan.ModelID,
 		stream,
+		plan.Mode,
+		plan.ClientEndpoint,
+		plan.UpstreamEndpoint,
 		provider.BaseURL,
 	)
 }

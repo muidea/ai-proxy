@@ -22,8 +22,6 @@ type ModelsListResponse struct {
 type ModelRecord struct {
 	ID                  string   `json:"id"`
 	Object              string   `json:"object"`
-	Created             int64    `json:"created"`
-	OwnedBy             string   `json:"owned_by"`
 	Operations          []string `json:"operations"`
 	ContextWindowTokens int      `json:"contextWindowTokens,omitempty"`
 	MaxOutputTokens     int      `json:"maxOutputTokens,omitempty"`
@@ -31,7 +29,7 @@ type ModelRecord struct {
 
 // handleModels 返回本地 model_catalog 合成的 OpenAI-compatible 模型列表。
 // 不转发上游;字段 contextWindowTokens / maxOutputTokens / operations 为扩展元数据。
-// owned_by 来自启动校验写入的确定 RouteOwner。
+// RouteOwner 仅用于内部路由、归档与观测，不作为客户端发现接口的一部分。
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request, requestID string) {
 	start := time.Now()
 	bodyBytes := []byte(nil)
@@ -39,7 +37,19 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request, requestID
 		var err error
 		bodyBytes, err = h.readLimitedBody(w, r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+			status := http.StatusBadRequest
+			code := ErrorCodeInvalidRequest
+			if isRequestTooLarge(err) {
+				status = http.StatusRequestEntityTooLarge
+				code = ErrorCodeRequestTooLarge
+			}
+			writeClientProtocolError(w, status, clientProtocolFromRequest(r), APIError{
+				Code:           code,
+				Message:        err.Error(),
+				ClientProtocol: clientProtocolFromRequest(r),
+				ClientEndpoint: NormalizeClientEndpoint(r.URL.Path),
+				Operation:      OperationForPath(r.URL.Path),
+			})
 			return
 		}
 	}
@@ -48,7 +58,11 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request, requestID
 	}
 	round, err := h.startRound()
 	if err != nil {
-		http.Error(w, "start interaction archive failed", http.StatusInternalServerError)
+		writeClientProtocolError(w, http.StatusInternalServerError, clientProtocolFromRequest(r), APIError{
+			Code: ErrorCodeProxyInternalError, Message: "start interaction archive failed",
+			ClientProtocol: clientProtocolFromRequest(r),
+			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
+		})
 		return
 	}
 	round.SetRequestID(requestID)
@@ -92,8 +106,6 @@ func buildModelsListResponse(catalog map[string]config.ModelInfo) ModelsListResp
 		rec := ModelRecord{
 			ID:         info.ID,
 			Object:     "model",
-			Created:    0,
-			OwnedBy:    info.RouteOwner,
 			Operations: operations,
 		}
 		if info.ContextWindowTokens > 0 {

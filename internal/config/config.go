@@ -62,6 +62,15 @@ type ModelInfo struct {
 	RouteOwner          string
 }
 
+// ResolvedModelRoute 是启动期只读模型路由 authority 的请求侧视图。
+// 回答“这个具体模型属于谁、具备哪些业务 operation”,供 /v1/models 与请求路由共同消费。
+// 与 ModelInfo 同源:LookupResolvedModelRoute 从 ModelCatalog 投影,不单独持有第二份状态。
+type ResolvedModelRoute struct {
+	ModelID    string
+	Operations []string
+	RouteOwner string
+}
+
 // MaxModelCatalogIDLength 限制 model_catalog id 长度,避免异常配置与标签膨胀。
 const MaxModelCatalogIDLength = 256
 
@@ -89,6 +98,9 @@ type Provider struct {
 	// EndpointCapabilities 为 provider 显式声明的直通端点能力(非 protocol 推断)。
 	// 取值: chat_completions / messages / responses / completions / embeddings。
 	EndpointCapabilities []string
+	// AllowUnauthenticated 仅允许受信 loopback 上游在无 API Key 时启动。
+	// 远程 base_url 即使设置 true 也必须 fail-fast。
+	AllowUnauthenticated bool
 	Disabled             bool
 }
 
@@ -125,7 +137,7 @@ func Load(path string) (Config, error) {
 	if err := applyEnv(&cfg); err != nil {
 		return Config{}, err
 	}
-	ensureKnownProviders(&cfg)
+	ensureProviderNames(&cfg)
 	if err := normalize(&cfg); err != nil {
 		return Config{}, err
 	}
@@ -338,6 +350,12 @@ func setProvider(cfg *Config, name, key, value string) error {
 			return fmt.Errorf("providers.%s.endpoint_capabilities: %w", name, err)
 		}
 		provider.EndpointCapabilities = caps
+	case "allow_unauthenticated":
+		b, err := parseStrictBool(value)
+		if err != nil {
+			return fmt.Errorf("providers.%s.allow_unauthenticated: %w", name, err)
+		}
+		provider.AllowUnauthenticated = b
 	case "enabled":
 		b, err := parseStrictBool(value)
 		if err != nil {
@@ -501,29 +519,14 @@ func applyEnv(cfg *Config) error {
 	return nil
 }
 
-func ensureKnownProviders(cfg *Config) {
-	// 仅补齐已在配置中声明的 provider 的 name/protocol/baseURL 缺省;
-	// 不创建 provider,不默认补 endpoint_capabilities(必须在配置中显式声明)。
-	defaults := map[string]string{
-		"openai":    "https://api.openai.com",
-		"deepseek":  "https://api.deepseek.com",
-		"anthropic": "https://api.anthropic.com",
-	}
+// ensureProviderNames 只补齐 Provider.Name = map key,不补 protocol/base_url/api_key。
+// protocol 与 base_url 必须由配置显式声明,否则 validate 启动失败。
+func ensureProviderNames(cfg *Config) {
 	for name, provider := range cfg.Providers {
 		if provider.Name == "" {
 			provider.Name = name
+			cfg.Providers[name] = provider
 		}
-		if provider.Protocol == "" {
-			if name == "anthropic" {
-				provider.Protocol = "anthropic"
-			} else {
-				provider.Protocol = "openai"
-			}
-		}
-		if provider.BaseURL == "" {
-			provider.BaseURL = defaults[name]
-		}
-		cfg.Providers[name] = provider
 	}
 }
 
@@ -552,10 +555,10 @@ func normalize(cfg *Config) error {
 			return fmt.Errorf("duplicate provider name after case fold: %q and %q both map to %q", existing.Name, name, key)
 		}
 		provider.Name = key
-		if provider.Protocol == "" {
-			provider.Protocol = "openai"
+		// protocol 必须显式配置;空值留给 validate fail-fast,不按 provider 名推断。
+		if provider.Protocol != "" {
+			provider.Protocol = strings.ToLower(provider.Protocol)
 		}
-		provider.Protocol = strings.ToLower(provider.Protocol)
 		provider.BaseURL = strings.TrimRight(provider.BaseURL, "/")
 		// models 严格区分大小写,与请求 body.model 原文匹配。
 		provider.Models = normalizeModelPatterns(provider.Models)
@@ -572,7 +575,6 @@ func normalize(cfg *Config) error {
 		cfg.ModelCatalog = map[string]ModelInfo{}
 	}
 	catalog := make(map[string]ModelInfo, len(cfg.ModelCatalog))
-	seenFold := map[string]string{} // lower -> display id
 	for name, info := range cfg.ModelCatalog {
 		id := strings.TrimSpace(info.ID)
 		if id == "" {
@@ -599,15 +601,11 @@ func normalize(cfg *Config) error {
 			return fmt.Errorf("model_catalog.%s.operations: at least one of chat_completions, embeddings is required", id)
 		}
 		info.Operations = ops
-		// case-fold 后全局唯一,避免 WorkOrch 刷新目录时因大小写重复拒绝整表。
-		fold := strings.ToLower(id)
-		if prev, ok := seenFold[fold]; ok {
-			return fmt.Errorf("duplicate model_catalog id after case fold: %q and %q both map to %q", prev, id, fold)
-		}
+		// model ID 严格区分大小写:DeepSeek-V4-Flash 与 deepseek-v4-flash 是两个不同模型。
+		// 仅 exact id 唯一;不做 case-fold 去重。
 		if prev, ok := catalog[id]; ok {
 			return fmt.Errorf("duplicate model_catalog id: %q (also seen as %q)", id, prev.ID)
 		}
-		seenFold[fold] = id
 		info.RouteOwner = "" // filled in validateModelRoutes
 		catalog[id] = info
 	}
@@ -715,16 +713,25 @@ func validateProviders(cfg Config) error {
 		if provider.Disabled {
 			continue
 		}
-		if strings.TrimSpace(provider.BaseURL) == "" {
-			return fmt.Errorf("provider %q has empty base_url", name)
-		}
-		if err := validateHTTPBaseURL(provider.BaseURL); err != nil {
-			return fmt.Errorf("provider %q base_url: %w", name, err)
+		if strings.TrimSpace(provider.Protocol) == "" {
+			return fmt.Errorf("provider %q protocol is required (explicit; not inferred from name)", name)
 		}
 		switch provider.Protocol {
 		case "openai", "anthropic":
 		default:
 			return fmt.Errorf("provider %q has unknown protocol %q (want openai or anthropic)", name, provider.Protocol)
+		}
+		if strings.TrimSpace(provider.BaseURL) == "" {
+			return fmt.Errorf("provider %q base_url is required (explicit; not inferred from name)", name)
+		}
+		if err := validateHTTPBaseURL(provider.BaseURL); err != nil {
+			return fmt.Errorf("provider %q base_url: %w", name, err)
+		}
+		if err := validateProviderAPIKey(name, provider); err != nil {
+			return err
+		}
+		if len(provider.Models) == 0 {
+			return fmt.Errorf("provider %q models is required (explicit; not inferred from provider name or protocol)", name)
 		}
 		if len(provider.EndpointCapabilities) == 0 {
 			return fmt.Errorf("provider %q endpoint_capabilities is required (explicit; not inferred from protocol)", name)
@@ -734,6 +741,47 @@ func validateProviders(cfg Config) error {
 		}
 	}
 	return nil
+}
+
+// validateProviderAPIKey:远程上游必须有 API Key;仅 allow_unauthenticated + loopback base_url 允许空 Key。
+func validateProviderAPIKey(name string, provider Provider) error {
+	key := strings.TrimSpace(provider.APIKey)
+	if provider.AllowUnauthenticated && key != "" {
+		return fmt.Errorf("provider %q allow_unauthenticated requires empty api_key; authenticated and unauthenticated modes are mutually exclusive", name)
+	}
+	if key != "" {
+		return nil
+	}
+	loopback, err := isLoopbackBaseURL(provider.BaseURL)
+	if err != nil {
+		return fmt.Errorf("provider %q base_url: %w", name, err)
+	}
+	if provider.AllowUnauthenticated {
+		if !loopback {
+			return fmt.Errorf("provider %q allow_unauthenticated requires loopback base_url; remote empty api_key is not allowed", name)
+		}
+		return nil
+	}
+	if loopback {
+		return fmt.Errorf("provider %q has empty api_key; set api_key or allow_unauthenticated=true for trusted loopback upstream", name)
+	}
+	return fmt.Errorf("provider %q has empty api_key; remote providers require explicit credentials", name)
+}
+
+func isLoopbackBaseURL(raw string) (bool, error) {
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil {
+		return false, err
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return false, fmt.Errorf("missing host")
+	}
+	if host == "localhost" {
+		return true, nil
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback(), nil
 }
 
 func validateSLO(slo SLOConfig) error {
@@ -1071,12 +1119,14 @@ func validateModelRoutes(cfg Config) error {
 
 // validateModelOperationsAgainstProvider 保证每个 operation 的 canonical path 可被 provider 服务。
 // chat_completions → /v1/chat/completions; embeddings → /v1/embeddings。
+// 校验依据与请求期 TransportPlan 矩阵一致:protocol × direct endpoint capability × 已实现 conversion。
 func validateModelOperationsAgainstProvider(modelID string, operations []string, provider Provider) error {
 	for _, op := range operations {
 		path := OperationToPrimaryInboundPath(op)
 		if path == "" {
 			return fmt.Errorf("model_catalog.%s: unknown operation %q", modelID, op)
 		}
+		// ProviderSupportsInboundPath 编码了 canonical TransportPlan readiness。
 		if !ProviderSupportsInboundPath(provider, path) {
 			return fmt.Errorf("model_catalog.%s: operation %q requires route owner to support inbound path %q (check endpoint_capabilities)", modelID, op, path)
 		}
@@ -1104,33 +1154,13 @@ func matchingEnabledProviders(providers map[string]Provider, model string) []str
 }
 
 // ProviderMatchesModel 判断 provider 的 models 模式是否匹配 model(区分大小写,仅 trim)。
-func ProviderMatchesModel(name string, provider Provider, model string) bool {
-	patterns := provider.Models
-	if len(patterns) == 0 {
-		patterns = defaultProviderModelPatterns(name, provider.Protocol)
-	}
-	for _, pattern := range patterns {
+func ProviderMatchesModel(_ string, provider Provider, model string) bool {
+	for _, pattern := range provider.Models {
 		if MatchModelPattern(model, pattern) {
 			return true
 		}
 	}
 	return false
-}
-
-// defaultProviderModelPatterns 与 proxy 侧历史内置模式保持一致,便于无 models 配置时启动校验。
-func defaultProviderModelPatterns(name, protocol string) []string {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "deepseek":
-		return []string{"deepseek*"}
-	case "anthropic", "claude":
-		return []string{"claude*"}
-	case "openai":
-		return []string{"gpt-*", "chatgpt-*", "o*", "text-embedding-*", "dall-e-*"}
-	}
-	if strings.ToLower(strings.TrimSpace(protocol)) == "anthropic" {
-		return []string{"claude*"}
-	}
-	return nil
 }
 
 // MatchModelPattern 精确或前缀通配(* 后缀);model 与 pattern 均区分大小写。
@@ -1233,8 +1263,9 @@ func validateProtocolEndpointCaps(protocol string, caps []string) error {
 	return nil
 }
 
-// ProviderHasEndpointCapability 判断 provider 是否显式声明了直通 capability。
-func ProviderHasEndpointCapability(provider Provider, capability string) bool {
+// ProviderHasDirectEndpoint 判断 provider 是否显式声明了上游直连 endpoint capability。
+// 只检查配置声明,不包含协议转换派生的客户端可服务 path。
+func ProviderHasDirectEndpoint(provider Provider, capability string) bool {
 	capability = strings.TrimSpace(capability)
 	for _, item := range provider.EndpointCapabilities {
 		if item == capability {
@@ -1244,33 +1275,41 @@ func ProviderHasEndpointCapability(provider Provider, capability string) bool {
 	return false
 }
 
-// ProviderSupportsInboundPath 根据显式 endpoint_capabilities + 已实现转换矩阵判断是否可服务入站 path。
+// ProviderHasEndpointCapability 是 ProviderHasDirectEndpoint 的历史别名。
+// 新代码应使用 ProviderHasDirectEndpoint,以区分 direct endpoint 与 conversion 可服务 path。
+func ProviderHasEndpointCapability(provider Provider, capability string) bool {
+	return ProviderHasDirectEndpoint(provider, capability)
+}
+
+// ProviderSupportsInboundPath 根据固定转发矩阵判断 RouteOwner 是否可服务某入站 path。
+// 内部只组合:upstream protocol × direct endpoint capability × 已实现转换。
 // 不得仅因 protocol=openai 假定支持全部 OpenAI path。
+// 注意:这是“可服务入站 path”(含 conversion),不是 direct endpoint capability。
 func ProviderSupportsInboundPath(provider Provider, path string) bool {
 	path = strings.TrimRight(strings.TrimSpace(path), "/")
 	switch path {
 	case "/v1/chat/completions":
-		// openai 直通 chat_completions; anthropic 声明 messages 后可通过转换服务。
+		// openai 直通 chat_completions; anthropic 声明 messages 后可通过 conversion 服务。
 		if provider.Protocol == "openai" {
-			return ProviderHasEndpointCapability(provider, EndpointCapabilityChatCompletions)
+			return ProviderHasDirectEndpoint(provider, EndpointCapabilityChatCompletions)
 		}
 		if provider.Protocol == "anthropic" {
-			return ProviderHasEndpointCapability(provider, EndpointCapabilityMessages)
+			return ProviderHasDirectEndpoint(provider, EndpointCapabilityMessages)
 		}
 	case "/v1/messages":
-		// anthropic 直通 messages; openai 声明 chat_completions 后可通过转换服务。
+		// anthropic 直通 messages; openai 声明 chat_completions 后可通过 conversion 服务。
 		if provider.Protocol == "anthropic" {
-			return ProviderHasEndpointCapability(provider, EndpointCapabilityMessages)
+			return ProviderHasDirectEndpoint(provider, EndpointCapabilityMessages)
 		}
 		if provider.Protocol == "openai" {
-			return ProviderHasEndpointCapability(provider, EndpointCapabilityChatCompletions)
+			return ProviderHasDirectEndpoint(provider, EndpointCapabilityChatCompletions)
 		}
 	case "/v1/responses":
-		return provider.Protocol == "openai" && ProviderHasEndpointCapability(provider, EndpointCapabilityResponses)
+		return provider.Protocol == "openai" && ProviderHasDirectEndpoint(provider, EndpointCapabilityResponses)
 	case "/v1/completions":
-		return provider.Protocol == "openai" && ProviderHasEndpointCapability(provider, EndpointCapabilityCompletions)
+		return provider.Protocol == "openai" && ProviderHasDirectEndpoint(provider, EndpointCapabilityCompletions)
 	case "/v1/embeddings":
-		return provider.Protocol == "openai" && ProviderHasEndpointCapability(provider, EndpointCapabilityEmbeddings)
+		return provider.Protocol == "openai" && ProviderHasDirectEndpoint(provider, EndpointCapabilityEmbeddings)
 	}
 	return false
 }
@@ -1324,6 +1363,20 @@ func LookupModel(cfg Config, modelID string) (ModelInfo, bool) {
 	return info, ok
 }
 
+// LookupResolvedModelRoute 从启动期 ModelCatalog authority 投影 ResolvedModelRoute。
+// 与 LookupModel 同源,不持有第二份状态。
+func LookupResolvedModelRoute(cfg Config, modelID string) (ResolvedModelRoute, bool) {
+	info, ok := LookupModel(cfg, modelID)
+	if !ok {
+		return ResolvedModelRoute{}, false
+	}
+	return ResolvedModelRoute{
+		ModelID:    info.ID,
+		Operations: append([]string(nil), info.Operations...),
+		RouteOwner: info.RouteOwner,
+	}, true
+}
+
 // ModelSupportsOperation 判断 catalog 模型是否声明了 operation。
 func ModelSupportsOperation(info ModelInfo, operation string) bool {
 	operation = strings.TrimSpace(operation)
@@ -1335,7 +1388,12 @@ func ModelSupportsOperation(info ModelInfo, operation string) bool {
 	return false
 }
 
-// CatalogModelsSorted 返回按 case-fold id 稳定排序的 catalog 模型。
+// ResolvedModelSupportsOperation 判断 ResolvedModelRoute 是否声明了 operation。
+func ResolvedModelSupportsOperation(route ResolvedModelRoute, operation string) bool {
+	return ModelSupportsOperation(ModelInfo{Operations: route.Operations}, operation)
+}
+
+// CatalogModelsSorted 返回 catalog 模型列表;排序键为 case-fold 仅用于稳定展示,不改变 exact id 语义。
 func CatalogModelsSorted(catalog map[string]ModelInfo) []ModelInfo {
 	items := make([]ModelInfo, 0, len(catalog))
 	for _, info := range catalog {
@@ -1345,7 +1403,12 @@ func CatalogModelsSorted(catalog map[string]ModelInfo) []ModelInfo {
 		items = append(items, info)
 	}
 	sort.SliceStable(items, func(i, j int) bool {
-		return strings.ToLower(items[i].ID) < strings.ToLower(items[j].ID)
+		leftFold := strings.ToLower(items[i].ID)
+		rightFold := strings.ToLower(items[j].ID)
+		if leftFold != rightFold {
+			return leftFold < rightFold
+		}
+		return items[i].ID < items[j].ID
 	})
 	return items
 }
