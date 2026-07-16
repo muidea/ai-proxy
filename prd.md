@@ -1,135 +1,113 @@
-# 轻量级 LLM 本地代理网关
+# ai-proxy PRD
 
-## 1. 项目背景
-在本地使用各种 AI 客户端（如 NextChat, LobeChat, ChatBox 等）时，通常需要直接连接多个云端模型 API。本项目旨在构建一个运行在本地的轻量级代理服务（Gateway），统一管理 API 调用，并实时统计不同模型的 Token 消耗情况，以便用户直观掌握使用成本。
+> 以当前代码实现为准。更新时间：2026-07-16。
 
----
+## 1. 产品目标
 
-## 2. 项目目标 (Goals)
+ai-proxy 是一个本地单二进制 LLM API 网关，为 OpenAI-compatible 与 Anthropic Messages 客户端提供统一入口。
 
-### 2.1 产品目标
+产品应达成：
 
-*   **本地统一入口**：为 NextChat、LobeChat、ChatBox、IDE Agent 等客户端提供一个本地 `API_BASE_URL`，屏蔽不同上游 provider 的 Base URL、API Key 与协议差异。
-*   **标准 path + 纯 model 路由**：客户端只访问 OpenAI/Anthropic 标准入站 path；请求期按 exact `model` 查找 `model_catalog` 已解析的唯一 RouteOwner，provider `models` 只在启动期验证归属，不再使用 `X-AI-Provider` / `?provider=` / `provider/model`。
-*   **双向协议兼容**：OpenAI chat ↔ Anthropic messages 提供基础协议转换；其余 OpenAI 端点仅在 RouteOwner 显式声明对应 `endpoint_capabilities` 时对 openai provider 直通。
-*   **用量与成本可见**：对每个经代理处理的标准 `/v1/*` 请求记录 provider、model、HTTP 状态、耗时、流式/非流式、输入/输出 token、缓存读写 token、缓存命中率；没有模型或 token 语义的请求保留空模型与 0 token，不能阻塞流水记录。
-*   **问题可追踪**：每个经代理处理的请求生成独立交互归档，保留请求、上游请求、上游响应、最终响应、元数据、request_id 和请求指纹，便于复盘异常、并发交错和 prompt 漂移。
-*   **多 provider 纯 model 路由**：`model_catalog` 唯一 RouteOwner；无 provider fallback；未匹配/operation 不支持直接 typed 4xx。
-*   **轻量本地运维**：采用 Go 单二进制交付，不依赖数据库、中间件或长期驻留外部服务；配置、用量流水和交互归档均使用本地文件。
-*   **可观测性内建**：提供 `/healthz`、`/metrics`、`/stats`、`/stats/stream`，实时查看请求量、延迟分位数、错误率和 cache 命中率。
+- 客户端只需配置一个本地 API Base URL，并使用裸模型名调用标准接口。
+- 请求仅按 `model_catalog` 中严格匹配的模型 ID 路由到唯一 provider；不支持 fallback、默认 provider 或显式指定 provider。
+- 支持 OpenAI chat 与 Anthropic Messages 的原生转发及基础双向转换；其他端点只允许原生转发。
+- 每个处理过的模型请求可追溯、可统计、可观测，并且不泄露认证信息。
+- 以本地文件和内存指标完成部署与运维，不依赖数据库或中间件。
 
-### 2.2 范围边界
+## 2. 范围与边界
 
-*   **Provider 配置**：通过 `config.yaml` 与环境变量配置端口、超时、usage 文件、交互归档目录、保留轮数、debug 日志、metrics 访问策略、SLO 阈值和 provider 列表。
-*   **Provider 选择**：仅 `model_catalog` exact model → 唯一 RouteOwner；无 default_provider / fallback。
-*   **Provider 模型范围**：每个 enabled provider 必须显式声明 `models`；不按 provider 名、protocol 或常见模型家族推导默认 pattern，pattern 也不自动生成 catalog。
-*   **转发能力**：标准 OpenAI path 与 Anthropic `/v1/messages`；非白名单 path 404；OpenAI chat ↔ Anthropic messages 基础双向转换。
-*   **记录能力**：`usage.csv` 作为结构化流水账，`interactions/{round_id}/` 作为完整交互归档；归档需要脱敏敏感请求头。
-*   **监控能力**：`/metrics` 输出 Prometheus text exposition format，`/stats` 输出 JSON 聚合快照，`/stats/stream` 输出 SSE 快照流；默认仅允许 loopback 访问，可通过 `metrics_remote_access` 显式开放远程访问。
-*   **安全底线**：不在日志、CSV、metadata 或归档 meta 中明文输出 API Key、Authorization、Cookie 等敏感头。
+### 2.1 支持范围
 
-### 2.3 可衡量目标
+- OpenAI：`/v1/chat/completions`、`/v1/responses`、`/v1/completions`、`/v1/embeddings`、`/v1/models`。
+- Anthropic：`/v1/messages`。
+- OpenAI chat 与 Anthropic Messages 的基础文本请求、非流式响应与 SSE 流式响应转换。
+- 本地用量 CSV、交互归档、Prometheus metrics、JSON/SSE stats、SLO 巡检与可选 webhook。
+- 入站 API Key、请求/响应/流大小限制、超时、默认 loopback 观测访问保护。
 
-*   **代理延迟**：在本机 loopback mock 上游、非 TLS、固定小响应的验收环境下，代理层自身引入的首包额外延迟 P95 目标不超过 20ms。
-*   **资源占用**：进程空闲 60s 后的 RSS 目标不超过 30MB；持续请求下不因归档、metrics 或 SSE 处理出现无界内存增长。
-*   **并发安全**：本地多个客户端并发调用时，CSV 追加、交互目录序号、metrics 聚合不能错乱或数据竞争。
-*   **用量准确性**：上游提供 usage 时优先使用精确值；缺失 usage 时允许估算，但必须在 CSV、metadata 和控制台摘要中标记。
-*   **故障透明**：上游错误透传原始状态码和响应体；代理自身错误返回明确 4xx/5xx typed 合同。
-*   **部署简单**：用户能通过 `make build` 得到单个可执行文件，并通过 `config.example.yaml` 或环境变量完成首次运行。
+### 2.2 非目标
 
-### 2.4 非目标 (Non-Goals)
+- 多用户、权限、计费、团队成本分摊或长期指标存储。
+- provider fallback、负载均衡、重试后切换 provider、通过 header/query/provider 前缀选路。
+- 所有上游私有扩展的完全兼容；tools、function calling、多模态、`response_format` 等不属于协议转换保证范围。
+- 跨实例共享 `usage.csv`。
 
-*   不提供多用户账号、权限体系、计费账单或团队级成本分摊。
-*   不长期保存完整历史数据；本地交互归档受 `interaction_retention` 控制。
-*   不实现完整 OpenTelemetry 分布式追踪；当前以轻量 Prometheus、JSON stats、CSV 和本地归档为主。
-*   不在本阶段验收 metrics CIDR 白名单策略；`metrics_allowed_cidrs` 作为预留配置字段，当前 DoD 只覆盖 loopback 默认保护与 `metrics_remote_access` 开关。
-*   不承诺兼容所有上游私有扩展字段；优先保证 OpenAI-compatible 与 Anthropic Messages 的主路径。
-*   不修改用户 prompt 或模型输出内容，除必要的协议适配外保持透明转发。
+## 3. 核心产品合同
 
----
+### 3.1 路由与能力
 
-## 3. 完成定义 (Definition of Done, DoD)
+- `model_catalog` 是模型能力与路由的唯一权威；模型 ID exact match，严格区分大小写。
+- 每个 catalog 模型在启动期必须唯一匹配一个 enabled provider 的 `models` 规则，否则服务拒绝启动。
+- 每个模型必须声明 `chat_completions` 或 `embeddings` operation；请求在访问上游前校验模型和 operation。
+- provider 必须显式配置 protocol、base URL、models、endpoint capabilities；远程上游必须配置 API Key。
+- 不支持 `default_provider`、`fallbacks`、`X-AI-Provider`、`?provider=` 或 `provider/model` 选择路由。
 
-### 3.1 接口与转发
+### 3.2 转发矩阵
 
-- [ ] `GET /healthz` 返回 200 和 JSON 健康状态。
-- [ ] `POST /v1/chat/completions` 能完成 OpenAI-compatible 非流式转发，客户端收到的状态码、主要响应头和 JSON body 与上游语义一致。
-- [ ] `POST /v1/chat/completions` 在 `stream: true` 时以 SSE 方式转发，客户端能边生成边接收；代理不能等待完整流结束后才向客户端返回，归档层允许增量写入原始流并在流结束后生成整理版响应。
-- [ ] 白名单 OpenAI 端点（`/v1/responses`、`/v1/completions`、`/v1/embeddings`、`/v1/models`）在 RouteOwner 显式声明对应 `endpoint_capabilities` 时可直通 openai provider；非白名单 `/v1/*` 返回 404。
-- [ ] Anthropic `POST /v1/messages` 可直通 anthropic provider，或在命中 openai provider 时做基础转换；OpenAI chat 命中 anthropic provider 时可做反向基础转换。
-- [x] 上游 400、401、403、404、429、5xx 等错误保留原始状态码和错误体透传；代理自身错误返回明确 typed 4xx/5xx。
+| 客户端路径 | 可用上游 | 行为 |
+| --- | --- | --- |
+| `/v1/chat/completions` | OpenAI chat | 原生转发 |
+| `/v1/chat/completions` | Anthropic messages | OpenAI → Anthropic 基础转换 |
+| `/v1/messages` | Anthropic messages | 原生转发 |
+| `/v1/messages` | OpenAI chat | Anthropic → OpenAI 基础转换 |
+| `/v1/responses`、`/v1/completions`、`/v1/embeddings` | 对应 OpenAI 直连能力 | 原生转发 |
+| `/v1/models` | 本地 catalog | 本地合成，不访问上游 |
 
-### 3.2 Provider 路由（catalog authority）
+转换范围限于基础文本消息与常用生成参数；不支持的转换特性必须在访问上游前返回明确错误。
 
-- [x] 仅按 `model_catalog` exact model + RouteOwner 路由；`X-AI-Provider` / `?provider=` / `provider/model` 被忽略。
-- [x] 无 provider fallback；无 model 未命中时的 default_provider 兜底。
-- [x] provider `enabled: false` 后不参与 model 匹配。
-- [x] 当多个 provider 的 models 同时命中同一 model 时配置加载启动失败，提示调整 `models` 规则。
-- [x] enabled provider 的 `models` 必须显式配置；空 `models` 不按 provider 名或 protocol 自动补默认值。
+### 3.3 安全与可靠性
 
-### 3.3 Token、cache 与用量统计
+- 非 loopback 监听必须配置入站 API Key；支持 `Authorization: Bearer` 与 `X-API-Key`。
+- 每个请求透传或生成 `X-Request-ID`，响应返回相同 ID；`/healthz` 不要求认证。
+- 上游认证由代理使用 provider 配置重建；入站认证信息不会转发或写入可见审计信息。
+- 所有请求、上游非流式响应与 SSE 流均受大小限制；流式请求同时受空闲超时和协议终止校验保护。
+- 上游 4xx/5xx 保留状态与协议语义；代理自身错误使用 OpenAI 或 Anthropic 兼容的 typed error envelope。
 
-- [ ] 非流式响应优先解析上游 `usage`，提取输入 token、输出 token、总 token、cache read token、cache creation token。
-- [ ] 流式响应优先解析结束前或事件中的 usage；缺少 usage 时按本地估算逻辑补齐 token，并标记为估算。
-- [ ] OpenAI-compatible 的 `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens` 与 Anthropic 的 `cache_read_input_tokens` / `cache_creation_input_tokens` 均能进入统一统计字段。
-- [ ] 每个经代理处理的 `/v1/*` 请求结束后追加一行 `usage.csv`，字段至少包括 `time,provider,model,input_tokens,output_tokens,total_tokens,duration_ms,stream,estimated,http_status,cached_input_tokens,cache_creation_input_tokens,cache_hit_rate`；没有模型或 token 语义的端点写入空模型与 0 token。
-- [ ] CSV 写入并发安全；并发请求不会交叉写半行、重复表头或破坏 CSV 格式。
-- [ ] 控制台摘要包含 round id、provider、model、状态码、耗时、token、cache 字段和错误摘要；敏感信息不出现在摘要中。
+## 4. Definition of Done
 
-### 3.4 交互归档与可追踪性
+### 4.1 接入与转发
 
-- [ ] 每个经代理处理的 `/v1/*` 请求创建递增的 `interactions/{round_id}/` 目录，目录名稳定、并发安全。
-- [ ] 归档至少包含客户端请求、脱敏请求元信息、最终上游请求、上游响应、最终客户端响应和 `metadata.json`；流式响应应增量保存原始 `response.sse`，并在流结束后保存整理后的完整响应。
-- [ ] `metadata.json` 包含 round id、request_id、provider、model、HTTP 状态、耗时、token、cache 字段、stream、estimated、响应文件路径和错误信息。
-- [ ] 请求入口生成或透传 `X-Request-ID`，响应头返回同一 request id，并写入归档 metadata。
-- [ ] 请求指纹和 stable prefix hash 写入 metadata；连续 2 次出现不同 stable prefix hash 时记录 `stable_prefix_drift` 与 `stable_prefix_drift_count` 字段。本阶段该阈值为全局固定值，不要求运行时配置。
-- [ ] `interaction_retention` 能限制本地归档保留轮数，并且不会删除正在写入的活跃轮次。
+- [x] `GET /healthz` 返回 `200` 和健康 JSON。
+- [x] OpenAI chat、responses、completions、embeddings 与 Anthropic Messages 路径受白名单保护；未知路径返回 `404`。
+- [x] OpenAI chat ↔ Anthropic Messages 支持基础的双向非流式和 SSE 转换。
+- [x] OpenAI 非 chat 端点只在 RouteOwner 声明对应直连 capability 时原生转发。
+- [x] `/v1/models` 由本地 `model_catalog` 合成，且不暴露 provider、URL 或认证信息。
+- [x] 上游路径正确处理带 `/v1` 的 base URL，避免重复版本路径。
 
-### 3.5 可观测性与 SLO
+### 4.2 路由合同
 
-- [x] `/metrics` 返回 Prometheus 兼容文本，至少包含请求数、请求耗时、输入/输出 token、cache token、cache hit rate、上游错误。
-- [x] `/stats` 返回 JSON 聚合快照，至少包含 uptime、按 provider/status 的请求量、cache 命中率、延迟分位数、上游错误分布。
-- [ ] `/stats/stream` 以 SSE 周期推送 `/stats` 快照，客户端断开后资源能释放。
-- [ ] `/metrics`、`/stats`、`/stats/stream` 默认仅允许 loopback 访问；开启 `metrics_remote_access` 后才允许远程访问。本阶段不验收 `metrics_allowed_cidrs` 白名单生效。
-- [ ] SLO 配置支持 cache 命中率下限、上游错误率上限、p99 延迟上限和巡检周期；命中阈值时输出可定位 provider 与规则的事件。
+- [x] 请求仅按 body 中的 exact `model` 和 catalog 的唯一 RouteOwner 路由。
+- [x] 配置加载拒绝未匹配、重复匹配、缺 operation、缺能力或缺 provider 必填项的模型配置。
+- [x] `model_required`、`model_not_found`、`operation_unsupported`、`endpoint_unsupported`、`conversion_unsupported` 均在访问上游前返回。
+- [x] 无 default provider、fallback 或失败切换；显式 provider 头、query 和模型前缀不影响路由。
 
-### 3.6 配置、安全与部署
+### 4.3 认证、错误与资源保护
 
-- [x] `config.example.yaml` 覆盖 server、provider（含 endpoint_capabilities）、model_catalog、metrics 和 SLO，可复制为 `config.yaml` 后运行。
-- [x] 支持通过环境变量覆盖监听地址、端口、usage 文件、交互目录、超时等 server 字段；**不支持** env 注入 provider；provider 与 api_key 在 config 中声明，可用 `${ENV}` 展开。
-- [x] 配置加载校验至少存在一个启用 provider；不支持 `default_provider`。
-- [ ] 日志、请求元信息、归档和错误输出会脱敏 `Authorization`、`X-API-Key`、`Cookie` 等敏感头。
-- [ ] `make build` 能生成单二进制；目标机器无需安装 Go、数据库或中间件即可运行该二进制。
-- [ ] 服务收到 SIGINT/SIGTERM 后能在超时时间内优雅关闭，不丢失已完成请求的 CSV 和归档记录。
+- [x] 非 loopback 监听强制入站 API Key；错误认证返回 `401 authentication_failed`。
+- [x] 请求体、上游非流式响应、SSE 累计字节和单行长度均有可配置上限；请求体超限返回 `413 request_too_large`。
+- [x] 流式响应即时转发并 flush；客户端取消、空闲超时、上游截断、协议损坏等会记录真实 outcome。
+- [x] 请求与响应头处理不会泄露入站 API Key、Authorization、Cookie 等敏感信息。
+- [x] 服务支持 SIGINT/SIGTERM 下的优雅关闭。
 
-### 3.7 性能、并发与质量门禁
+### 4.4 用量与审计
 
-- [ ] 在本机 loopback mock 上游、非 TLS、固定 1KB 非流式响应和固定首个 SSE chunk 立即返回的环境中，各执行 1000 次请求、并发度 1 与 10 各一轮；代理路径相对直接访问 mock 上游的首包额外延迟 P95 满足 20ms 目标。若环境不满足，需要在验收记录中说明瓶颈和实测值。
-- [ ] 进程启动并空闲 60s 后 RSS 满足 30MB 目标；持续 1000 次请求后，metrics 样本、归档清理和流式处理没有无界增长。
-- [x] 并发测试覆盖 CSV 写入、交互归档序号、metrics 聚合和流式转发。
-- [ ] `make check` 通过，即 `go fmt ./...`、`go vet ./...`、`go test ./...` 均无失败。
-- [ ] 关键路径测试覆盖配置加载、provider 选择、OpenAI-compatible 转发、Anthropic 适配、流式 usage、usage 估算、cache 字段、归档、metrics、SLO 和错误透传。
-- [ ] README、`config.example.yaml` 与本 PRD 的端点、字段、环境变量和运行方式保持一致。
+- [x] 每个处理过的 `/v1/*` 请求写入单进程并发安全的 `usage.csv`。
+- [x] 用量记录包含路由、operation、token、cache、时延、流式、HTTP 状态、转换方式与 outcome。
+- [x] 优先解析上游 usage；缺失时对适用响应估算 token 并显式标记。
+- [x] 每个请求创建递增交互归档，保留请求/上游/响应的脱敏元信息、最终 metadata 与 request ID。
+- [x] 可关闭完整正文归档；归档保留策略不会删除正在写入的轮次。
+- [x] metadata 记录模型、provider、TransportPlan、状态、token、outcome、指纹和 stable-prefix drift 信息。
 
-## model_catalog operation 合同（WorkOrch 对齐）
+### 4.5 可观测性与 SLO
 
-- [x] `model_catalog` 每项必填 `operations`（`chat_completions` / `embeddings`）；model id **严格区分大小写**且 exact 唯一。
-- [x] 每个 catalog model 唯一匹配 enabled provider；`GET /v1/models` 使用具体 DTO，只发布模型业务能力，
-  不暴露 RouteOwner。
-- [x] 请求前按 exact model + path operation 校验；`operation_unsupported` / `model_not_found` 不访问上游。
+- [x] `/metrics` 提供请求、时延、token、cache、上游错误及 SLO webhook 指标。
+- [x] `/stats` 提供按 provider/status/outcome 聚合的请求、cache、延迟分位数与上游错误快照。
+- [x] `/stats/stream` 以 SSE 立即并按秒推送 stats 快照，客户端断开后释放资源。
+- [x] metrics、stats 和 stats stream 默认仅 loopback 可访问；可按远程访问开关及 IP/CIDR 白名单开放。
+- [x] SLO 支持 cache 命中率、上游错误率、上游 attempt p99 延迟阈值及状态变化 webhook。
 
-### Provider endpoint_capabilities
+### 4.6 交付与质量
 
-- [x] enabled provider 必须显式配置 `endpoint_capabilities`（仅表示上游直连能力）。
-- [x] 不支持 env 注入 provider；不支持 `fallbacks`。
-- [x] 请求前校验 endpoint capability，失败返回 `endpoint_unsupported`。
-
-### Provider Capability Contract（TransportPlan）
-
-- [x] 启动期 `ResolvedModelRoute` 与请求期 `TransportPlan` 两阶段权威。
-- [x] 单一入口 `ResolveTransportPlan` 应用固定转发矩阵（native / openai_to_anthropic / anthropic_to_openai）。
-- [x] 转换前 feature preflight 返回 `conversion_unsupported`，不访问上游。
-- [x] 转换模式下游错误保留 status，输出客户端协议兼容安全 envelope。
-- [x] metadata 记录 operation、client endpoint/protocol、upstream protocol/path、conversion mode。
-- [x] `go test ./...` 覆盖矩阵、typed error、conversion preflight、SDK 验收与错误 envelope。
-- [x] 独立 `cmd/ai-proxy-probe` 运维入口与脱敏审计记录。
+- [x] `config.example.yaml` 覆盖 server、provider、model catalog、metrics 和 SLO 配置。
+- [x] 支持环境变量覆盖 server 层配置及 `${ENV}` 展开敏感配置值；provider 本身只能在配置文件中声明。
+- [x] 提供独立 `ai-proxy-probe`，可脱敏探测已声明 provider 的直连能力。
+- [x] 自动化测试覆盖配置校验、路由矩阵、协议转换、流式处理、用量、归档、metrics、SLO webhook 与 probe。
