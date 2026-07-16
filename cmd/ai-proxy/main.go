@@ -19,14 +19,15 @@ func main() {
 	configPath := flag.String("config", os.Getenv("AI_PROXY_CONFIG"), "config file path")
 	flag.Parse()
 
-	cfg, err := config.Load(*configPath)
+	resolvedConfigPath := config.ResolvePath(*configPath)
+	cfg, err := config.Load(resolvedConfigPath)
 	if err != nil {
 		slog.Error("load config", slog.Any("error", err))
 		os.Exit(1)
 	}
 	proxy.ConfigureLogger(cfg.LogFormat, cfg.DebugLog)
 
-	application, err := buildApp(cfg)
+	application, err := buildAppWithConfigPath(cfg, resolvedConfigPath)
 	if err != nil {
 		slog.Error("build app", slog.Any("error", err))
 		os.Exit(1)

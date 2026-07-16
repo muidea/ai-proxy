@@ -66,7 +66,7 @@ func TestBuildAppWiresObservabilityAndProxyRoutes(t *testing.T) {
 	}
 
 	h := application.server.Handler
-	for _, path := range []string{"/healthz", "/metrics", "/stats"} {
+	for _, path := range []string{"/healthz", "/metrics", "/stats", "/admin/"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		req.RemoteAddr = "127.0.0.1:12345"
 		rec := httptest.NewRecorder()

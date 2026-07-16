@@ -16,6 +16,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,12 +27,47 @@ import (
 )
 
 type Handler struct {
+	cfgMu               sync.RWMutex
 	cfg                 config.Config
 	recorder            stats.Recorder
 	interactionRecorder *archive.Recorder
 	metricsRegistry     *metrics.Registry
 	driftTracker        *FingerprintDriftTracker
 	client              *http.Client
+}
+
+// ConfigSnapshot 返回当前生效配置的独立快照，避免管理接口读取切片或 map 时
+// 与后续配置切换共享可变底层数据。
+func (h *Handler) ConfigSnapshot() config.Config {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	cfg := h.cfg
+	cfg.MetricsAllowedCIDRs = append([]string(nil), h.cfg.MetricsAllowedCIDRs...)
+	cfg.Providers = make(map[string]config.Provider, len(h.cfg.Providers))
+	for name, provider := range h.cfg.Providers {
+		provider.Models = append([]string(nil), provider.Models...)
+		provider.EndpointCapabilities = append([]string(nil), provider.EndpointCapabilities...)
+		cfg.Providers[name] = provider
+	}
+	cfg.ModelCatalog = make(map[string]config.ModelInfo, len(h.cfg.ModelCatalog))
+	for id, info := range h.cfg.ModelCatalog {
+		info.Operations = append([]string(nil), info.Operations...)
+		cfg.ModelCatalog[id] = info
+	}
+	return cfg
+}
+
+// UpdateConfig 在完整请求边界之间原子切换运行时配置。
+// 已进入代理处理的请求继续使用旧配置，新请求使用新配置。
+func (h *Handler) UpdateConfig(cfg config.Config) error {
+	if err := requireResolvedConfig(cfg); err != nil {
+		return err
+	}
+	h.cfgMu.Lock()
+	defer h.cfgMu.Unlock()
+	h.cfg = cfg
+	h.client = newHTTPClient(cfg.RequestTimeout)
+	return nil
 }
 
 func NewHandler(cfg config.Config, recorder stats.Recorder, interactionRecorder *archive.Recorder, metricsRegistry *metrics.Registry) *Handler {
@@ -184,6 +220,9 @@ func newHTTPClient(requestTimeout time.Duration) *http.Client {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+
 	requestID := ensureRequestID(r)
 	r = attachRequestID(w, r, requestID)
 

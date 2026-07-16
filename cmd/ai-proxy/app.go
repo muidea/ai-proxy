@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"ai-proxy/internal/admin"
 	"ai-proxy/internal/archive"
 	"ai-proxy/internal/config"
 	"ai-proxy/internal/metrics"
@@ -28,6 +29,12 @@ type app struct {
 
 // buildApp 根据配置装配 HTTP server、metrics 与 SLO,不监听端口。
 func buildApp(cfg config.Config) (*app, error) {
+	return buildAppWithConfigPath(cfg, "")
+}
+
+// buildAppWithConfigPath 在常规服务装配基础上启用项目内 Provider 管理页。
+// configPath 为空时页面保持可查看，但禁止写回配置。
+func buildAppWithConfigPath(cfg config.Config, configPath string) (*app, error) {
 	recorder := stats.NewCSVRecorder(cfg.UsageFile)
 	interactionRecorder, err := archive.NewRecorderOptions(cfg.InteractionDir, archive.RecorderOptions{
 		MaxRounds:   cfg.InteractionRetention,
@@ -88,6 +95,9 @@ func buildApp(cfg config.Config) (*app, error) {
 	mux.Handle("/metrics", metricsHandler)
 	mux.Handle("/stats", metricsHandler)
 	mux.Handle("/stats/stream", streamHandler)
+	adminHandler := admin.NewHandler(configPath, handler)
+	mux.Handle("/admin", adminHandler)
+	mux.Handle("/admin/", adminHandler)
 	mux.Handle("/healthz", handler)
 	mux.Handle("/", handler)
 

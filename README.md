@@ -102,6 +102,16 @@ cp config.example.yaml config.yaml   # 编辑 providers / model_catalog / endpoi
 make run
 ```
 
+### Provider Web 管理页
+
+服务启动后，在本机访问 [http://127.0.0.1:8080/admin/](http://127.0.0.1:8080/admin/) 可查看和配置 Provider。
+
+- 页面源码位于项目目录 `web/admin/`，使用轻量的 Ant Design 风格，不需要 Node.js 或额外前端构建链；Go 构建时会嵌入单个二进制。
+- 管理页和 `/admin/api/providers` 固定只允许 loopback 来源访问，即使代理监听在非 loopback 地址也不会开放远程管理。
+- API Key 只显示“已配置”状态，不会回显明文；不填写新值时会保留配置文件原有值，包括 `${ENV}` 表达式。
+- 保存前会执行与启动期相同的完整配置校验；成功后原子写回当前 `config.yaml`（或 `-config` / `AI_PROXY_CONFIG` 指定文件），并热更新当前实例。
+- Provider 修改不能破坏 `model_catalog` 的唯一 RouteOwner 合同；如有模型仍依赖被删除、禁用或改动后的 Provider，页面会显示校验错误且不会覆盖配置文件。
+
 常用环境变量：
 
 - `AI_PROXY_CONFIG`: 配置文件路径。

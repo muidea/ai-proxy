@@ -123,11 +123,7 @@ func Load(path string) (Config, error) {
 		ModelCatalog:             map[string]ModelInfo{},
 	}
 
-	if path == "" {
-		if _, err := os.Stat("config.yaml"); err == nil {
-			path = "config.yaml"
-		}
-	}
+	path = ResolvePath(path)
 	if path != "" {
 		if err := loadFile(path, &cfg); err != nil {
 			return Config{}, err
@@ -145,6 +141,18 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// ResolvePath 返回服务实际读取的配置文件路径。显式路径原样保留；未指定时，
+// 若当前目录存在 config.yaml 则返回该默认路径。
+func ResolvePath(path string) string {
+	if strings.TrimSpace(path) != "" {
+		return path
+	}
+	if _, err := os.Stat("config.yaml"); err == nil {
+		return "config.yaml"
+	}
+	return ""
 }
 
 func loadFile(path string, cfg *Config) error {
