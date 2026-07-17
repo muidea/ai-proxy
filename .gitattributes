@@ -1,0 +1,3 @@
+# Go formatter is byte-sensitive. Keep source files LF on every CI runner,
+# including Windows Git Bash, so gofmt checks are platform-independent.
+* text=auto eol=lf

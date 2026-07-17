@@ -59,7 +59,7 @@ jobs:
       - name: Verify native target
         shell: bash
         run: |
-          test -z "$(gofmt -l .)"
+          scripts/check-format.sh
           go vet ./...
           go test ./... -count=1
       - name: Build release archive
