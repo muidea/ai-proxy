@@ -21,6 +21,7 @@ const (
 	ErrorCodeRequestTooLarge       = "request_too_large"
 	ErrorCodeProxyInternalError    = "proxy_internal_error"
 	ErrorCodeUpstreamUnavailable   = "upstream_unavailable"
+	ErrorCodeUsageStoreUnavailable = "usage_store_unavailable"
 )
 
 // APIErrorResponse 是 OpenAI-compatible 错误 envelope。

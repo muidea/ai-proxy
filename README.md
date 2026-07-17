@@ -1,10 +1,11 @@
-## usage.csv
+## ai-proxy
 
-`usage_file`（默认 `usage.csv`）为**单进程本地追加文件**：
+`usage_store.path`（默认 `usage.duckdb`）为**单进程本地 DuckDB 文件**（唯一在线用量 authority）：
 
 - 每个 ai-proxy 进程必须使用独立路径；
-- 多副本/多实例**不要**挂载同一 `usage.csv`（否则可能行交错、schema 轮转竞态、备份覆盖）；
-- 需要集中统计时请用 Prometheus `/metrics` 或外部采集，而不是共享 CSV。
+- 多副本/多实例**不要**共享同一 DuckDB 文件；
+- 需要集中统计时请用 Prometheus `/metrics`、Admin 导出或外部采集。
+- 旧 `usage.csv` 可通过 `go run ./cmd/ai-proxy-usage-import` 一次性导入，不在启动时自动迁移。
 
 ## SLO webhook
 
@@ -65,7 +66,7 @@ Prometheus: `ai_proxy_requests_total{...,status,outcome}`；`/stats` 含 `reques
 
 # ai-proxy
 
-轻量级本地 LLM API 网关。客户端只访问统一标准入站 path（OpenAI 与 Anthropic），代理**仅按请求 `model`** 匹配上游 provider，并在需要时做基础协议转换。请求结束后把模型、耗时、token 用量和缓存命中统计追加到 `usage.csv`，同时按轮次归档请求和响应内容。
+轻量级本地 LLM API 网关。客户端只访问统一标准入站 path（OpenAI 与 Anthropic），代理**仅按请求 `model`** 匹配上游 provider，并在需要时做基础协议转换。请求结束后把模型、耗时、token 用量和缓存命中统计写入 DuckDB `usage_events`，同时按轮次归档请求和响应内容。Web 管理端提供使用统计页签。
 
 ## 功能
 
@@ -116,12 +117,13 @@ make run
 
 - `AI_PROXY_CONFIG`: 配置文件路径。
 - `AI_PROXY_LISTEN_ADDR`: 完整监听地址，例如 `127.0.0.1:8080`。
-- `AI_PROXY_PORT`: 仅修改端口，生成 `127.0.0.1:<port>`（不再绑定全部网卡；若需监听全网卡请显式设置 `AI_PROXY_LISTEN_ADDR=:8080` 并配置 `inbound_api_key`）。
-- `AI_PROXY_INBOUND_API_KEY`: 入站 API Key。监听非 loopback 时**必须**配置；客户端通过 `Authorization: Bearer <key>` 或 `X-API-Key` 提交。
+- `AI_PROXY_PORT`: 仅修改端口，生成 `127.0.0.1:<port>`（不再绑定全部网卡；若需监听全网卡请显式设置 `AI_PROXY_LISTEN_ADDR=:8080`，并在网络层落实访问控制）。
+- `client_api_keys`（配置文件）: 多客户端 API Key 身份与用量归属。未携带 Key 归入内置 `default`；未知/禁用/冲突 Key 返回 401。**不再支持** `inbound_api_key` / `AI_PROXY_INBOUND_API_KEY`。
+  - 客户端 Key 是归属机制，不是强制登录；非 loopback 监听需由防火墙/反代等独立接入层保护。
 - `AI_PROXY_MAX_REQUEST_BODY_BYTES` / `AI_PROXY_MAX_UPSTREAM_RESPONSE_BYTES`: 请求体与上游响应大小上限。
 - `AI_PROXY_MAX_STREAM_BYTES` / `AI_PROXY_MAX_SSE_LINE_BYTES`: 流式累计输出与单条 SSE 行上限。
 - `AI_PROXY_ARCHIVE_FULL_CONTENT`: `true|false`，是否落盘完整请求/响应正文。
-- `AI_PROXY_USAGE_FILE`: 用量 CSV 文件路径。
+- `AI_PROXY_USAGE_STORE_PATH`: DuckDB 用量库路径（也可用配置 `usage_store.path`）。**不再支持** `usage_file` / `AI_PROXY_USAGE_FILE`。
 - `AI_PROXY_INTERACTION_DIR`: 交互归档目录，默认 `interactions`。
 - `AI_PROXY_INTERACTION_RETENTION`: 保留的交互归档轮数，默认 `500`。
 - `AI_PROXY_DEBUG_LOG`: 是否输出调试日志，默认 `true`。
@@ -240,7 +242,7 @@ model_catalog:
 
 如果 `base_url` 已包含 `/v1`（含嵌套如 `.../codex/v1`），代理会避免重复拼接版本路径。
 
-上游错误：native 路径透传；转换模式保留上游 HTTP status，并输出客户端协议兼容的安全错误 envelope。`usage.csv` / `metadata.json` 记录 RouteOwner、client endpoint、upstream protocol/path 与 conversion mode。流式响应在写出首包 SSE 前会探测首字节以便识别断流，但**不会**切换其它 provider。
+上游错误：native 路径透传；转换模式保留上游 HTTP status，并输出客户端协议兼容的安全错误 envelope。DuckDB `usage_events` / `metadata.json` 记录 RouteOwner、client endpoint、upstream protocol/path 与 conversion mode。流式响应在写出首包 SSE 前会探测首字节以便识别断流，但**不会**切换其它 provider。
 
 Provider 与 model_catalog 示例（`models` 互不重叠；catalog model 必须唯一命中）：
 
@@ -356,6 +358,8 @@ curl http://127.0.0.1:8080/stats
 - `ai_proxy_cached_input_tokens_total{provider,model}` / `ai_proxy_cache_creation_input_tokens_total{provider,model}`
 - `ai_proxy_cache_hit_rate{provider,model}` — 缓存命中率
 - `ai_proxy_upstream_errors_total{provider,status_code}` — upstream 错误分布
+- `ai_proxy_client_requests_total{api_key_id}` / `ai_proxy_client_{input,output,}tokens_total{api_key_id}` — 按客户端 Key 的累计调用与 Token
+- `ai_proxy_usage_store_{write_errors_total,query_errors_total,recovered_events_total,checkpoint_errors_total,healthy}` — DuckDB 写入、查询、恢复、checkpoint 与健康状态
 
 ## 构建单二进制
 
@@ -369,6 +373,20 @@ make build
 make build BINARY=bin/ai-proxy
 ```
 
+## CI 与发布
+
+GitHub Actions 的 CI 在 Linux amd64/arm64、macOS amd64/arm64 与 Windows amd64 的**原生 runner**上执行测试和打包；这样不会触发 DuckDB bindings 不支持的 amd64→arm64 交叉编译。推送 `vX.Y.Z` tag 会生成 GitHub Release 和各平台 `tar.gz`、SHA-256 校验文件。若手动重跑 Release workflow，输入的版本必须是已存在的 tag。
+
+本地仅可打包当前原生平台：
+
+```bash
+make release-package VERSION=v1.2.3
+make release VERSION=v1.2.3             # check + 本地打包
+make release VERSION=v1.2.3 PUBLISH=1   # 创建 tag、推送并用 gh 发布当前平台包
+```
+
+完整多平台发布应始终由 tag 触发的 GitHub Actions 完成。
+
 ## 开发检查
 
 ```bash
@@ -377,15 +395,11 @@ make check
 
 `make check` 会依次运行 `go fmt ./...`、`go vet ./...` 和 `go test ./...`。
 
-## CSV 字段
+## 用量存储（DuckDB）与 CSV 导出
 
-`usage.csv` 首次写入会生成表头：
+`usage_store.path` 指向唯一在线用量主存储 `usage.duckdb`。每个已接受调用会先持久化 `started`，随后在成功、校验失败、上游失败或流式中断时结算为 `completed`。`/stats` 的 `usage` 字段与 `/metrics` 的 `ai_proxy_client_*` 指标均由该持久化数据启动初始化，并随成功结算更新。
 
-```text
-time,provider,model,input_tokens,output_tokens,total_tokens,duration_ms,stream,estimated,http_status,outcome,cached_input_tokens,cache_creation_input_tokens,cache_hit_rate
-```
-
-`cache_hit_rate` 按 `cached_input_tokens / input_tokens` 计算，CSV 中保留 4 位小数。没有上游 `usage` 时，`estimated=true` 表示 token 用量来自本地轻量估算；缓存字段无法估算时记为 `0`。
+管理页或 `/admin/api/usage/export.csv` 可按时间、API Key、Provider、Model、Outcome 与估算标记导出安全字段；单次导出最多 31 天且不超过 100,000 行。旧 `usage.csv` 仅能通过 `cmd/ai-proxy-usage-import` 显式、一次性导入。
 
 ## 交互归档
 

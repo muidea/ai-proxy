@@ -13,7 +13,7 @@ import (
 	"ai-proxy/internal/archive"
 	"ai-proxy/internal/config"
 	"ai-proxy/internal/metrics"
-	"ai-proxy/internal/stats"
+	"ai-proxy/internal/usage"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	anthropicoption "github.com/anthropics/anthropic-sdk-go/option"
@@ -26,9 +26,7 @@ import (
 
 func startProxySDKServer(t *testing.T, cfg config.Config, upstream http.RoundTripper) *httptest.Server {
 	t.Helper()
-	usageFile := filepath.Join(t.TempDir(), "usage.csv")
 	interactionDir := filepath.Join(t.TempDir(), "interactions")
-	cfg.UsageFile = usageFile
 	cfg.InteractionDir = interactionDir
 	cfg.ListenAddr = "127.0.0.1:0"
 	cfg.DebugLog = false
@@ -36,7 +34,14 @@ func startProxySDKServer(t *testing.T, cfg config.Config, upstream http.RoundTri
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHandler(mustHandlerConfig(cfg), stats.NewCSVRecorder(usageFile), rec, metrics.NewRegistry())
+	cfg = mustHandlerConfig(cfg)
+	if cfg.ClientAPIKeys == nil {
+		cfg.ClientAPIKeys = map[string]config.ClientAPIKey{}
+	}
+	// SDK 测试默认 key,与 WithAPIKey("inbound-not-used") / anthropic WithAPIKey("inbound") 对齐。
+	cfg.ClientAPIKeys["sdk"] = config.ClientAPIKey{ID: "sdk", APIKey: "inbound-not-used", Enabled: true}
+	cfg.ClientAPIKeys["anthropic-sdk"] = config.ClientAPIKey{ID: "anthropic-sdk", APIKey: "inbound", Enabled: true}
+	h := NewHandler(cfg, usage.NewMemoryStore(), rec, metrics.NewRegistry())
 	if upstream != nil {
 		h.client.Transport = upstream
 	}
@@ -44,6 +49,7 @@ func startProxySDKServer(t *testing.T, cfg config.Config, upstream http.RoundTri
 }
 
 func TestOpenAISDKModelsChatEmbeddingsAndTypedError(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "")
 	upstreamHits := 0
 	upstream := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		upstreamHits++
@@ -142,6 +148,9 @@ func TestOpenAISDKModelsChatEmbeddingsAndTypedError(t *testing.T) {
 }
 
 func TestAnthropicSDKMessagesNativeAndConversionAndTypedError(t *testing.T) {
+	// 避免环境中的 ANTHROPIC_AUTH_TOKEN/API_KEY 与 WithAPIKey 叠加导致双 Header 冲突 401。
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
 	// Case A: anthropic native RouteOwner
 	nativeUpstream := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/messages") {

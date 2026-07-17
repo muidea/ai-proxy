@@ -13,18 +13,19 @@ import (
 	"ai-proxy/internal/config"
 	"ai-proxy/internal/metrics"
 	"ai-proxy/internal/proxy"
-	"ai-proxy/internal/stats"
+	"ai-proxy/internal/usage"
 )
 
 // app 是可测试的服务装配结果。
 type app struct {
-	cfg       config.Config
-	server    *http.Server
-	evaluator *metrics.SLOEvaluator
-	sloCancel context.CancelFunc
-	sloDone   chan struct{} // Run goroutine 退出信号;未启动时为 nil
-	registry  *metrics.Registry
-	closeOnce sync.Once
+	cfg        config.Config
+	server     *http.Server
+	evaluator  *metrics.SLOEvaluator
+	sloCancel  context.CancelFunc
+	sloDone    chan struct{} // Run goroutine 退出信号;未启动时为 nil
+	registry   *metrics.Registry
+	usageStore usage.Store
+	closeOnce  sync.Once
 }
 
 // buildApp 根据配置装配 HTTP server、metrics 与 SLO,不监听端口。
@@ -35,17 +36,34 @@ func buildApp(cfg config.Config) (*app, error) {
 // buildAppWithConfigPath 在常规服务装配基础上启用项目内 Provider 管理页。
 // configPath 为空时页面保持可查看，但禁止写回配置。
 func buildAppWithConfigPath(cfg config.Config, configPath string) (*app, error) {
-	recorder := stats.NewCSVRecorder(cfg.UsageFile)
+	usageStore, err := usage.OpenDuckDB(cfg.UsageStore)
+	if err != nil {
+		return nil, fmt.Errorf("init usage store: %w", err)
+	}
 	interactionRecorder, err := archive.NewRecorderOptions(cfg.InteractionDir, archive.RecorderOptions{
 		MaxRounds:   cfg.InteractionRetention,
 		FullContent: cfg.ArchiveFullContent,
 	})
 	if err != nil {
+		_ = usageStore.Close()
 		return nil, fmt.Errorf("init interaction recorder: %w", err)
 	}
 	registry := metrics.NewRegistry()
+	if allTime, err := usageStore.AllTimeByKey(context.Background()); err != nil {
+		registry.RecordUsageStoreQuery(0, err, usageStore.Healthy())
+	} else {
+		mirror := make(map[string]metrics.ClientUsage, len(allTime))
+		for id, total := range allTime {
+			mirror[id] = metrics.ClientUsage{Requests: total.Requests, InputTokens: total.InputTokens, OutputTokens: total.OutputTokens, TotalTokens: total.TotalTokens}
+		}
+		registry.InitializeClientUsage(mirror)
+		registry.SetUsageStoreHealthy(usageStore.Healthy())
+	}
+	if recovered, ok := any(usageStore).(interface{ RecoveredEvents() int64 }); ok {
+		registry.RecordUsageStoreRecovered(recovered.RecoveredEvents())
+	}
 	proxy.ReserveMetricsModels(registry, cfg)
-	handler := proxy.NewHandler(cfg, recorder, interactionRecorder, registry)
+	handler := proxy.NewHandler(cfg, usageStore, interactionRecorder, registry)
 	metricsHandler := metrics.Handler(registry, metrics.HandlerOptions{
 		AllowRemote:  cfg.MetricsRemoteAccess,
 		AllowedCIDRs: cfg.MetricsAllowedCIDRs,
@@ -95,7 +113,7 @@ func buildAppWithConfigPath(cfg config.Config, configPath string) (*app, error) 
 	mux.Handle("/metrics", metricsHandler)
 	mux.Handle("/stats", metricsHandler)
 	mux.Handle("/stats/stream", streamHandler)
-	adminHandler := admin.NewHandler(configPath, handler)
+	adminHandler := admin.NewHandlerWithUsage(configPath, handler, usageStore).WithMetrics(registry)
 	mux.Handle("/admin", adminHandler)
 	mux.Handle("/admin/", adminHandler)
 	mux.Handle("/healthz", handler)
@@ -110,12 +128,13 @@ func buildAppWithConfigPath(cfg config.Config, configPath string) (*app, error) 
 	}
 
 	return &app{
-		cfg:       cfg,
-		server:    server,
-		evaluator: evaluator,
-		sloCancel: sloCancel,
-		sloDone:   sloDone,
-		registry:  registry,
+		cfg:        cfg,
+		server:     server,
+		evaluator:  evaluator,
+		sloCancel:  sloCancel,
+		sloDone:    sloDone,
+		registry:   registry,
+		usageStore: usageStore,
 	}, nil
 }
 
@@ -136,6 +155,18 @@ func (a *app) Close() {
 		}
 		if a.registry != nil {
 			a.registry.AttachSLO(nil)
+		}
+		// Shutdown 末尾 checkpoint + 关闭 usage store。
+		if a.usageStore != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := a.usageStore.Checkpoint(ctx); err != nil {
+				slog.Error("usage store checkpoint failed", slog.Any("error", err))
+				if a.registry != nil {
+					a.registry.RecordUsageStoreCheckpointError()
+				}
+			}
+			cancel()
+			_ = a.usageStore.Close()
 		}
 	})
 }

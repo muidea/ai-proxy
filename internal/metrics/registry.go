@@ -47,6 +47,9 @@ type errorKey struct {
 	Provider, StatusCode string
 }
 
+// clientUsageKey 只有配置内受控的 api_key_id 与 default，label 基数有界。
+type clientUsageKey string
+
 // latencyKey 是延迟样本的复合 label。
 type latencyKey struct {
 	Provider, Model string
@@ -81,6 +84,18 @@ type Registry struct {
 	upstreamErrors   map[errorKey]uint64
 	upstreamAttempts map[string]uint64 // provider -> total attempts
 
+	clientRequests          map[clientUsageKey]uint64
+	clientInput             map[clientUsageKey]uint64
+	clientOutput            map[clientUsageKey]uint64
+	clientTokens            map[clientUsageKey]uint64
+	usageWriteErr           map[string]uint64
+	usageQueryErr           uint64
+	usageQueryDurationSum   float64
+	usageQueryDurationCount uint64
+	usageRecovered          uint64
+	usageCheckpointErr      uint64
+	usageHealthy            bool
+
 	// knownModels 记录每个 provider 已见过的 model label(不含 _other),用于基数限制。
 	knownModels map[string]map[string]struct{} // provider -> set(model)
 
@@ -110,8 +125,120 @@ func NewRegistry() *Registry {
 		cachedTokenSumHits:        map[tokenKey]uint64{},
 		upstreamErrors:            map[errorKey]uint64{},
 		upstreamAttempts:          map[string]uint64{},
+		clientRequests:            map[clientUsageKey]uint64{},
+		clientInput:               map[clientUsageKey]uint64{},
+		clientOutput:              map[clientUsageKey]uint64{},
+		clientTokens:              map[clientUsageKey]uint64{},
+		usageWriteErr:             map[string]uint64{},
+		usageHealthy:              true,
 		knownModels:               map[string]map[string]struct{}{},
 	}
+}
+
+// InitializeClientUsage 使用 DuckDB all-time 聚合初始化进程内 Prometheus 镜像。
+// Store 仍是唯一 authority；该镜像只服务低开销 exposition。
+func (r *Registry) InitializeClientUsage(values map[string]ClientUsage) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clientRequests = map[clientUsageKey]uint64{}
+	r.clientInput = map[clientUsageKey]uint64{}
+	r.clientOutput = map[clientUsageKey]uint64{}
+	r.clientTokens = map[clientUsageKey]uint64{}
+	for id, value := range values {
+		key := clientUsageKey(id)
+		if value.Requests > 0 {
+			r.clientRequests[key] = uint64(value.Requests)
+		}
+		if value.InputTokens > 0 {
+			r.clientInput[key] = uint64(value.InputTokens)
+		}
+		if value.OutputTokens > 0 {
+			r.clientOutput[key] = uint64(value.OutputTokens)
+		}
+		if value.TotalTokens > 0 {
+			r.clientTokens[key] = uint64(value.TotalTokens)
+		}
+	}
+}
+
+// ClientUsage 是 DuckDB all-time key 汇总投影，避免 metrics 包依赖 usage 包。
+type ClientUsage struct{ Requests, InputTokens, OutputTokens, TotalTokens int64 }
+
+func (r *Registry) RecordClientUsage(apiKeyID string, input, output int) {
+	if r == nil || apiKeyID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := clientUsageKey(apiKeyID)
+	r.clientRequests[key]++
+	if input > 0 {
+		r.clientInput[key] += uint64(input)
+	}
+	if output > 0 {
+		r.clientOutput[key] += uint64(output)
+	}
+	if input+output > 0 {
+		r.clientTokens[key] += uint64(input + output)
+	}
+}
+
+func (r *Registry) RecordUsageStoreWriteError(phase string) {
+	if r == nil {
+		return
+	}
+	if phase != "start" && phase != "complete" {
+		phase = "unknown"
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.usageWriteErr[phase]++
+	r.usageHealthy = false
+}
+
+func (r *Registry) RecordUsageStoreQuery(duration time.Duration, err error, healthy bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.usageQueryDurationSum += duration.Seconds()
+	r.usageQueryDurationCount++
+	if err != nil {
+		r.usageQueryErr++
+	}
+	r.usageHealthy = healthy
+}
+
+func (r *Registry) RecordUsageStoreRecovered(count int64) {
+	if r == nil || count <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.usageRecovered += uint64(count)
+}
+
+func (r *Registry) RecordUsageStoreCheckpointError() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.usageCheckpointErr++
+	r.usageHealthy = false
+}
+
+func (r *Registry) SetUsageStoreHealthy(healthy bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.usageHealthy = healthy
 }
 
 // normalizeModelLabel 在已持锁前提下限制 model label 基数。

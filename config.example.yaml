@@ -1,9 +1,7 @@
 server:
   # 默认仅绑定 loopback。若改为 0.0.0.0:8080 / :8080 等非 loopback,
-  # 必须同时配置 inbound_api_key,否则启动失败。
+  # client_api_keys 是归属机制而非强制登录;非 loopback 需由网络层保护。
   listen_addr: 127.0.0.1:8080
-  # 入站 API Key(可选于 loopback)。客户端用 Authorization: Bearer <key> 或 X-API-Key。
-  # inbound_api_key: change-me
   # 请求体 / 上游响应大小上限(字节)。
   max_request_body_bytes: 33554432
   max_upstream_response_bytes: 67108864
@@ -12,8 +10,6 @@ server:
   max_sse_line_bytes: 1048576
   # 是否落盘完整请求/响应正文;false 时仅保留 metadata 等元数据。
   archive_full_content: true
-  # 单进程本地文件;多副本请使用不同路径,勿共享同一 usage.csv。
-  usage_file: usage.csv
   interaction_dir: interactions
   interaction_retention: 500
   debug_log: true
@@ -46,13 +42,27 @@ server:
 # 已禁用 X-AI-Provider / ?provider= / provider/model 显式选择。
 # endpoint_capabilities 仅声明上游直连能力;客户端可服务 path 由 TransportPlan 矩阵决定
 # (含 OpenAI chat ↔ Anthropic messages 基础文本转换)。
+
+# 客户端 API Key(可选)。未携带 Key 的请求归入内置 default 统计桶。
+# client_api_keys:
+#   codex:
+#     api_key: ${CODEX_API_KEY}
+#     enabled: true
+
+# 用量存储:进程内嵌 DuckDB。多实例不得共享同一 path。
+usage_store:
+  path: usage.duckdb
+  memory_limit: 256MB
+  threads: 2
+  query_cache_seconds: 15
+
 providers:
   # 每个 enabled provider 必须显式声明 protocol、base_url、endpoint_capabilities。
   # 远程空 api_key 启动失败；仅 loopback 上游可设 allow_unauthenticated: true。
   openai:
     enabled: true
     protocol: openai
-    # base_url 可带或不带 /v1；代理会按入站 path 智能拼接并去重。
+  # base_url 可带或不带 /v1；代理会按入站 path 智能拼接并去重。
     base_url: https://onlycode.shop/v1
     api_key: ${OPENAI_API_KEY}
     endpoint_capabilities: chat_completions, responses, completions, embeddings
@@ -67,7 +77,7 @@ providers:
   anthropic:
     enabled: true
     protocol: anthropic
-    # 转换与直通均走统一 path join；带/不带 /v1 均可。
+  # 转换与直通均走统一 path join；带/不带 /v1 均可。
     base_url: https://onlycode.shop
     api_key: ${ANTHROPIC_API_KEY}
     endpoint_capabilities: messages

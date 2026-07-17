@@ -16,10 +16,14 @@ func TestLoadConfigFileAndEnv(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 server:
   port: 9090
-  usage_file: test-usage.csv
   interaction_dir: test-interactions
   debug_log: false
   stream_idle_timeout_seconds: 900
+usage_store:
+  path: test-usage.duckdb
+  memory_limit: 256MB
+  threads: 2
+  query_cache_seconds: 15
 providers:
   deepseek:
     protocol: openai
@@ -324,36 +328,12 @@ providers:
 	}
 }
 
-func TestLoadRejectsNonLoopbackWithoutInboundKey(t *testing.T) {
+func TestLoadAllowsNonLoopbackWithoutClientKeys(t *testing.T) {
+	// client_api_keys 是归属机制而非强制登录;非 loopback 不再要求 inbound key。
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(`
 server:
   listen_addr: 0.0.0.0:8080
-providers:
-  openai:
-    protocol: openai
-    base_url: https://api.openai.com
-    api_key: test
-    endpoint_capabilities: chat_completions, responses, completions, embeddings
-    models: gpt-*
-`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("expected non-loopback without inbound_api_key to fail")
-	}
-	if !strings.Contains(err.Error(), "inbound_api_key") {
-		t.Fatalf("error = %q", err)
-	}
-}
-
-func TestLoadAllowsNonLoopbackWithInboundKey(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte(`
-server:
-  listen_addr: 0.0.0.0:8080
-  inbound_api_key: secret-key
 providers:
   openai:
     protocol: openai
@@ -368,8 +348,167 @@ providers:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.InboundAPIKey != "secret-key" {
-		t.Fatalf("InboundAPIKey = %q", cfg.InboundAPIKey)
+	if cfg.ListenAddr != "0.0.0.0:8080" {
+		t.Fatalf("listen = %q", cfg.ListenAddr)
+	}
+}
+
+func TestLoadRejectsInboundAPIKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  listen_addr: 127.0.0.1:8080
+  inbound_api_key: secret-key
+providers:
+  openai:
+    protocol: openai
+    base_url: https://api.openai.com
+    api_key: test
+    endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected inbound_api_key to be rejected")
+	}
+	if !strings.Contains(err.Error(), "inbound_api_key") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestLoadRejectsUsageFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  usage_file: usage.csv
+providers:
+  openai:
+    protocol: openai
+    base_url: https://api.openai.com
+    api_key: test
+    endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected usage_file to be rejected")
+	}
+	if !strings.Contains(err.Error(), "usage_file") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestLoadClientAPIKeys(t *testing.T) {
+	t.Setenv("CODEX_API_KEY", "sk-codex-from-env")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+client_api_keys:
+  Codex:
+    api_key: ${CODEX_API_KEY}
+    enabled: true
+  workorch:
+    api_key: sk-workorch
+    enabled: false
+providers:
+  openai:
+    protocol: openai
+    base_url: https://api.openai.com
+    api_key: test
+    endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.ClientAPIKeys) != 2 {
+		t.Fatalf("keys = %#v", cfg.ClientAPIKeys)
+	}
+	codex, ok := cfg.ClientAPIKeys["codex"]
+	if !ok || codex.APIKey != "sk-codex-from-env" || !codex.Enabled {
+		t.Fatalf("codex = %#v ok=%v", codex, ok)
+	}
+	wo, ok := cfg.ClientAPIKeys["workorch"]
+	if !ok || wo.Enabled {
+		t.Fatalf("workorch = %#v", wo)
+	}
+}
+
+func TestLoadRejectsDefaultClientKeyID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+client_api_keys:
+  default:
+    api_key: sk-x
+providers:
+  openai:
+    protocol: openai
+    base_url: https://api.openai.com
+    api_key: test
+    endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestLoadRejectsDuplicateClientSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+client_api_keys:
+  a:
+    api_key: same-secret
+  b:
+    api_key: same-secret
+providers:
+  openai:
+    protocol: openai
+    base_url: https://api.openai.com
+    api_key: test
+    endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected duplicate secret error")
+	}
+	if strings.Contains(err.Error(), "same-secret") {
+		t.Fatalf("error leaked secret: %v", err)
+	}
+	if !strings.Contains(err.Error(), "duplicate api_key") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestLoadRejectsInboundEnv(t *testing.T) {
+	t.Setenv("AI_PROXY_INBOUND_API_KEY", "x")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+providers:
+  openai:
+    protocol: openai
+    base_url: https://api.openai.com
+    api_key: test
+    endpoint_capabilities: chat_completions, responses, completions, embeddings
+    models: gpt-*
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "AI_PROXY_INBOUND_API_KEY") {
+		t.Fatalf("err = %v", err)
 	}
 }
 

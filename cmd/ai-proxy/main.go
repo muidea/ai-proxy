@@ -15,6 +15,9 @@ import (
 	"ai-proxy/internal/proxy"
 )
 
+// version 由 scripts/build-release.sh 通过 -ldflags 注入；本地开发保持 dev。
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", os.Getenv("AI_PROXY_CONFIG"), "config file path")
 	flag.Parse()
@@ -37,8 +40,9 @@ func main() {
 	errCh := make(chan error, 1)
 	go func() {
 		slog.Info("ai-proxy listening",
+			slog.String("version", version),
 			slog.String("addr", cfg.ListenAddr),
-			slog.String("usage_file", cfg.UsageFile),
+			slog.String("usage_store", cfg.UsageStore.Path),
 			slog.String("interactions", cfg.InteractionDir),
 			slog.String("metrics", metricsURL(cfg.MetricsRemoteAccess)),
 		)

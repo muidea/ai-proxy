@@ -1,7 +1,10 @@
 /ai-proxy
 /bin/
+/dist/
 config.yaml
 usage.csv
 usage.csv.bak.*
+usage.duckdb
+usage.duckdb.wal
 interactions/
 logs/

@@ -51,6 +51,40 @@ func TestRegistryCounters(t *testing.T) {
 	mustContain(t, out, "# EOF")
 }
 
+func TestClientUsageAndStoreMetrics(t *testing.T) {
+	r := NewRegistry()
+	r.InitializeClientUsage(map[string]ClientUsage{"default": {Requests: 2, InputTokens: 10, OutputTokens: 5, TotalTokens: 15}})
+	r.RecordClientUsage("default", 3, 2)
+	r.RecordUsageStoreWriteError("complete")
+	r.RecordUsageStoreQuery(20*time.Millisecond, nil, true)
+	r.RecordUsageStoreRecovered(4)
+	r.RecordUsageStoreCheckpointError()
+
+	var buf strings.Builder
+	if err := r.WritePrometheus(&buf); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	mustContain(t, out, `ai_proxy_client_requests_total{api_key_id="default"} 3`)
+	mustContain(t, out, `ai_proxy_client_tokens_total{api_key_id="default"} 20`)
+	mustContain(t, out, `ai_proxy_usage_store_write_errors_total{phase="complete"} 1`)
+	mustContain(t, out, `ai_proxy_usage_store_recovered_events_total 4`)
+	mustContain(t, out, `ai_proxy_usage_store_checkpoint_errors_total 1`)
+	mustContain(t, out, `ai_proxy_usage_store_healthy 0`)
+
+	payload, err := r.StatsJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stats StatsJSON
+	if err := json.Unmarshal(payload, &stats); err != nil {
+		t.Fatal(err)
+	}
+	if got := stats.Usage.ByAPIKey["default"]; got.Requests != 3 || got.TotalTokens != 20 || stats.Usage.Store.Healthy {
+		t.Fatalf("usage stats = %#v", stats.Usage)
+	}
+}
+
 func TestRegistryDurationSummary(t *testing.T) {
 	r := NewRegistry()
 	r.RecordRequest("p", "m", "chat_completions", 200, 100*time.Millisecond, "success")

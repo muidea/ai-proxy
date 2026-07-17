@@ -14,6 +14,10 @@ const RequestIDHeader = "X-Request-ID"
 // requestIDKey 是 context 中 request id 的私有 key,避免与外部包冲突。
 type requestIDKey struct{}
 
+// usageEventKey 与可由客户端透传的 RequestID 分离。用量事件主键必须由
+// 服务端生成，避免重复的 X-Request-ID 造成用量写入冲突。
+type usageEventKey struct{}
+
 // newRequestID 生成 16 字节随机 ID,返回 32 字符的 hex 字符串。
 func newRequestID() string {
 	var buf [16]byte
@@ -41,6 +45,21 @@ func requestIDFromContext(ctx context.Context) string {
 		return id
 	}
 	return ""
+}
+
+func withUsageEventID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, usageEventKey{}, id)
+}
+
+func usageEventIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	id, _ := ctx.Value(usageEventKey{}).(string)
+	return id
 }
 
 // ensureRequestID 优先从入站请求头透传,缺失时生成新的 ID。

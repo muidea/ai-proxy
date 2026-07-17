@@ -13,8 +13,13 @@ import (
 
 func testConfig(dir string) config.Config {
 	return config.Config{
-		ListenAddr:               "127.0.0.1:0",
-		UsageFile:                filepath.Join(dir, "usage.csv"),
+		ListenAddr: "127.0.0.1:0",
+		UsageStore: config.UsageStoreConfig{
+			Path:              filepath.Join(dir, "usage.duckdb"),
+			MemoryLimit:       "256MB",
+			Threads:           2,
+			QueryCacheSeconds: 0,
+		},
 		InteractionDir:           filepath.Join(dir, "interactions"),
 		InteractionRetention:     10,
 		ArchiveFullContent:       true,

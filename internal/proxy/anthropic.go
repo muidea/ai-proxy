@@ -35,6 +35,7 @@ type anthropicRequest struct {
 // 通过 TransportPlan 决定 native 或 anthropic_to_openai 转换。
 func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request, requestID string) {
 	start := time.Now()
+	round := archiveRoundFromContext(r.Context())
 	bodyBytes, err := h.readLimitedBody(w, r)
 	if err != nil {
 		status := http.StatusBadRequest
@@ -43,7 +44,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 			status = http.StatusRequestEntityTooLarge
 			code = ErrorCodeRequestTooLarge
 		}
-		writeClientProtocolError(w, status, clientProtocolFromRequest(r), APIError{
+		h.writeArchivedAPIError(w, round, r, start, "", "", false, status, APIError{
 			Code: code, Message: err.Error(), ClientProtocol: clientProtocolFromRequest(r),
 			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
 		})
@@ -51,19 +52,6 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	}
 	defer r.Body.Close()
 
-	round, err := h.startRound()
-	if err != nil {
-		writeClientProtocolError(w, http.StatusInternalServerError, clientProtocolFromRequest(r), APIError{
-			Code: ErrorCodeProxyInternalError, Message: "start interaction archive failed",
-			ClientProtocol: clientProtocolFromRequest(r),
-			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
-		})
-		return
-	}
-	if round != nil {
-		defer round.Abort()
-	}
-	round.SetRequestID(requestID)
 	if err := round.WriteRequest(bodyBytes); err != nil {
 		log.Printf("archive request: %v", err)
 	}

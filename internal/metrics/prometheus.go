@@ -20,15 +20,26 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 	}
 	r.mu.Lock()
 	snapshot := prometheusSnapshot{
-		requestCount:         copyRequestKeys(r.requestCount),
-		requestDurationSum:   copyFloatKeys(r.requestDurationSum),
-		requestDurationCount: copyUintKeys(r.requestDurationCount),
-		inputTokens:          copyTokenKeys(r.inputTokens),
-		outputTokens:         copyTokenKeys(r.outputTokens),
-		cachedInputTokens:    copyTokenKeys(r.cachedInputTokens),
-		cacheCreationTokens:  copyTokenKeys(r.cacheCreationTokens),
-		cacheHitRate:         computeCacheHitRateLocked(r),
-		upstreamErrors:       copyErrorKeys(r.upstreamErrors),
+		requestCount:            copyRequestKeys(r.requestCount),
+		requestDurationSum:      copyFloatKeys(r.requestDurationSum),
+		requestDurationCount:    copyUintKeys(r.requestDurationCount),
+		inputTokens:             copyTokenKeys(r.inputTokens),
+		outputTokens:            copyTokenKeys(r.outputTokens),
+		cachedInputTokens:       copyTokenKeys(r.cachedInputTokens),
+		cacheCreationTokens:     copyTokenKeys(r.cacheCreationTokens),
+		cacheHitRate:            computeCacheHitRateLocked(r),
+		upstreamErrors:          copyErrorKeys(r.upstreamErrors),
+		clientRequests:          copyClientKeys(r.clientRequests),
+		clientInput:             copyClientKeys(r.clientInput),
+		clientOutput:            copyClientKeys(r.clientOutput),
+		clientTokens:            copyClientKeys(r.clientTokens),
+		usageWriteErr:           maps.Clone(r.usageWriteErr),
+		usageQueryErr:           r.usageQueryErr,
+		usageQueryDurationSum:   r.usageQueryDurationSum,
+		usageQueryDurationCount: r.usageQueryDurationCount,
+		usageRecovered:          r.usageRecovered,
+		usageCheckpointErr:      r.usageCheckpointErr,
+		usageHealthy:            r.usageHealthy,
 	}
 	r.mu.Unlock()
 
@@ -68,6 +79,32 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 		"Total upstream error responses, by provider and HTTP status code.",
 		snapshot.upstreamErrors, errorKeyLabels)
 
+	writeCounter(w, "ai_proxy_client_requests_total",
+		"Total completed client requests by configured API key ID.", snapshot.clientRequests, clientUsageKeyLabels)
+	writeCounter(w, "ai_proxy_client_input_tokens_total",
+		"Total input tokens by configured API key ID.", snapshot.clientInput, clientUsageKeyLabels)
+	writeCounter(w, "ai_proxy_client_output_tokens_total",
+		"Total output tokens by configured API key ID.", snapshot.clientOutput, clientUsageKeyLabels)
+	writeCounter(w, "ai_proxy_client_tokens_total",
+		"Total input plus output tokens by configured API key ID.", snapshot.clientTokens, clientUsageKeyLabels)
+	writeCounter(w, "ai_proxy_usage_store_write_errors_total",
+		"Total usage store write errors by phase.", snapshot.usageWriteErr, func(phase string) string { return formatLabels("phase", phase) })
+	emitType(w, "ai_proxy_usage_store_query_errors_total", "counter", "Total usage store query errors.")
+	_, _ = fmt.Fprintf(w, "ai_proxy_usage_store_query_errors_total %d\n", snapshot.usageQueryErr)
+	emitType(w, "ai_proxy_usage_store_query_duration_seconds", "summary", "Usage store query duration in seconds.")
+	_, _ = fmt.Fprintf(w, "ai_proxy_usage_store_query_duration_seconds_sum %s\n", formatFloat(snapshot.usageQueryDurationSum))
+	_, _ = fmt.Fprintf(w, "ai_proxy_usage_store_query_duration_seconds_count %d\n", snapshot.usageQueryDurationCount)
+	emitType(w, "ai_proxy_usage_store_recovered_events_total", "counter", "Total interrupted usage events recovered at startup.")
+	_, _ = fmt.Fprintf(w, "ai_proxy_usage_store_recovered_events_total %d\n", snapshot.usageRecovered)
+	emitType(w, "ai_proxy_usage_store_checkpoint_errors_total", "counter", "Total usage store checkpoint errors.")
+	_, _ = fmt.Fprintf(w, "ai_proxy_usage_store_checkpoint_errors_total %d\n", snapshot.usageCheckpointErr)
+	emitType(w, "ai_proxy_usage_store_healthy", "gauge", "Whether the usage store write/query path is healthy (1 healthy, 0 degraded).")
+	healthy := 0
+	if snapshot.usageHealthy {
+		healthy = 1
+	}
+	_, _ = fmt.Fprintf(w, "ai_proxy_usage_store_healthy %d\n", healthy)
+
 	writeSLOWebhookMetrics(w, r.SLO())
 
 	_, err := io.WriteString(w, "# EOF\n")
@@ -104,15 +141,26 @@ func writeSLOWebhookMetrics(w io.Writer, e *SLOEvaluator) {
 }
 
 type prometheusSnapshot struct {
-	requestCount         map[requestKey]uint64
-	requestDurationSum   map[requestKey]float64
-	requestDurationCount map[requestKey]uint64
-	inputTokens          map[tokenKey]uint64
-	outputTokens         map[tokenKey]uint64
-	cachedInputTokens    map[tokenKey]uint64
-	cacheCreationTokens  map[tokenKey]uint64
-	cacheHitRate         map[tokenKey]float64
-	upstreamErrors       map[errorKey]uint64
+	requestCount            map[requestKey]uint64
+	requestDurationSum      map[requestKey]float64
+	requestDurationCount    map[requestKey]uint64
+	inputTokens             map[tokenKey]uint64
+	outputTokens            map[tokenKey]uint64
+	cachedInputTokens       map[tokenKey]uint64
+	cacheCreationTokens     map[tokenKey]uint64
+	cacheHitRate            map[tokenKey]float64
+	upstreamErrors          map[errorKey]uint64
+	clientRequests          map[clientUsageKey]uint64
+	clientInput             map[clientUsageKey]uint64
+	clientOutput            map[clientUsageKey]uint64
+	clientTokens            map[clientUsageKey]uint64
+	usageWriteErr           map[string]uint64
+	usageQueryErr           uint64
+	usageQueryDurationSum   float64
+	usageQueryDurationCount uint64
+	usageRecovered          uint64
+	usageCheckpointErr      uint64
+	usageHealthy            bool
 }
 
 func computeCacheHitRateLocked(r *Registry) map[tokenKey]float64 {
@@ -187,6 +235,8 @@ func tokenKeyLabels(k tokenKey) string {
 func errorKeyLabels(k errorKey) string {
 	return formatLabels("provider", k.Provider, "status_code", k.StatusCode)
 }
+
+func clientUsageKeyLabels(k clientUsageKey) string { return formatLabels("api_key_id", string(k)) }
 
 func formatLabels(kv ...string) string {
 	if len(kv) == 0 {
@@ -291,6 +341,12 @@ func copyTokenKeys(src map[tokenKey]uint64) map[tokenKey]uint64 {
 
 func copyErrorKeys(src map[errorKey]uint64) map[errorKey]uint64 {
 	out := make(map[errorKey]uint64, len(src))
+	maps.Copy(out, src)
+	return out
+}
+
+func copyClientKeys(src map[clientUsageKey]uint64) map[clientUsageKey]uint64 {
+	out := make(map[clientUsageKey]uint64, len(src))
 	maps.Copy(out, src)
 	return out
 }

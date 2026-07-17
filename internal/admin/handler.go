@@ -15,6 +15,8 @@ import (
 	"sync"
 
 	"ai-proxy/internal/config"
+	"ai-proxy/internal/metrics"
+	"ai-proxy/internal/usage"
 	adminweb "ai-proxy/web"
 
 	"go.yaml.in/yaml/v4"
@@ -29,9 +31,11 @@ type RuntimeConfig interface {
 }
 
 type Handler struct {
-	configPath string
-	runtime    RuntimeConfig
-	updateMu   sync.Mutex
+	configPath      string
+	runtime         RuntimeConfig
+	usageStore      usage.Store
+	metricsRegistry *metrics.Registry
+	updateMu        sync.Mutex
 }
 
 type providerView struct {
@@ -65,6 +69,12 @@ func NewHandler(configPath string, runtime RuntimeConfig) *Handler {
 	return &Handler{configPath: configPath, runtime: runtime}
 }
 
+// WithMetrics 挂接 usage 查询的健康与错误观测；nil-safe，便于单测复用。
+func (h *Handler) WithMetrics(registry *metrics.Registry) *Handler {
+	h.metricsRegistry = registry
+	return h
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !isLoopbackRequest(r) {
 		http.Error(w, "admin access is loopback-only", http.StatusForbidden)
@@ -82,6 +92,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.updateProviders(w, r)
+	case strings.HasPrefix(r.URL.Path, "/admin/api/usage/"):
+		h.usageAPI(w, r)
 	default:
 		http.NotFound(w, r)
 	}

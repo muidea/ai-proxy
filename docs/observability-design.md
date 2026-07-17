@@ -16,7 +16,7 @@ Related:
 - [prd.md](../prd.md)
 - `internal/config/config.go`
 - `internal/archive/recorder.go`
-- `internal/stats/recorder.go`
+- `internal/usage/`（当前实现；本文其余 CSV 内容为历史记录）
 - `internal/proxy/handler.go`
 
 ## Purpose

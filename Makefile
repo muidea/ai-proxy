@@ -1,4 +1,4 @@
-.PHONY: help run build test fmt vet check clean
+.PHONY: help run build test fmt vet check release-package release clean
 
 BINARY ?= ai-proxy
 CMD ?= ./cmd/ai-proxy
@@ -13,6 +13,8 @@ help:
 	@printf '  %-10s %s\n' 'fmt' 'format Go source files'
 	@printf '  %-10s %s\n' 'vet' 'run go vet'
 	@printf '  %-10s %s\n' 'check' 'run fmt, vet, and test'
+	@printf '  %-10s %s\n' 'release-package' 'build a native release archive (VERSION=vX.Y.Z)'
+	@printf '  %-10s %s\n' 'release' 'run checks and optionally publish a native release (VERSION=vX.Y.Z PUBLISH=1)'
 	@printf '  %-10s %s\n' 'clean' 'remove build artifacts'
 
 run:
@@ -31,6 +33,14 @@ vet:
 	$(GO) vet ./...
 
 check: fmt vet test
+
+release-package:
+	@test -n "$(VERSION)" || (echo 'VERSION=vX.Y.Z is required' >&2; exit 2)
+	VERSION=$(VERSION) scripts/build-release.sh "$(VERSION)" dist
+
+release:
+	@test -n "$(VERSION)" || (echo 'VERSION=vX.Y.Z is required' >&2; exit 2)
+	VERSION=$(VERSION) PUBLISH=$(PUBLISH) scripts/release.sh "$(VERSION)"
 
 clean:
 	$(GO) clean

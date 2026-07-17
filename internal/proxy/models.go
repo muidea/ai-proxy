@@ -32,6 +32,7 @@ type ModelRecord struct {
 // RouteOwner 仅用于内部路由、归档与观测，不作为客户端发现接口的一部分。
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request, requestID string) {
 	start := time.Now()
+	round := archiveRoundFromContext(r.Context())
 	bodyBytes := []byte(nil)
 	if r.Body != nil && r.Method == http.MethodPost {
 		var err error
@@ -43,7 +44,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request, requestID
 				status = http.StatusRequestEntityTooLarge
 				code = ErrorCodeRequestTooLarge
 			}
-			writeClientProtocolError(w, status, clientProtocolFromRequest(r), APIError{
+			h.writeArchivedAPIError(w, round, r, start, "", "", false, status, APIError{
 				Code:           code,
 				Message:        err.Error(),
 				ClientProtocol: clientProtocolFromRequest(r),
@@ -56,16 +57,6 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request, requestID
 	if r.Body != nil {
 		_ = r.Body.Close()
 	}
-	round, err := h.startRound()
-	if err != nil {
-		writeClientProtocolError(w, http.StatusInternalServerError, clientProtocolFromRequest(r), APIError{
-			Code: ErrorCodeProxyInternalError, Message: "start interaction archive failed",
-			ClientProtocol: clientProtocolFromRequest(r),
-			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
-		})
-		return
-	}
-	round.SetRequestID(requestID)
 	if len(bodyBytes) > 0 {
 		if err := round.WriteRequest(bodyBytes); err != nil {
 			// best-effort

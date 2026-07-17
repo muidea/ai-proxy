@@ -13,6 +13,26 @@ type StatsJSON struct {
 	Cache         StatsCache                 `json:"cache"`
 	LatencyMS     map[string]quantileSummary `json:"latency_ms"`
 	Errors        StatsErrors                `json:"errors"`
+	Usage         StatsUsage                 `json:"usage"`
+}
+
+// StatsUsage 是从 DuckDB 初始化、并随成功 Complete 更新的 all-time 用量镜像。
+type StatsUsage struct {
+	Scope    string                      `json:"scope"`
+	Store    StatsUsageStore             `json:"store"`
+	ByAPIKey map[string]StatsUsageTotals `json:"by_api_key"`
+}
+
+type StatsUsageStore struct {
+	Engine  string `json:"engine"`
+	Healthy bool   `json:"healthy"`
+}
+
+type StatsUsageTotals struct {
+	Requests     int64 `json:"requests"`
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	TotalTokens  int64 `json:"total_tokens"`
 }
 
 // StatsRequests 汇总请求计数。
@@ -146,6 +166,23 @@ func buildStatsLocked(r *Registry) StatsJSON {
 	if !r.startedAt.IsZero() {
 		uptime = int64(time.Since(r.startedAt).Seconds())
 	}
+	usage := StatsUsage{Scope: "all_time", Store: StatsUsageStore{Engine: "duckdb", Healthy: r.usageHealthy}, ByAPIKey: map[string]StatsUsageTotals{}}
+	keys := map[clientUsageKey]struct{}{}
+	for key := range r.clientRequests {
+		keys[key] = struct{}{}
+	}
+	for key := range r.clientInput {
+		keys[key] = struct{}{}
+	}
+	for key := range r.clientOutput {
+		keys[key] = struct{}{}
+	}
+	for key := range r.clientTokens {
+		keys[key] = struct{}{}
+	}
+	for key := range keys {
+		usage.ByAPIKey[string(key)] = StatsUsageTotals{Requests: int64(r.clientRequests[key]), InputTokens: int64(r.clientInput[key]), OutputTokens: int64(r.clientOutput[key]), TotalTokens: int64(r.clientTokens[key])}
+	}
 
 	return StatsJSON{
 		UptimeSeconds: uptime,
@@ -153,6 +190,7 @@ func buildStatsLocked(r *Registry) StatsJSON {
 		Cache:         cache,
 		LatencyMS:     latency,
 		Errors:        errors,
+		Usage:         usage,
 	}
 }
 

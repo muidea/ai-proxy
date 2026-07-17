@@ -28,6 +28,7 @@ type Round struct {
 	Dir                string    `json:"dir"`
 	StartedAt          time.Time `json:"started_at"`
 	RequestID          string    `json:"request_id,omitempty"`
+	APIKeyID           string    `json:"api_key_id,omitempty"`
 	StablePrefixHash   string    `json:"stable_prefix_hash,omitempty"`
 	RequestFingerprint string    `json:"request_fingerprint,omitempty"`
 	// Transport plan fields (in-memory only; written into Metadata at finish).
@@ -37,6 +38,9 @@ type Round struct {
 	UpstreamProtocol string
 	UpstreamEndpoint string
 	ConversionMode   string
+	// UpstreamDuration 是本次上游 HTTP 请求（含首包探测）的耗时，仅供
+	// usage 结算使用；完整 metadata 当前仍保留总请求耗时。
+	UpstreamDuration time.Duration
 	recorder         *Recorder
 	written          map[string]struct{} // basename -> present
 }
@@ -67,6 +71,13 @@ func (r *Round) SetRequestID(id string) {
 	r.RequestID = id
 }
 
+func (r *Round) SetAPIKeyID(id string) {
+	if r == nil {
+		return
+	}
+	r.APIKeyID = id
+}
+
 func (r *Round) SetFingerprint(stableHash, fingerprint string) {
 	if r == nil {
 		return
@@ -88,13 +99,24 @@ func (r *Round) SetTransportPlan(operation, clientEndpoint, clientProtocol, upst
 	r.ConversionMode = conversionMode
 }
 
+func (r *Round) SetUpstreamDuration(duration time.Duration) {
+	if r == nil {
+		return
+	}
+	r.UpstreamDuration = duration
+}
+
 type Metadata struct {
 	ID         int       `json:"id"`
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at"`
 	RequestID  string    `json:"request_id,omitempty"`
-	Provider   string    `json:"provider"`
-	Model      string    `json:"model"`
+	// EventID 与 usage_events.event_id 对齐(通常等于 request_id)。
+	EventID string `json:"event_id,omitempty"`
+	// APIKeyID 为客户端身份稳定 ID;永不保存原始密钥。
+	APIKeyID string `json:"api_key_id,omitempty"`
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
 	// Operation / ClientEndpoint / Upstream* / ConversionMode 记录 TransportPlan 权威字段。
 	Operation              string `json:"operation,omitempty"`
 	ClientEndpoint         string `json:"client_endpoint,omitempty"`
@@ -108,7 +130,7 @@ type Metadata struct {
 	StablePrefixDriftCount int    `json:"stable_prefix_drift_count,omitempty"`
 	Stream                 bool   `json:"stream"`
 	HTTPStatus             int    `json:"http_status"`
-	// Outcome 与 CSV/Prometheus 对齐的业务结果枚举。
+	// Outcome 与 DuckDB/Prometheus 对齐的业务结果枚举。
 	Outcome                  string  `json:"outcome,omitempty"`
 	DurationMS               int64   `json:"duration_ms"`
 	InputTokens              int     `json:"input_tokens"`
@@ -285,6 +307,12 @@ func (r *Round) WriteMetadata(metadata Metadata) error {
 	metadata.StartedAt = r.StartedAt
 	if metadata.RequestID == "" {
 		metadata.RequestID = r.RequestID
+	}
+	if metadata.EventID == "" {
+		metadata.EventID = r.RequestID
+	}
+	if metadata.APIKeyID == "" {
+		metadata.APIKeyID = r.APIKeyID
 	}
 	if metadata.StablePrefixHash == "" {
 		metadata.StablePrefixHash = r.StablePrefixHash

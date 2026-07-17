@@ -6,6 +6,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,9 +26,6 @@ const (
 
 type Config struct {
 	ListenAddr string
-	// InboundAPIKey 是代理入站认证密钥。非 loopback 监听时必须配置;
-	// 客户端通过 Authorization: Bearer <key> 或 X-API-Key 提交。
-	InboundAPIKey string
 	// MaxRequestBodyBytes 限制入站请求体大小;<=0 时使用默认值。
 	MaxRequestBodyBytes int64
 	// MaxUpstreamResponseBytes 限制上游非流式响应读取上限;<=0 时使用默认值。
@@ -36,7 +36,6 @@ type Config struct {
 	MaxSSELineBytes int64
 	// ArchiveFullContent 为 false 时仅写元数据,不落盘完整请求/响应正文。
 	ArchiveFullContent   bool
-	UsageFile            string
 	InteractionDir       string
 	InteractionRetention int
 	DebugLog             bool
@@ -46,9 +45,34 @@ type Config struct {
 	MetricsRemoteAccess  bool
 	MetricsAllowedCIDRs  []string
 	SLO                  SLOConfig
-	Providers            map[string]Provider
+	// ClientAPIKeys 是客户端调用方识别与用量归属的唯一配置 authority。
+	// 可为空:未携带 Key 的请求归入内置 default 统计桶。
+	ClientAPIKeys map[string]ClientAPIKey
+	// UsageStore 描述进程内嵌 DuckDB 持久化统计存储。路径与资源参数变更需重启。
+	UsageStore UsageStoreConfig
+	Providers  map[string]Provider
 	// ModelCatalog 是全局模型元数据目录,供 GET /v1/models 使用;是请求路由与 /v1/models 的共同 authority。
 	ModelCatalog map[string]ModelInfo
+}
+
+// ClientAPIKey 描述一个客户端调用方密钥条目。
+// ID 规范化为小写;APIKey 可含 ${ENV} 展开结果;Enabled=false 时请求返回 401。
+type ClientAPIKey struct {
+	ID      string
+	APIKey  string
+	Enabled bool
+}
+
+// UsageStoreConfig 是 DuckDB usage 持久化配置。
+type UsageStoreConfig struct {
+	// Path 默认 usage.duckdb;必须为本地普通文件路径。
+	Path string
+	// MemoryLimit 默认 256MB;应用层解析后下发 SET memory_limit,禁止透传任意 SQL。
+	MemoryLimit string
+	// Threads 默认 2,最小 1。
+	Threads int
+	// QueryCacheSeconds 默认 15;0 关闭缓存。
+	QueryCacheSeconds int
 }
 
 // ModelInfo 描述客户端可查询的模型能力与确定路由(各 provider 共用同一目录)。
@@ -112,15 +136,21 @@ func Load(path string) (Config, error) {
 		MaxStreamBytes:           DefaultMaxStreamBytes,
 		MaxSSELineBytes:          DefaultMaxSSELineBytes,
 		ArchiveFullContent:       true,
-		UsageFile:                "usage.csv",
 		InteractionDir:           "interactions",
 		InteractionRetention:     500,
 		DebugLog:                 true,
 		LogFormat:                "json",
 		RequestTimeout:           5 * time.Minute,
 		StreamIdleTimeout:        5 * time.Minute,
-		Providers:                map[string]Provider{},
-		ModelCatalog:             map[string]ModelInfo{},
+		ClientAPIKeys:            map[string]ClientAPIKey{},
+		UsageStore: UsageStoreConfig{
+			Path:              "usage.duckdb",
+			MemoryLimit:       "256MB",
+			Threads:           2,
+			QueryCacheSeconds: 15,
+		},
+		Providers:    map[string]Provider{},
+		ModelCatalog: map[string]ModelInfo{},
 	}
 
 	path = ResolvePath(path)
@@ -166,6 +196,7 @@ func loadFile(path string, cfg *Config) error {
 	section := ""
 	providerName := ""
 	modelName := ""
+	clientKeyID := ""
 	lineNo := 0
 	for scanner.Scan() {
 		lineNo++
@@ -184,10 +215,11 @@ func loadFile(path string, cfg *Config) error {
 		switch {
 		case indent == 0 && !hasValue:
 			switch key {
-			case "server", "providers", "model_catalog":
+			case "server", "providers", "model_catalog", "client_api_keys", "usage_store":
 				section = key
 				providerName = ""
 				modelName = ""
+				clientKeyID = ""
 			default:
 				return fmt.Errorf("%s:%d: unknown section %q", path, lineNo, key)
 			}
@@ -195,18 +227,30 @@ func loadFile(path string, cfg *Config) error {
 			section = ""
 			providerName = ""
 			modelName = ""
+			clientKeyID = ""
 			setErr = setTopLevel(cfg, key, expand(value))
 		case section == "server" && indent >= 2:
 			setErr = setServer(cfg, key, expand(value))
+		case section == "usage_store" && indent >= 2:
+			setErr = setUsageStore(cfg, key, expand(value))
+		case section == "client_api_keys" && indent == 2 && !hasValue:
+			clientKeyID = key
+			providerName = ""
+			modelName = ""
+			ensureClientAPIKey(cfg, clientKeyID)
+		case section == "client_api_keys" && indent >= 4 && clientKeyID != "":
+			setErr = setClientAPIKey(cfg, clientKeyID, key, expand(value))
 		case section == "providers" && indent == 2 && !hasValue:
 			providerName = key
 			modelName = ""
+			clientKeyID = ""
 			ensureProvider(cfg, providerName)
 		case section == "providers" && indent >= 4 && providerName != "":
 			setErr = setProvider(cfg, providerName, key, expand(value))
 		case section == "model_catalog" && indent == 2 && !hasValue:
 			modelName = key
 			providerName = ""
+			clientKeyID = ""
 			ensureModelInfo(cfg, modelName)
 		case section == "model_catalog" && indent >= 4 && modelName != "":
 			setErr = setModelInfo(cfg, modelName, key, expand(value))
@@ -225,8 +269,10 @@ func loadFile(path string, cfg *Config) error {
 
 func setTopLevel(cfg *Config, key, value string) error {
 	switch key {
-	case "usage_file":
-		cfg.UsageFile = value
+	case "usage_file", "AI_PROXY_USAGE_FILE":
+		return fmt.Errorf("%s is not supported; use usage_store.path (DuckDB) as the only online usage authority", key)
+	case "inbound_api_key":
+		return fmt.Errorf("inbound_api_key is not supported; use client_api_keys for caller identity and usage attribution")
 	case "interaction_dir":
 		cfg.InteractionDir = value
 	case "interaction_retention":
@@ -247,8 +293,6 @@ func setTopLevel(cfg *Config, key, value string) error {
 		cfg.ListenAddr = addrFromPort(value)
 	case "listen_addr":
 		cfg.ListenAddr = value
-	case "inbound_api_key":
-		cfg.InboundAPIKey = value
 	case "max_request_body_bytes":
 		n, err := parseStrictPositiveInt64(value)
 		if err != nil {
@@ -330,6 +374,61 @@ func setTopLevel(cfg *Config, key, value string) error {
 	default:
 		return fmt.Errorf("unknown config key %q", key)
 	}
+	return nil
+}
+
+func setUsageStore(cfg *Config, key, value string) error {
+	switch key {
+	case "path":
+		cfg.UsageStore.Path = strings.TrimSpace(value)
+	case "memory_limit":
+		cfg.UsageStore.MemoryLimit = strings.TrimSpace(value)
+	case "threads":
+		n, err := parseStrictPositiveInt(value)
+		if err != nil {
+			return fmt.Errorf("usage_store.threads: %w", err)
+		}
+		cfg.UsageStore.Threads = n
+	case "query_cache_seconds":
+		n, err := parseStrictNonNegativeInt(value)
+		if err != nil {
+			return fmt.Errorf("usage_store.query_cache_seconds: %w", err)
+		}
+		cfg.UsageStore.QueryCacheSeconds = n
+	default:
+		return fmt.Errorf("usage_store: unknown key %q", key)
+	}
+	return nil
+}
+
+func ensureClientAPIKey(cfg *Config, id string) ClientAPIKey {
+	if cfg.ClientAPIKeys == nil {
+		cfg.ClientAPIKeys = map[string]ClientAPIKey{}
+	}
+	if existing, ok := cfg.ClientAPIKeys[id]; ok {
+		return existing
+	}
+	entry := ClientAPIKey{ID: id, Enabled: true}
+	cfg.ClientAPIKeys[id] = entry
+	return entry
+}
+
+func setClientAPIKey(cfg *Config, id, key, value string) error {
+	entry := ensureClientAPIKey(cfg, id)
+	switch key {
+	case "api_key":
+		entry.APIKey = value
+	case "enabled":
+		b, err := parseStrictBool(value)
+		if err != nil {
+			return fmt.Errorf("client_api_keys.%s.enabled: %w", id, err)
+		}
+		entry.Enabled = b
+	default:
+		return fmt.Errorf("client_api_keys.%s: unknown key %q", id, key)
+	}
+	entry.ID = id
+	cfg.ClientAPIKeys[id] = entry
 	return nil
 }
 
@@ -436,8 +535,11 @@ func applyEnv(cfg *Config) error {
 	if value := os.Getenv("AI_PROXY_PORT"); value != "" {
 		cfg.ListenAddr = addrFromPort(value)
 	}
-	if value := os.Getenv("AI_PROXY_INBOUND_API_KEY"); value != "" {
-		cfg.InboundAPIKey = value
+	if os.Getenv("AI_PROXY_INBOUND_API_KEY") != "" {
+		return fmt.Errorf("AI_PROXY_INBOUND_API_KEY is not supported; configure client_api_keys instead")
+	}
+	if os.Getenv("AI_PROXY_USAGE_FILE") != "" {
+		return fmt.Errorf("AI_PROXY_USAGE_FILE is not supported; configure usage_store.path (DuckDB) instead")
 	}
 	if value := os.Getenv("AI_PROXY_MAX_REQUEST_BODY_BYTES"); value != "" {
 		n, err := parseStrictPositiveInt64(value)
@@ -474,8 +576,8 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.ArchiveFullContent = b
 	}
-	if value := os.Getenv("AI_PROXY_USAGE_FILE"); value != "" {
-		cfg.UsageFile = value
+	if value := os.Getenv("AI_PROXY_USAGE_STORE_PATH"); value != "" {
+		cfg.UsageStore.Path = value
 	}
 	if value := os.Getenv("AI_PROXY_INTERACTION_DIR"); value != "" {
 		cfg.InteractionDir = value
@@ -540,7 +642,6 @@ func ensureProviderNames(cfg *Config) {
 
 func normalize(cfg *Config) error {
 	cfg.LogFormat = normalizeLogFormat(cfg.LogFormat)
-	cfg.InboundAPIKey = strings.TrimSpace(cfg.InboundAPIKey)
 	if cfg.MaxRequestBodyBytes <= 0 {
 		cfg.MaxRequestBodyBytes = DefaultMaxRequestBodyBytes
 	}
@@ -552,6 +653,12 @@ func normalize(cfg *Config) error {
 	}
 	if cfg.MaxSSELineBytes <= 0 {
 		cfg.MaxSSELineBytes = DefaultMaxSSELineBytes
+	}
+	if err := normalizeUsageStore(&cfg.UsageStore); err != nil {
+		return err
+	}
+	if err := normalizeClientAPIKeys(cfg); err != nil {
+		return err
 	}
 	normalized := make(map[string]Provider, len(cfg.Providers))
 	for name, provider := range cfg.Providers {
@@ -646,7 +753,12 @@ func validate(cfg Config) error {
 	if !hasEnabledProvider(cfg.Providers) {
 		return fmt.Errorf("no enabled providers configured")
 	}
-	if err := validateListenAndAuth(cfg); err != nil {
+	// client_api_keys 是归属机制而非强制登录;非 loopback 监听不再要求 inbound key。
+	// 生产环境需由防火墙/反代等独立接入层保护(见闭包方案 §7.5)。
+	if err := validateClientAPIKeys(cfg); err != nil {
+		return err
+	}
+	if err := validateUsageStore(cfg.UsageStore); err != nil {
 		return err
 	}
 	if err := validateProviders(cfg); err != nil {
@@ -660,17 +772,6 @@ func validate(cfg Config) error {
 	}
 	if err := validateMetricsCIDRs(cfg.MetricsAllowedCIDRs); err != nil {
 		return err
-	}
-	return nil
-}
-
-// validateListenAndAuth:非 loopback 监听时必须配置入站 API Key。
-func validateListenAndAuth(cfg Config) error {
-	if IsLoopbackListenAddr(cfg.ListenAddr) {
-		return nil
-	}
-	if strings.TrimSpace(cfg.InboundAPIKey) == "" {
-		return fmt.Errorf("listen_addr %q is not loopback; set inbound_api_key (or AI_PROXY_INBOUND_API_KEY) to require client auth", cfg.ListenAddr)
 	}
 	return nil
 }
@@ -888,7 +989,7 @@ func expand(value string) string {
 }
 
 // addrFromPort 将纯端口转为 loopback 地址,避免 AI_PROXY_PORT=8080 变成 :8080(全网卡)。
-// 若传入已是 host:port 或 :port,则保留原语义(:port 仍表示全网卡,需配 inbound_api_key)。
+// 若传入已是 host:port 或 :port,则保留原语义(:port 仍表示全网卡，调用方访问控制由网络层负责)。
 func addrFromPort(port string) string {
 	port = strings.TrimSpace(port)
 	if port == "" {
@@ -1419,4 +1520,223 @@ func CatalogModelsSorted(catalog map[string]ModelInfo) []ModelInfo {
 		return items[i].ID < items[j].ID
 	})
 	return items
+}
+
+// clientAPIKeyIDPattern: [a-z0-9][a-z0-9._-]{0,63}
+var clientAPIKeyIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+
+// BuiltinDefaultAPIKeyID 是未携带客户端 Key 时的内置统计 ID,配置中禁止声明。
+const BuiltinDefaultAPIKeyID = "default"
+
+const (
+	defaultUsageStorePath              = "usage.duckdb"
+	defaultUsageStoreMemoryLimit       = "256MB"
+	defaultUsageStoreThreads           = 2
+	defaultUsageStoreQueryCacheSeconds = 15
+	maxUsageStoreThreads               = 32
+	maxUsageStoreQueryCacheSeconds     = 3600
+	maxUsageStoreMemoryBytes           = 16 << 30 // 16GiB 上限
+	minUsageStoreMemoryBytes           = 32 << 20 // 32MiB 下限
+)
+
+func normalizeUsageStore(us *UsageStoreConfig) error {
+	if us == nil {
+		return fmt.Errorf("usage_store is nil")
+	}
+	if strings.TrimSpace(us.Path) == "" {
+		us.Path = defaultUsageStorePath
+	}
+	us.Path = strings.TrimSpace(us.Path)
+	if strings.TrimSpace(us.MemoryLimit) == "" {
+		us.MemoryLimit = defaultUsageStoreMemoryLimit
+	}
+	us.MemoryLimit = strings.TrimSpace(us.MemoryLimit)
+	if us.Threads <= 0 {
+		us.Threads = defaultUsageStoreThreads
+	}
+	maxThreads := runtime.NumCPU()
+	if maxThreads < 1 {
+		maxThreads = 1
+	}
+	if maxThreads > maxUsageStoreThreads {
+		maxThreads = maxUsageStoreThreads
+	}
+	if us.Threads > maxThreads {
+		us.Threads = maxThreads
+	}
+	if us.QueryCacheSeconds < 0 {
+		us.QueryCacheSeconds = defaultUsageStoreQueryCacheSeconds
+	}
+	// QueryCacheSeconds==0 表示关闭缓存,合法。
+	return nil
+}
+
+func normalizeClientAPIKeys(cfg *Config) error {
+	if cfg.ClientAPIKeys == nil {
+		cfg.ClientAPIKeys = map[string]ClientAPIKey{}
+		return nil
+	}
+	normalized := make(map[string]ClientAPIKey, len(cfg.ClientAPIKeys))
+	for rawID, entry := range cfg.ClientAPIKeys {
+		id := strings.ToLower(strings.TrimSpace(entry.ID))
+		if id == "" {
+			id = strings.ToLower(strings.TrimSpace(rawID))
+		}
+		if id == "" {
+			return fmt.Errorf("client_api_keys: empty id")
+		}
+		if id == BuiltinDefaultAPIKeyID {
+			return fmt.Errorf("client_api_keys: %q is a reserved builtin id", BuiltinDefaultAPIKeyID)
+		}
+		if !clientAPIKeyIDPattern.MatchString(id) {
+			return fmt.Errorf("client_api_keys: invalid id %q (must match [a-z0-9][a-z0-9._-]{0,63})", id)
+		}
+		if existing, ok := normalized[id]; ok {
+			return fmt.Errorf("client_api_keys: duplicate id after case fold: %q and %q", existing.ID, rawID)
+		}
+		entry.ID = id
+		entry.APIKey = strings.TrimSpace(entry.APIKey)
+		normalized[id] = entry
+	}
+	cfg.ClientAPIKeys = normalized
+	return nil
+}
+
+func validateClientAPIKeys(cfg Config) error {
+	// 用展开后密钥做唯一性检查;错误信息不得包含密钥明文。
+	seenSecrets := make(map[string]string, len(cfg.ClientAPIKeys)) // secret -> id
+	for id, entry := range cfg.ClientAPIKeys {
+		if id == BuiltinDefaultAPIKeyID {
+			return fmt.Errorf("client_api_keys: %q is a reserved builtin id", BuiltinDefaultAPIKeyID)
+		}
+		if !clientAPIKeyIDPattern.MatchString(id) {
+			return fmt.Errorf("client_api_keys: invalid id %q", id)
+		}
+		if entry.Enabled && entry.APIKey == "" {
+			return fmt.Errorf("client_api_keys.%s: api_key is required when enabled", id)
+		}
+		if entry.APIKey == "" {
+			continue
+		}
+		if prev, ok := seenSecrets[entry.APIKey]; ok {
+			return fmt.Errorf("client_api_keys: duplicate api_key shared by %q and %q", prev, id)
+		}
+		seenSecrets[entry.APIKey] = id
+	}
+	return nil
+}
+
+func validateUsageStore(us UsageStoreConfig) error {
+	path := strings.TrimSpace(us.Path)
+	if path == "" {
+		return fmt.Errorf("usage_store.path is required")
+	}
+	if filepath.IsAbs(path) {
+		// ok
+	}
+	// 禁止明显的非本地路径语义(http/sql 等)。
+	lower := strings.ToLower(path)
+	if strings.Contains(lower, "://") {
+		return fmt.Errorf("usage_store.path must be a local file path")
+	}
+	parent := filepath.Dir(path)
+	if parent != "" && parent != "." {
+		// 父目录在启动时创建;此处仅校验不指向明显错误。
+		if info, err := os.Stat(parent); err == nil && !info.IsDir() {
+			return fmt.Errorf("usage_store.path parent %q is not a directory", parent)
+		}
+	}
+	if _, err := parseMemoryLimitBytes(us.MemoryLimit); err != nil {
+		return fmt.Errorf("usage_store.memory_limit: %w", err)
+	}
+	if us.Threads < 1 {
+		return fmt.Errorf("usage_store.threads must be >= 1")
+	}
+	maxThreads := runtime.NumCPU()
+	if maxThreads < 1 {
+		maxThreads = 1
+	}
+	if maxThreads > maxUsageStoreThreads {
+		maxThreads = maxUsageStoreThreads
+	}
+	if us.Threads > maxThreads {
+		return fmt.Errorf("usage_store.threads %d exceeds limit %d", us.Threads, maxThreads)
+	}
+	if us.QueryCacheSeconds < 0 || us.QueryCacheSeconds > maxUsageStoreQueryCacheSeconds {
+		return fmt.Errorf("usage_store.query_cache_seconds must be between 0 and %d", maxUsageStoreQueryCacheSeconds)
+	}
+	return nil
+}
+
+// parseMemoryLimitBytes 解析形如 256MB / 1GB / 512MiB 的内存上限,并施加上下限。
+// 只接受受控后缀,禁止透传任意 SQL 字符串。
+func parseMemoryLimitBytes(raw string) (int64, error) {
+	s := strings.TrimSpace(strings.ToUpper(raw))
+	if s == "" {
+		return 0, fmt.Errorf("empty")
+	}
+	type unit struct {
+		suffix string
+		mult   int64
+	}
+	units := []unit{
+		{"GIB", 1 << 30},
+		{"GB", 1000 * 1000 * 1000},
+		{"MIB", 1 << 20},
+		{"MB", 1000 * 1000},
+		{"KIB", 1 << 10},
+		{"KB", 1000},
+		{"B", 1},
+	}
+	var mult int64 = 1
+	for _, u := range units {
+		if strings.HasSuffix(s, u.suffix) {
+			s = strings.TrimSpace(s[:len(s)-len(u.suffix)])
+			mult = u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid memory_limit %q", raw)
+	}
+	bytes := n * mult
+	if bytes < minUsageStoreMemoryBytes {
+		return 0, fmt.Errorf("memory_limit too small (min 32MB)")
+	}
+	if bytes > maxUsageStoreMemoryBytes {
+		return 0, fmt.Errorf("memory_limit too large (max 16GB)")
+	}
+	return bytes, nil
+}
+
+// ClientAPIKeyEntries 返回稳定排序的客户端 Key 条目,供 clientauth 索引构建。
+func ClientAPIKeyEntries(cfg Config) []ClientAPIKey {
+	if len(cfg.ClientAPIKeys) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(cfg.ClientAPIKeys))
+	for id := range cfg.ClientAPIKeys {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]ClientAPIKey, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, cfg.ClientAPIKeys[id])
+	}
+	return out
+}
+
+// UsageStoreMemoryLimitSQL 返回可安全用于 SET memory_limit 的字面量(已校验)。
+func UsageStoreMemoryLimitSQL(us UsageStoreConfig) (string, error) {
+	bytes, err := parseMemoryLimitBytes(us.MemoryLimit)
+	if err != nil {
+		return "", err
+	}
+	// DuckDB 接受 '256MB' 形式;统一用 MB 整数避免浮点。
+	mb := bytes / (1000 * 1000)
+	if mb < 1 {
+		mb = 1
+	}
+	return fmt.Sprintf("%dMB", mb), nil
 }

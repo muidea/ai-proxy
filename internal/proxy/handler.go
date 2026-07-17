@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,19 +20,45 @@ import (
 	"time"
 
 	"ai-proxy/internal/archive"
+	"ai-proxy/internal/clientauth"
 	"ai-proxy/internal/config"
 	"ai-proxy/internal/metrics"
-	"ai-proxy/internal/stats"
+	"ai-proxy/internal/usage"
 )
 
 type Handler struct {
 	cfgMu               sync.RWMutex
 	cfg                 config.Config
-	recorder            stats.Recorder
+	clientKeyIndex      atomic.Pointer[clientauth.Index]
+	usageStore          usage.Store
 	interactionRecorder *archive.Recorder
 	metricsRegistry     *metrics.Registry
 	driftTracker        *FingerprintDriftTracker
 	client              *http.Client
+}
+
+type archiveRoundKey struct{}
+
+type usageCompletionKey struct{}
+
+type usageCompletion struct{ done atomic.Bool }
+
+func withArchiveRound(ctx context.Context, round *archive.Round) context.Context {
+	return context.WithValue(ctx, archiveRoundKey{}, round)
+}
+
+func archiveRoundFromContext(ctx context.Context) *archive.Round {
+	round, _ := ctx.Value(archiveRoundKey{}).(*archive.Round)
+	return round
+}
+
+func withUsageCompletion(ctx context.Context, completion *usageCompletion) context.Context {
+	return context.WithValue(ctx, usageCompletionKey{}, completion)
+}
+
+func usageCompletionFromContext(ctx context.Context) *usageCompletion {
+	completion, _ := ctx.Value(usageCompletionKey{}).(*usageCompletion)
+	return completion
 }
 
 // ConfigSnapshot 返回当前生效配置的独立快照，避免管理接口读取切片或 map 时
@@ -54,34 +79,53 @@ func (h *Handler) ConfigSnapshot() config.Config {
 		info.Operations = append([]string(nil), info.Operations...)
 		cfg.ModelCatalog[id] = info
 	}
+	cfg.ClientAPIKeys = make(map[string]config.ClientAPIKey, len(h.cfg.ClientAPIKeys))
+	for id, key := range h.cfg.ClientAPIKeys {
+		cfg.ClientAPIKeys[id] = key
+	}
 	return cfg
 }
 
 // UpdateConfig 在完整请求边界之间原子切换运行时配置。
 // 已进入代理处理的请求继续使用旧配置，新请求使用新配置。
+// client_api_keys 可热更新(重建身份索引);usage_store 路径不热切换。
 func (h *Handler) UpdateConfig(cfg config.Config) error {
 	if err := requireResolvedConfig(cfg); err != nil {
 		return err
 	}
+	idx := buildClientKeyIndex(cfg)
 	h.cfgMu.Lock()
 	defer h.cfgMu.Unlock()
 	h.cfg = cfg
+	h.clientKeyIndex.Store(idx)
 	h.client = newHTTPClient(cfg.RequestTimeout)
 	return nil
 }
 
-func NewHandler(cfg config.Config, recorder stats.Recorder, interactionRecorder *archive.Recorder, metricsRegistry *metrics.Registry) *Handler {
+// NewHandler 装配代理处理器。usageStore 可为 nil(仅健康检查/测试),业务请求 Start 将失败。
+func NewHandler(cfg config.Config, usageStore usage.Store, interactionRecorder *archive.Recorder, metricsRegistry *metrics.Registry) *Handler {
 	if err := requireResolvedConfig(cfg); err != nil {
 		panic("proxy.NewHandler: " + err.Error() + "; call config.Load or tests.MustHandlerConfig")
 	}
-	return &Handler{
+	h := &Handler{
 		cfg:                 cfg,
-		recorder:            recorder,
+		usageStore:          usageStore,
 		interactionRecorder: interactionRecorder,
 		metricsRegistry:     metricsRegistry,
 		driftTracker:        NewFingerprintDriftTracker(2),
 		client:              newHTTPClient(cfg.RequestTimeout),
 	}
+	h.clientKeyIndex.Store(buildClientKeyIndex(cfg))
+	return h
+}
+
+func buildClientKeyIndex(cfg config.Config) *clientauth.Index {
+	entries := config.ClientAPIKeyEntries(cfg)
+	keys := make([]clientauth.KeyEntry, 0, len(entries))
+	for _, e := range entries {
+		keys = append(keys, clientauth.KeyEntry{ID: e.ID, APIKey: e.APIKey, Enabled: e.Enabled})
+	}
+	return clientauth.BuildIndex(keys)
 }
 
 // requireResolvedConfig 要求 Config 已通过 config.Load 的 authority 合同。
@@ -235,17 +279,53 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// 入站认证:配置了 InboundAPIKey 时,所有 /v1/* 代理入口均需校验。
-	if !h.authorizeInbound(r) {
+	// 客户端身份解析:未携带 Key → default;未知/禁用/冲突 → 401(不计 usage)。
+	identity, err := clientauth.ResolveHeaders(r.Header, h.clientKeyIndex.Load())
+	if err != nil {
 		writeClientProtocolError(w, http.StatusUnauthorized, clientProtocolFromRequest(r), APIError{
 			Code:           ErrorCodeAuthenticationFailed,
-			Message:        "missing or invalid inbound api key",
+			Message:        "missing or invalid client api key",
 			ClientProtocol: clientProtocolFromRequest(r),
 			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path),
 			Operation:      OperationForPath(r.URL.Path),
 		})
 		return
 	}
+	r = r.WithContext(clientauth.WithClientIdentity(r.Context(), identity))
+
+	// round 与 event 在读取 body / 访问上游前建立。event ID 不复用客户端可控的
+	// X-Request-ID；round_id 用于将 usage_events 和本地归档精确关联。
+	round, err := h.startRound()
+	if err != nil {
+		writeClientProtocolError(w, http.StatusInternalServerError, clientProtocolFromRequest(r), APIError{
+			Code: ErrorCodeProxyInternalError, Message: "start interaction archive failed",
+			ClientProtocol: clientProtocolFromRequest(r), ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
+		})
+		return
+	}
+	if round != nil {
+		round.SetRequestID(requestID)
+		round.SetAPIKeyID(identity.KeyID)
+		defer round.Abort()
+	}
+	r = r.WithContext(withArchiveRound(r.Context(), round))
+	eventID := newRequestID()
+	if eventID == "" {
+		writeClientProtocolError(w, http.StatusServiceUnavailable, clientProtocolFromRequest(r), APIError{
+			Code: ErrorCodeUsageStoreUnavailable, Message: "usage store unavailable",
+			ClientProtocol: clientProtocolFromRequest(r), ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
+		})
+		return
+	}
+	r = r.WithContext(withUsageCompletion(withUsageEventID(r.Context(), eventID), &usageCompletion{}))
+
+	// 在读取 body / 访问上游前持久化 started;失败则 503。
+	if !h.beginUsage(w, r, eventID, round) {
+		return
+	}
+	// 所有已 Start 的请求都有兜底 Complete，处理器内的正常路径会先完成它。
+	defer h.completePendingUsage(r, round)
+
 	switch {
 	case r.URL.Path == "/v1/chat/completions" && r.Method == http.MethodPost:
 		h.handleChatCompletions(w, r, requestID)
@@ -259,27 +339,140 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// authorizeInbound 校验入站 API Key。
-// 未配置 InboundAPIKey 时放行(仅 loopback 监听时允许此状态,由 config 校验保证)。
-// 客户端可通过 Authorization: Bearer <key> 或 X-API-Key 提交。
-func (h *Handler) authorizeInbound(r *http.Request) bool {
-	expected := strings.TrimSpace(h.cfg.InboundAPIKey)
-	if expected == "" {
-		return true
-	}
-	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
-		return subtle.ConstantTimeCompare([]byte(key), []byte(expected)) == 1
-	}
-	auth := strings.TrimSpace(r.Header.Get("Authorization"))
-	if auth == "" {
+// beginUsage 同步写入 usage started event。失败时写 503 并返回 false。
+// 注意:round 在各 handler 内创建;此处先用 round_id=0 登记,Complete 时不依赖 round。
+func (h *Handler) beginUsage(w http.ResponseWriter, r *http.Request, eventID string, round *archive.Round) bool {
+	if h.usageStore == nil {
+		writeClientProtocolError(w, http.StatusServiceUnavailable, clientProtocolFromRequest(r), APIError{
+			Code:           ErrorCodeUsageStoreUnavailable,
+			Message:        "usage store unavailable",
+			ClientProtocol: clientProtocolFromRequest(r),
+			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path),
+			Operation:      OperationForPath(r.URL.Path),
+		})
 		return false
 	}
-	const bearer = "Bearer "
-	if len(auth) > len(bearer) && strings.EqualFold(auth[:len(bearer)], bearer) {
-		token := strings.TrimSpace(auth[len(bearer):])
-		return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
+	identity := clientauth.ClientIdentityFromContext(r.Context())
+	path := NormalizeClientEndpoint(r.URL.Path)
+	rec := usage.StartRecord{
+		EventID:        eventID,
+		StartedAt:      time.Now().UTC(),
+		APIKeyID:       identity.KeyID,
+		Operation:      OperationForPath(path),
+		Route:          RouteLabel(r),
+		ClientEndpoint: path,
+		ClientProtocol: ClientProtocolForPath(path),
 	}
-	return false
+	if round != nil {
+		rec.RoundID = int64(round.ID)
+	}
+	if err := h.usageStore.Start(r.Context(), rec); err != nil {
+		if h.metricsRegistry != nil {
+			h.metricsRegistry.RecordUsageStoreWriteError("start")
+		}
+		writeClientProtocolError(w, http.StatusServiceUnavailable, clientProtocolFromRequest(r), APIError{
+			Code:           ErrorCodeUsageStoreUnavailable,
+			Message:        "usage store unavailable",
+			ClientProtocol: clientProtocolFromRequest(r),
+			ClientEndpoint: path,
+			Operation:      rec.Operation,
+		})
+		return false
+	}
+	if h.metricsRegistry != nil {
+		h.metricsRegistry.SetUsageStoreHealthy(h.usageStore.Healthy())
+	}
+	return true
+}
+
+// completePendingUsage 仅在处理器漏掉结算（如未来新增的早退路径）时执行。
+// 已完成 event 的条件更新会返回 ErrEventNotStarted，因此不会产生重复入账。
+func (h *Handler) completePendingUsage(r *http.Request, round *archive.Round) {
+	if completion := usageCompletionFromContext(r.Context()); completion != nil && completion.done.Load() {
+		return
+	}
+	eventID := usageEventIDFromContext(r.Context())
+	if eventID == "" || h.usageStore == nil {
+		return
+	}
+	startedAt := time.Now()
+	upstreamDuration := time.Duration(0)
+	if round != nil {
+		if !round.StartedAt.IsZero() {
+			startedAt = round.StartedAt
+		}
+		upstreamDuration = round.UpstreamDuration
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := h.usageStore.Complete(ctx, usage.CompleteRecord{
+		EventID: eventID, CompletedAt: time.Now().UTC(), HTTPStatus: http.StatusInternalServerError,
+		Outcome: "error", ErrorCode: ErrorCodeProxyInternalError,
+		Duration: time.Since(startedAt), UpstreamDuration: upstreamDuration,
+	})
+	if err == nil && h.metricsRegistry != nil {
+		h.metricsRegistry.RecordClientUsage(clientauth.ClientIdentityFromContext(r.Context()).KeyID, 0, 0)
+		h.metricsRegistry.SetUsageStoreHealthy(h.usageStore.Healthy())
+	}
+	if err != nil && !errors.Is(err, usage.ErrEventNotStarted) {
+		if h.metricsRegistry != nil {
+			h.metricsRegistry.RecordUsageStoreWriteError("complete")
+		}
+		slog.Error("usage store fallback complete failed", slog.String("event_id", eventID), slog.Any("error", err))
+	}
+}
+
+// completeUsage 结算已 Start 的 event;失败只记日志/降级,不改变已写出的 HTTP 响应。
+func (h *Handler) completeUsage(r *http.Request, requestID string, provider, model string, stream bool, status int, duration time.Duration, tok tokenUsage, outcome, errorCode string, round *archive.Round) bool {
+	if h.usageStore == nil || requestID == "" {
+		return false
+	}
+	if r != nil {
+		if completion := usageCompletionFromContext(r.Context()); completion != nil {
+			if !completion.done.CompareAndSwap(false, true) {
+				return false
+			}
+		}
+	}
+	rec := usage.CompleteRecord{
+		EventID:                  requestID,
+		CompletedAt:              time.Now().UTC(),
+		Provider:                 provider,
+		Model:                    model,
+		InputTokens:              int64(tok.PromptTokens),
+		OutputTokens:             int64(tok.CompletionTokens),
+		CachedInputTokens:        int64(tok.CachedInputTokens),
+		CacheCreationInputTokens: int64(tok.CacheCreationInputTokens),
+		HTTPStatus:               status,
+		Outcome:                  outcome,
+		ErrorCode:                errorCode,
+		Duration:                 duration,
+		Stream:                   stream,
+		Estimated:                tok.Estimated,
+	}
+	if round != nil {
+		rec.UpstreamProtocol = round.UpstreamProtocol
+		rec.UpstreamEndpoint = round.UpstreamEndpoint
+		rec.ConversionMode = round.ConversionMode
+		rec.UpstreamDuration = round.UpstreamDuration
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.usageStore.Complete(ctx, rec); err != nil {
+		if h.metricsRegistry != nil {
+			h.metricsRegistry.RecordUsageStoreWriteError("complete")
+		}
+		slog.Error("usage store complete failed",
+			slog.String("event_id", requestID),
+			slog.String("api_key_id", clientauth.ClientIdentityFromContext(r.Context()).KeyID),
+			slog.Any("error", err),
+		)
+		return false
+	}
+	if h.metricsRegistry != nil {
+		h.metricsRegistry.SetUsageStoreHealthy(h.usageStore.Healthy())
+	}
+	return true
 }
 
 func isRequestTooLarge(err error) bool {
@@ -380,6 +573,7 @@ func isSupportedInbound(method, path string) bool {
 
 func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, requestID string) {
 	start := time.Now()
+	round := archiveRoundFromContext(r.Context())
 	bodyBytes, err := h.readLimitedBody(w, r)
 	if err != nil {
 		status := http.StatusBadRequest
@@ -388,7 +582,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 			status = http.StatusRequestEntityTooLarge
 			code = ErrorCodeRequestTooLarge
 		}
-		writeClientProtocolError(w, status, clientProtocolFromRequest(r), APIError{
+		h.writeArchivedAPIError(w, round, r, start, "", "", false, status, APIError{
 			Code: code, Message: err.Error(), ClientProtocol: clientProtocolFromRequest(r),
 			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
 		})
@@ -396,20 +590,6 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	}
 	defer r.Body.Close()
 
-	round, err := h.startRound()
-	if err != nil {
-		writeClientProtocolError(w, http.StatusInternalServerError, clientProtocolFromRequest(r), APIError{
-			Code: ErrorCodeProxyInternalError, Message: "start interaction archive failed",
-			ClientProtocol: clientProtocolFromRequest(r),
-			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
-		})
-		return
-	}
-	if round != nil {
-		// panic 或遗漏路径也释放 active;WriteMetadata/Abort 幂等。
-		defer round.Abort()
-	}
-	round.SetRequestID(requestID)
 	if len(bodyBytes) > 0 {
 		stableHash, fingerprint := ComputeRequestFingerprint(bodyBytes)
 		round.SetFingerprint(stableHash, fingerprint)
@@ -586,6 +766,7 @@ func (h *Handler) writeArchivedAPIError(w http.ResponseWriter, round *archive.Ro
 
 func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID string) {
 	start := time.Now()
+	round := archiveRoundFromContext(r.Context())
 	body, err := h.readLimitedBody(w, r)
 	if err != nil {
 		status := http.StatusBadRequest
@@ -594,7 +775,7 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID s
 			status = http.StatusRequestEntityTooLarge
 			code = ErrorCodeRequestTooLarge
 		}
-		writeClientProtocolError(w, status, clientProtocolFromRequest(r), APIError{
+		h.writeArchivedAPIError(w, round, r, start, "", "", false, status, APIError{
 			Code: code, Message: err.Error(), ClientProtocol: clientProtocolFromRequest(r),
 			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
 		})
@@ -602,20 +783,6 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID s
 	}
 	defer r.Body.Close()
 	rawBody, rawModel, rawStream := parseRawRequestBody(body)
-	round, err := h.startRound()
-	if err != nil {
-		writeClientProtocolError(w, http.StatusInternalServerError, clientProtocolFromRequest(r), APIError{
-			Code: ErrorCodeProxyInternalError, Message: "start interaction archive failed",
-			ClientProtocol: clientProtocolFromRequest(r),
-			ClientEndpoint: NormalizeClientEndpoint(r.URL.Path), Operation: OperationForPath(r.URL.Path),
-		})
-		return
-	}
-	if round != nil {
-		// panic 或遗漏路径也释放 active;WriteMetadata/Abort 幂等。
-		defer round.Abort()
-	}
-	round.SetRequestID(requestID)
 	if err := round.WriteRequest(body); err != nil {
 		log.Printf("archive raw request: %v", err)
 	}
@@ -1060,6 +1227,9 @@ func (h *Handler) doUpstreamPath(r *http.Request, round *archive.Round, provider
 	upstreamStart := time.Now()
 	resp, err := h.client.Do(req)
 	duration := time.Since(upstreamStart)
+	if round != nil {
+		round.SetUpstreamDuration(duration)
+	}
 	h.archiveAndLogUpstreamResponse(round, r, providerName, provider, resp, duration, err)
 	if resp != nil && resp.StatusCode >= 400 {
 		h.metricsRegistry.RecordUpstreamError(providerName, resp.StatusCode)
@@ -1444,50 +1614,45 @@ func copyResponseHeader(dst, src http.Header) {
 	removeHopByHop(dst)
 }
 
-func (h *Handler) recordAndPrint(round *archive.Round, r *http.Request, provider, model string, stream bool, status int, duration time.Duration, usage tokenUsage, errMessage string) {
-	h.recordAndPrintFail(round, r, provider, model, stream, status, duration, usage, streamFailFromMessage(errMessage))
+func (h *Handler) recordAndPrint(round *archive.Round, r *http.Request, provider, model string, stream bool, status int, duration time.Duration, tok tokenUsage, errMessage string) {
+	h.recordAndPrintFail(round, r, provider, model, stream, status, duration, tok, streamFailFromMessage(errMessage))
 }
 
-func (h *Handler) recordAndPrintFail(round *archive.Round, r *http.Request, provider, model string, stream bool, status int, duration time.Duration, usage tokenUsage, fail *streamFail) {
+func (h *Handler) recordAndPrintFail(round *archive.Round, r *http.Request, provider, model string, stream bool, status int, duration time.Duration, tok tokenUsage, fail *streamFail) {
 	outcome := outcomeFromStreamFail(fail, status)
 	errMessage := ""
+	errorCode := ""
 	if fail != nil {
 		errMessage = fail.Error()
+		if fail.Kind != "" {
+			errorCode = string(fail.Kind)
+		}
 	}
-	record := stats.Record{
-		Time:                     time.Now(),
-		Provider:                 provider,
-		Model:                    model,
-		InputTokens:              usage.PromptTokens,
-		OutputTokens:             usage.CompletionTokens,
-		CachedInputTokens:        usage.CachedInputTokens,
-		CacheCreationInputTokens: usage.CacheCreationInputTokens,
-		CacheHitRate:             usage.CacheHitRate(),
-		Duration:                 duration,
-		Stream:                   stream,
-		Estimated:                usage.Estimated,
-		HTTPStatus:               status,
-		Outcome:                  outcome,
-	}
+	clientEndpoint, upstreamProtocol, upstreamEndpoint, conversionMode := "", "", "", ""
 	if round != nil {
-		record.Operation = round.Operation
-		record.ClientEndpoint = round.ClientEndpoint
-		record.UpstreamProtocol = round.UpstreamProtocol
-		record.UpstreamEndpoint = round.UpstreamEndpoint
-		record.ConversionMode = round.ConversionMode
+		clientEndpoint = round.ClientEndpoint
+		upstreamProtocol = round.UpstreamProtocol
+		upstreamEndpoint = round.UpstreamEndpoint
+		conversionMode = round.ConversionMode
 	}
-	if err := h.recorder.Append(record); err != nil {
-		log.Printf("append usage record: %v", err)
+	// 结算 DuckDB usage event(ServeHTTP 已 Start)。
+	eventID := ""
+	if r != nil {
+		eventID = usageEventIDFromContext(r.Context())
 	}
+	if h.completeUsage(r, eventID, provider, model, stream, status, duration, tok, outcome, errorCode, round) && h.metricsRegistry != nil && r != nil {
+		h.metricsRegistry.RecordClientUsage(clientauth.ClientIdentityFromContext(r.Context()).KeyID, tok.PromptTokens, tok.CompletionTokens)
+	}
+
 	route := RouteLabel(r)
 	h.metricsRegistry.RecordRequestPlan(provider, model, route, status, duration, outcome,
-		record.ClientEndpoint, record.UpstreamProtocol, record.UpstreamEndpoint, record.ConversionMode)
+		clientEndpoint, upstreamProtocol, upstreamEndpoint, conversionMode)
 	// 仅流式 midflight 上游读失败计入 provider 错误率,避免非流式状态码/本地错误重复计数。
 	if shouldCountUpstreamError(fail, stream) {
 		h.metricsRegistry.RecordUpstreamError(provider, -2) // -2 = stream_midflight
 	}
-	h.metricsRegistry.RecordTokens(provider, model, usage.PromptTokens, usage.CompletionTokens, usage.CachedInputTokens, usage.CacheCreationInputTokens)
-	h.printSummary(round, provider, model, stream, status, duration, usage, errMessage)
+	h.metricsRegistry.RecordTokens(provider, model, tok.PromptTokens, tok.CompletionTokens, tok.CachedInputTokens, tok.CacheCreationInputTokens)
+	h.printSummary(round, provider, model, stream, status, duration, tok, errMessage)
 }
 
 func (h *Handler) writeArchiveMetadata(round *archive.Round, provider, model string, stream bool, status int, duration time.Duration, usage tokenUsage, responsePath, message, fullResponsePath, outcome string) {
@@ -1527,6 +1692,9 @@ func (h *Handler) writeArchiveMetadata(round *archive.Round, provider, model str
 		Error:                    message,
 	}
 	if round != nil {
+		meta.RequestID = round.RequestID
+		meta.EventID = round.RequestID
+		meta.APIKeyID = round.APIKeyID
 		meta.Operation = round.Operation
 		meta.ClientEndpoint = round.ClientEndpoint
 		meta.ClientProtocol = round.ClientProtocol
