@@ -1,446 +1,52 @@
-## ai-proxy
-
-`usage_store.path`（默认 `usage.duckdb`）为**单进程本地 DuckDB 文件**（唯一在线用量 authority）：
-
-- 每个 ai-proxy 进程必须使用独立路径；
-- 多副本/多实例**不要**共享同一 DuckDB 文件；
-- 需要集中统计时请用 Prometheus `/metrics`、Admin 导出或外部采集。
-- 旧 `usage.csv` 可通过 `go run ./cmd/ai-proxy-usage-import` 一次性导入，不在启动时自动迁移。
-
-## SLO webhook
-
-可选配置 `slo_violation_webhook`：SLO **状态变化**时异步 POST JSON。
-
-载荷 `SLOWebhookPayload`：
-
-```json
-{
-  "at": "...",
-  "instance_id": "a1b2c3d4e5f607081122334455667788",
-  "seq": 1,
-  "entered": [{"provider":"openai","rule":"upstream_error_rate_max","generation":1,"event_id":"a1b2c3d4e5f607081122334455667788|openai|upstream_error_rate_max|1|entered", "...": "..."}],
-  "resolved": []
-}
-```
-
-- **仅状态变化通知**：持续违规不会每个巡检周期重复投递；恢复时发送 `resolved`
-- **评估层 vs 投递层**：`active` 只驱动本地 listener 一次；webhook 失败可延期重投，不重放 listener
-- **顺序与幂等（重启安全）**：
-  - `instance_id`：evaluator **启动时随机生成**，进程重启后变化；**仅在同一 instance 内**比较 `seq`
-  - `seq`：实际投递序号，本 instance 内每次（重）入队递增；对账后重投会 reseq
-  - 每条 violation 的 `event_id`：`instance|provider|rule|generation|state`，**单条状态变化幂等键**；对账裁剪 batch 后剩余条目 ID 不变
-  - 每条 violation 含 `generation`（生命周期代次）；重投前按 generation 对账
-  - **消费者应**：按 `event_id` 幂等去重；按 `(instance_id, seq)` 拒绝倒序（跨 instance 不要比较 seq）
-  - `CheckNow` 经互斥串行；单 worker 串行投递
-  - **listener 禁止重入** `CheckNow`（同步回调，重入会死锁）
-- 本地 listener：`entered` → WARN `slo violation`；`resolved` → INFO `slo recovered`
-- 有界队列（64）+ 单 worker；队列满时丢弃并计数
-- 单次超时 3s；网络/408/425/429/5xx 可重试（最多 3 次 attempt）；429 优先 `Retry-After`（秒或 HTTP-date，上限 30s）
-- 失败不在 worker 内长 sleep：写入 `undelivered`+`NextRetry`，下轮 `CheckNow` flush（上限 32 批）
-- 其他 4xx 视为永久失败；禁用自动重定向；失败写日志（host 脱敏）
-- **shutdown**：`Close()` 取消共享 context，中断在途 HTTP；剩余队列与 `undelivered` **计入** `dropped` 并清空（`queue_length=0`）
-- Prometheus（需挂接 evaluator，进程默认已挂）：
-  - `ai_proxy_slo_webhook_dropped_total`
-  - `ai_proxy_slo_webhook_queue_length`（内存队列 + undelivered）
-  - `ai_proxy_slo_webhook_requests_total{result="ok|error|non_2xx|canceled"}`
-
-## 请求 outcome 枚举
-
-流式首包 HTTP 200 后中途失败时，HTTP 状态无法改写；以 `outcome` 区分真实结果（CSV / Prometheus / metadata 一致）：
-
-| outcome | 含义 | 计入 upstream 错误率 |
-|---------|------|---------------------|
-| `success` | 正常完成 | 否 |
-| `client_canceled` | 客户端取消 | 否 |
-| `idle_timeout` | 流空闲超时 | 是 |
-| `limit_exceeded` | 本地体/流大小限制 | 否 |
-| `upstream_truncated` | 上游中途断流/无终止事件 | 是 |
-| `upstream_failed` | 上游显式失败（如 `response.failed`） | 是 |
-| `incomplete` | 上游未完成（如 `response.incomplete`） | 否 |
-| `client_write` | 写客户端失败 | 否 |
-| `conversion` | 协议转换不支持的能力 | 否 |
-| `protocol` | 上游 SSE/JSON 协议损坏 | 是 |
-| `error` | 其他错误（含非流式 4xx/5xx） | 否（非流式已按状态码计数） |
-
-Prometheus: `ai_proxy_requests_total{...,status,outcome}`；`/stats` 含 `requests.by_outcome`。
-
 # ai-proxy
 
-轻量级本地 LLM API 网关。客户端只访问统一标准入站 path（OpenAI 与 Anthropic），代理**仅按请求 `model`** 匹配上游 provider，并在需要时做基础协议转换。请求结束后把模型、耗时、token 用量和缓存命中统计写入 DuckDB `usage_events`，同时按轮次归档请求和响应内容。Web 管理端提供使用统计页签。
+轻量级本地 LLM API 网关。它提供 OpenAI 和 Anthropic 标准入站端点，严格按请求中的 exact `model` 路由到唯一上游 Provider；用量明细持久化至进程内嵌 DuckDB，并提供本地 Web 管理页。
 
-## 功能
+## 快速开始
 
-- 标准入站白名单：
-  - OpenAI：`POST /v1/chat/completions`、`/v1/responses`、`/v1/completions`、`/v1/embeddings`，以及 `GET/POST /v1/models`
-  - Anthropic：`POST /v1/messages`
-  - 其它 `/v1/*` 返回 404
-- **纯 model 路由**：请求期用 body 中的 exact `model` 查找 `model_catalog` 已解析的唯一 RouteOwner；provider `models` 只在启动期验证归属，不在请求期重新选 provider；已禁用 `X-AI-Provider`、`?provider=`、`provider/model` 前缀选择
-- **模型能力目录**：全局 `model_catalog` 配置上下文窗口与 `operations`；`GET /v1/models` 本地返回 `contextWindowTokens` / `maxOutputTokens` / `operations`（不透传上游）
-- 双向基础协议转换：
-  - OpenAI 客户端 → Anthropic 上游：`POST /v1/chat/completions` 命中 `protocol: anthropic` 时转换
-  - Anthropic 客户端 → OpenAI 上游：`POST /v1/messages` 命中 `protocol: openai` 时转换
-- 支持流式 SSE 转发，客户端可以边收边显示
-- 非流式/流式优先读取上游 `usage`；缺失时按字符数轻量估算
-- 记录缓存使用量和缓存命中率（OpenAI cached_tokens / Anthropic cache_*_input_tokens）
-- 上游 4xx/5xx 错误状态码和错误体透传
-- CSV 追加写入并发安全；每轮交互归档到 `interactions/{round_id}/`
-- 无 provider fallback：model 必须在 `model_catalog` 唯一路由，未匹配直接 typed 4xx
-
-## 配置
-
-复制示例配置：
+要求 Go 1.24+。先从示例创建配置，填入 Provider 和模型目录，再启动服务：
 
 ```bash
 cp config.example.yaml config.yaml
-```
-
-配置文件中的 `api_key` 等字段可用 `${ENV}` 展开，但 **provider 本身必须写在 config.yaml**：
-
-```bash
-export OPENAI_API_KEY=sk-...   # 供 config 中 ${OPENAI_API_KEY} 展开
-export AI_PROXY_LISTEN_ADDR=127.0.0.1:8080
-cp config.example.yaml config.yaml   # 编辑 providers / model_catalog / endpoint_capabilities
+export OPENAI_API_KEY=sk-... # 供 config.yaml 中的 ${OPENAI_API_KEY} 展开
 make run
 ```
 
-### Provider Web 管理页
+默认地址为 `http://127.0.0.1:8080`。启动后可访问：
 
-服务启动后，在本机访问 [http://127.0.0.1:8080/admin/](http://127.0.0.1:8080/admin/) 可查看和配置 Provider。
+- [Provider 管理与使用统计](http://127.0.0.1:8080/admin/)
+- `GET /healthz`
+- `GET /metrics`、`GET /stats`（默认仅 loopback）
 
-- 页面源码位于项目目录 `web/admin/`，使用轻量的 Ant Design 风格，不需要 Node.js 或额外前端构建链；Go 构建时会嵌入单个二进制。
-- 管理页和 `/admin/api/providers` 固定只允许 loopback 来源访问，即使代理监听在非 loopback 地址也不会开放远程管理。
-- API Key 只显示“已配置”状态，不会回显明文；不填写新值时会保留配置文件原有值，包括 `${ENV}` 表达式。
-- 保存前会执行与启动期相同的完整配置校验；成功后原子写回当前 `config.yaml`（或 `-config` / `AI_PROXY_CONFIG` 指定文件），并热更新当前实例。
-- Provider 修改不能破坏 `model_catalog` 的唯一 RouteOwner 合同；如有模型仍依赖被删除、禁用或改动后的 Provider，页面会显示校验错误且不会覆盖配置文件。
-
-常用环境变量：
-
-- `AI_PROXY_CONFIG`: 配置文件路径。
-- `AI_PROXY_LISTEN_ADDR`: 完整监听地址，例如 `127.0.0.1:8080`。
-- `AI_PROXY_PORT`: 仅修改端口，生成 `127.0.0.1:<port>`（不再绑定全部网卡；若需监听全网卡请显式设置 `AI_PROXY_LISTEN_ADDR=:8080`，并在网络层落实访问控制）。
-- `client_api_keys`（配置文件）: 多客户端 API Key 身份与用量归属。未携带 Key 归入内置 `default`；未知/禁用/冲突 Key 返回 401。**不再支持** `inbound_api_key` / `AI_PROXY_INBOUND_API_KEY`。
-  - 客户端 Key 是归属机制，不是强制登录；非 loopback 监听需由防火墙/反代等独立接入层保护。
-- `AI_PROXY_MAX_REQUEST_BODY_BYTES` / `AI_PROXY_MAX_UPSTREAM_RESPONSE_BYTES`: 请求体与上游响应大小上限。
-- `AI_PROXY_MAX_STREAM_BYTES` / `AI_PROXY_MAX_SSE_LINE_BYTES`: 流式累计输出与单条 SSE 行上限。
-- `AI_PROXY_ARCHIVE_FULL_CONTENT`: `true|false`，是否落盘完整请求/响应正文。
-- `AI_PROXY_USAGE_STORE_PATH`: DuckDB 用量库路径（也可用配置 `usage_store.path`）。**不再支持** `usage_file` / `AI_PROXY_USAGE_FILE`。
-- `AI_PROXY_INTERACTION_DIR`: 交互归档目录，默认 `interactions`。
-- `AI_PROXY_INTERACTION_RETENTION`: 保留的交互归档轮数，默认 `500`。
-- `AI_PROXY_DEBUG_LOG`: 是否输出调试日志，默认 `true`。
-- `AI_PROXY_LOG_FORMAT` / `LOG_FORMAT`: 日志格式，`json` 或 `text`；`text` 会按日志等级给 `level=` 字段着色。
-- `AI_PROXY_REQUEST_TIMEOUT_SECONDS`: 非流式请求总超时、流式请求等待上游响应头的超时时间，默认 `300`。
-- `AI_PROXY_STREAM_IDLE_TIMEOUT_SECONDS`: 流式响应读取空闲超时，默认 `300`；设为 `0` 可禁用。该值不是流式请求总时长限制，只在连续没有收到 SSE 数据时触发。
-- Provider **仅**通过 `config.yaml` 的 `providers` 声明；**不支持**通过 env 注入/创建 provider。
-- 配置值可用 `${ENV}` 展开（例如 `api_key: ${OPENAI_API_KEY}`），但 provider 条目本身必须写在配置文件中。
-- 每个 enabled provider 必须显式配置 `endpoint_capabilities`（不得从 protocol 推断）。
-- `AI_PROXY_METRICS_REMOTE_ACCESS`: 设为 `true` 开放 `/metrics` 与 `/stats` 端点的非 loopback 访问。
-- `AI_PROXY_METRICS_ALLOWED_CIDRS`: 逗号分隔的 CIDR 白名单(预留,P0 阶段未启用)。
-
-### Provider 路由（仅 model）
-
-客户端应发送**裸模型名**，例如：
-
-```json
-{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}
-```
-
-路由规则（两阶段权威）：
-
-1. **启动期 `ResolvedModelRoute`**：`config.Load` 为每个 catalog model 写入唯一 RouteOwner 与 operations
-2. **请求期 `TransportPlan`**：`ResolveTransportPlan(cfg, method, path, model)` 固定入站协议/path、上游协议/path 与转换模式
-3. 从 body 读取 exact `model`（与 catalog 展示 ID 原文匹配；**严格区分大小写**）
-4. 校验 model 存在、operation 已声明、RouteOwner 可用
-5. 按固定转发矩阵生成 TransportPlan；矩阵外组合 → `endpoint_unsupported`
-6. 转换模式先做 feature preflight；超出保证范围 → `conversion_unsupported`，**不访问上游**
-7. 仅请求 TransportPlan 中的唯一 RouteOwner；**无 provider fallback / default_provider**
-
-**已废弃（忽略）：** `X-AI-Provider` 头、`?provider=` 查询参数、`provider/model` 前缀。
-
-本地 typed error（访问上游前）：
-
-| HTTP | code | 含义 |
-|------|------|------|
-| 400 | `model_required` | body 缺少 model |
-| 400 | `model_not_found` | model 不在 catalog |
-| 400 | `operation_unsupported` | model 未声明该 operation |
-| 400 | `endpoint_unsupported` | 无法生成 TransportPlan |
-| 400 | `conversion_unsupported` | 转换 payload 超出最低保证 |
-| 401 | `authentication_failed` | 入站 API Key 缺失或无效 |
-| 500 | `route_contract_invalid` | 运行期 authority 不完整 |
-| 503 | `provider_unavailable` | RouteOwner 缺失/disabled |
-
-### 模型上下文查询（`GET /v1/models`）
-
-在配置中用**全局** `model_catalog` 登记具体模型能力（各 provider 共用）。`model_catalog` 是容量、operations 与确定路由的权威：
-- model id **严格区分大小写**且 exact 唯一（`DeepSeek-V4-Flash` 与 `deepseek-v4-flash` 是两个模型；仅完全相同 id 不得重复）
-- 每个 catalog model 必须**唯一匹配**一个 enabled provider，作为仅内部使用的 RouteOwner
-- `operations` **必填**，仅允许 `chat_completions` / `embeddings`（可多选，逗号分隔）
-- **operations 是执行合同**：请求在访问上游前按 exact model 与入站 path 对应 operation 校验
-
-配置示例：
-
-```yaml
-model_catalog:
-  gpt-4o:
-    context_window_tokens: 128000
-    max_output_tokens: 16384
-    operations: chat_completions
-  claude-sonnet-4-20250514:
-    context_window_tokens: 200000
-    max_output_tokens: 8192
-    operations: chat_completions
-  text-embedding-3-large:
-    context_window_tokens: 8192
-    max_output_tokens: 8191
-    operations: embeddings
-```
-
-`GET /v1/models`（`POST` 同样）由代理**本地合成** OpenAI-compatible 列表，不再转发上游。示例响应：
-
-```json
-{
-  "object": "list",
-  "data": [
-    {
-      "id": "gpt-4o",
-      "object": "model",
-      "contextWindowTokens": 128000,
-      "maxOutputTokens": 16384,
-      "operations": ["chat_completions"]
-    }
-  ]
-}
-```
-
-说明：
-
-- 仅 catalog 中登记的模型会出现在列表中；仅有 `gpt-*` 通配不会自动展开
-- RouteOwner 仅保留在内部路由、归档和受控观测中；`/v1/models` 不返回 provider 名称、base URL、认证信息或
-  其它内部路由细节
-- `contextWindowTokens` / `maxOutputTokens` 为扩展字段；值为 0 或未配置时省略
-- `operations` **始终输出**为非空数组；取值仅 `chat_completions` / `embeddings`
-- 请求前校验：model 必须在 catalog 中且声明了入站 path 对应 operation，否则返回 typed 400（`model_not_found` / `operation_unsupported` 等），**不访问上游**
-- path → operation：`/v1/chat/completions|/v1/messages|/v1/responses|/v1/completions` → `chat_completions`；`/v1/embeddings` → `embeddings`
-
-其它规则：
-
-- **不支持** `default_provider`；配置中声明将启动失败（路由仅使用 model_catalog RouteOwner）
-- `enabled: false` 的 provider 不参与 model 匹配
-- **不支持** `fallbacks`；配置中声明 `fallbacks` 将启动失败
-- TransportPlan 转发矩阵（`endpoint_capabilities` 只表示上游直连能力，不含转换派生 path）：
-  | Client Endpoint | Upstream Protocol | 要求的 direct capability | Upstream Endpoint | Mode |
-  |---|---|---|---|---|
-  | `/v1/chat/completions` | openai | `chat_completions` | `/v1/chat/completions` | native |
-  | `/v1/chat/completions` | anthropic | `messages` | `/v1/messages` | `openai_to_anthropic` |
-  | `/v1/messages` | anthropic | `messages` | `/v1/messages` | native |
-  | `/v1/messages` | openai | `chat_completions` | `/v1/chat/completions` | `anthropic_to_openai` |
-  | `/v1/responses` | openai | `responses` | `/v1/responses` | native |
-  | `/v1/completions` | openai | `completions` | `/v1/completions` | native |
-  | `/v1/embeddings` | openai | `embeddings` | `/v1/embeddings` | native |
-
-  转换仅保证基础文本（system/user/assistant、max_tokens/temperature/top_p/stop、非流式与基础 SSE）。tools、function calling、多模态、`response_format` 等在访问上游前返回 `conversion_unsupported`。responses/completions/embeddings **不允许**通过 chat/messages 转换获得。
-
-如果 `base_url` 已包含 `/v1`（含嵌套如 `.../codex/v1`），代理会避免重复拼接版本路径。
-
-上游错误：native 路径透传；转换模式保留上游 HTTP status，并输出客户端协议兼容的安全错误 envelope。DuckDB `usage_events` / `metadata.json` 记录 RouteOwner、client endpoint、upstream protocol/path 与 conversion mode。流式响应在写出首包 SSE 前会探测首字节以便识别断流，但**不会**切换其它 provider。
-
-Provider 与 model_catalog 示例（`models` 互不重叠；catalog model 必须唯一命中）：
-
-每个 enabled provider 都必须显式配置 `models`；ai-proxy 不按 provider 名称、protocol 或常见模型家族
-推导默认 pattern。`models` 只参与 catalog model 的 RouteOwner 解析，不会自动生成 catalog 条目。
-
-```yaml
-providers:
-  openai:
-    enabled: true
-    protocol: openai
-    base_url: https://primary.example/v1
-    api_key: ${OPENAI_API_KEY}
-    endpoint_capabilities: chat_completions, responses, completions, embeddings
-    models: gpt-*, chatgpt-*, o*, text-embedding-*
-  backup-openai:
-    enabled: true
-    protocol: openai
-    base_url: https://backup.example/v1
-    api_key: ${BACKUP_OPENAI_API_KEY}
-    endpoint_capabilities: chat_completions
-    models: backup-gpt-*
-  deepseek:
-    enabled: true
-    protocol: openai
-    base_url: https://api.deepseek.com
-    api_key: ${DEEPSEEK_API_KEY}
-    endpoint_capabilities: chat_completions
-    models: deepseek*
-  anthropic:
-    enabled: true
-    protocol: anthropic
-    base_url: https://api.anthropic.com
-    api_key: ${ANTHROPIC_API_KEY}
-    endpoint_capabilities: messages
-    models: claude*
-```
-
-## 运行
-
-```bash
-make run
-```
-
-也可以指定配置文件：
-
-```bash
-AI_PROXY_CONFIG=config.yaml make run
-```
-
-客户端接入：
+客户端使用裸模型名与标准地址：
 
 ```text
-# OpenAI-compatible 客户端
-API_BASE_URL=http://127.0.0.1:8080/v1
-
-# Anthropic 客户端
-ANTHROPIC_BASE_URL=http://127.0.0.1:8080
-# 或 ANTHROPIC_API_URL=http://127.0.0.1:8080
+OpenAI API base:    http://127.0.0.1:8080/v1
+Anthropic API base: http://127.0.0.1:8080
 ```
 
-只需发送裸模型名；代理按 `model_catalog` 已解析的唯一 RouteOwner 转发，必要时自动做 OpenAI ↔ Anthropic
-基础协议转换。provider `models` 仅用于启动期解析和验证该 RouteOwner。
+如配置了 `client_api_keys`，OpenAI 客户端通过 `Authorization: Bearer <key>`、Anthropic 客户端通过 `X-API-Key: <key>` 提交身份。未携带 Key 的请求归入内置 `default` 统计桶。
 
-健康检查：
+## 常用命令
 
 ```bash
-curl http://127.0.0.1:8080/healthz
-```
-
-可观测性端点（默认仅 loopback 访问；可通过 `metrics_remote_access: true` 放开）：
-
-```bash
-# Prometheus 文本格式
-curl http://127.0.0.1:8080/metrics
-
-# 实时聚合 JSON（p50/p75/p90/p95/p99 延迟、cache 命中率、provider 错误分布等）
-curl http://127.0.0.1:8080/stats
-```
-
-`/stats` 字段参考：
-
-```json
-{
-  "uptime_seconds": 1234,
-  "requests": {
-    "total": 493,
-    "by_provider": {"aiapi-Deepseek": 107, "deepseek-v4-flash": 119, ...},
-    "by_status": {"2xx": 400, "5xx": 50, "4xx": 43}
-  },
-  "cache": {
-    "by_provider": {
-      "deepseek-v4-flash": {"hit": 102, "miss": 17, "hit_rate": 0.8571, "avg_cached_tokens": 11416}
-    }
-  },
-  "latency_ms": {
-    "openai/gpt-4": {"p50": 1234, "p75": 2000, "p90": 3500, "p95": 4567, "p99": 8901}
-  },
-  "errors": {
-    "upstream_5xx": 50,
-    "upstream_timeout": 12,
-    "upstream_rate_limit": 8,
-    "upstream_by_status_code": {"502": 30, "504": 12, "429": 8}
-  }
-}
-```
-
-`/metrics` 暴露的指标名（均以 `ai_proxy_` 为前缀）：
-
-- `ai_proxy_requests_total{provider,model,route,status}` — 请求计数
-- `ai_proxy_request_duration_seconds_{sum,count}{provider,model,route,status}` — 累计耗时
-- `ai_proxy_input_tokens_total{provider,model}` / `ai_proxy_output_tokens_total{provider,model}` — token 用量
-- `ai_proxy_cached_input_tokens_total{provider,model}` / `ai_proxy_cache_creation_input_tokens_total{provider,model}`
-- `ai_proxy_cache_hit_rate{provider,model}` — 缓存命中率
-- `ai_proxy_upstream_errors_total{provider,status_code}` — upstream 错误分布
-- `ai_proxy_client_requests_total{api_key_id}` / `ai_proxy_client_{input,output,}tokens_total{api_key_id}` — 按客户端 Key 的累计调用与 Token
-- `ai_proxy_usage_store_{write_errors_total,query_errors_total,recovered_events_total,checkpoint_errors_total,healthy}` — DuckDB 写入、查询、恢复、checkpoint 与健康状态
-
-## 构建单二进制
-
-```bash
-make build
-```
-
-`Makefile` 默认使用 `-buildvcs=false`，避免当前目录不是完整 Git worktree 时 `go build` 因 VCS stamping 失败。可通过 `BINARY` 覆盖输出文件名：
-
-```bash
-make build BINARY=bin/ai-proxy
-```
-
-## CI 与发布
-
-普通代码提交的 CI 只在 Linux amd64 上执行格式、依赖、vet、全量测试和构建。推送 `vX.Y.Z` tag 后才进入发布流程：先统一验证一次，再在 Linux amd64/arm64、macOS arm64 与 Windows amd64 的**原生 runner**上打包。这样既避免 DuckDB bindings 的跨架构编译，也不会让日常提交重复执行多平台工作。若手动重跑 Release workflow，输入的版本必须是已存在的 tag。
-
-本地仅可打包当前原生平台：
-
-```bash
+make run                         # 使用 config.yaml 启动
+make check                       # 格式、vet、全量测试
+make build                       # 构建当前平台二进制
 make release-package VERSION=v1.2.3
-make release VERSION=v1.2.3             # check + 本地打包
-make release VERSION=v1.2.3 PUBLISH=1   # 创建 tag、推送并用 gh 发布当前平台包
 ```
 
-完整多平台发布应始终由 tag 触发的 GitHub Actions 完成。
+完整多平台发布由推送 `vX.Y.Z` tag 的 GitHub Actions 完成；详情见[运维与发布说明](docs/operations.md#构建与发布)。
 
-## 开发检查
+## 文档
 
-```bash
-make check
-```
+| 主题 | 文档 |
+| --- | --- |
+| 配置、客户端 Key、Provider 管理 | [配置参考](docs/configuration.md) |
+| 协议端点、模型路由、转换与错误合同 | [Provider Capability Contract](docs/provider-capability-contract-design-2026-07-15.md) |
+| DuckDB 用量、Admin API、Web 统计 | [API Key 用量与 DuckDB 收口方案](docs/api-key-usage-duckdb-web-closure-plan-2026-07-17.md) |
+| 运行、监控、归档、探针、备份与发布 | [运维与发布](docs/operations.md) |
+| Provider 现场能力审计 | [Provider Capability Audit](docs/provider-capability-audit-2026-07-15.md) |
+| Provider profile 维护 | [Provider Profile Contract Register](docs/provider-profile-contracts-2026-07-15.md) |
 
-`make check` 会依次运行 `go fmt ./...`、`go vet ./...` 和 `go test ./...`。
-
-## 用量存储（DuckDB）与 CSV 导出
-
-`usage_store.path` 指向唯一在线用量主存储 `usage.duckdb`。每个已接受调用会先持久化 `started`，随后在成功、校验失败、上游失败或流式中断时结算为 `completed`。`/stats` 的 `usage` 字段与 `/metrics` 的 `ai_proxy_client_*` 指标均由该持久化数据启动初始化，并随成功结算更新。
-
-管理页或 `/admin/api/usage/export.csv` 可按时间、API Key、Provider、Model、Outcome 与估算标记导出安全字段；单次导出最多 31 天且不超过 100,000 行。旧 `usage.csv` 仅能通过 `cmd/ai-proxy-usage-import` 显式、一次性导入。
-
-## 交互归档
-
-每一轮 `POST /v1/*` 会创建一个递增序号目录。默认只保留最新 `500` 轮，可通过 `server.interaction_retention` 或 `AI_PROXY_INTERACTION_RETENTION` 调整：
-
-```text
-interactions/
-  000001/
-    request.json
-    request.meta.json
-    upstream_request.json
-    upstream_response.json
-    response.json
-    metadata.json
-  000002/
-    request.json
-    request.meta.json
-    upstream_request.json
-    upstream_response.json
-    response.sse
-    response.json
-    metadata.json
-```
-
-非流式响应通常写入 `response.json`。流式响应始终写入原始 `response.sse`；其中 Chat Completions / Completions 与 Anthropic Messages 还会整理出完整 `response.json`（合并 delta / content_block）。**Responses API（`/v1/responses`）当前只保留原始 `response.sse`**，不生成整理后的 `response.json`（事件结构与 Chat Completions 不同）。`request.meta.json` 记录客户端方法、路径、查询参数、来源地址、User-Agent、Content-Length 和脱敏后的请求头；`upstream_request.json` 与 `upstream_response.json` 记录唯一 RouteOwner 的上游请求/响应；`metadata.json` 汇总最终 provider、model、耗时、HTTP 状态、token 统计、缓存读写 token 和缓存命中率，流式响应会额外记录 `full_response_path`。
-
-调试日志默认输出到终端，包含每轮 round id、客户端请求摘要、provider/model 选择、上游请求、上游响应和最终 token 摘要。`Authorization`、`X-API-Key`、`Cookie` 等敏感头会显示为 `<redacted>`。
-最终 token 摘要也会带 `round`，并在流式读取中断、客户端写入失败等场景附带 `error`；对应错误也会写入该轮 `metadata.json`，便于并发请求交错时追踪完整生命周期。
-默认日志格式为 JSON，便于日志系统采集；在 `server.log_format` 中设置 `text`，或设置 `AI_PROXY_LOG_FORMAT=text` / `LOG_FORMAT=text` 后，会输出人类可读日志，并仅对 `level=DEBUG`/`INFO`/`WARN`/`ERROR` 字段按等级着色。
-
-
-## Provider live probe（运维）
-
-独立入口，不在服务启动时执行：
-
-```bash
-go run ./cmd/ai-proxy-probe -config config.yaml \
-  -provider <route-owner> -capability chat_completions -model <exact-model-id>
-```
-
-- 仅验证配置中声明的 direct endpoint capability。
-- 输出脱敏摘要（不记录 API Key / 完整敏感 body）。
-- 结论：`success` / `credential_issue` / `capability_drift` / `environment_undetermined`。
-- 审计结果写入 `docs/provider-capability-audit-*.md`。
+`config.example.yaml` 是可复制的完整配置起点；所有 Provider 必须显式写入配置文件，不能由环境变量创建。
