@@ -90,6 +90,11 @@ jobs:
     needs: package
     runs-on: ubuntu-latest
     steps:
+      # gh release create 需要在关联 Git 远端的工作目录中运行。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
