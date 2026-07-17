@@ -81,7 +81,7 @@ client_api_keys:
 | `debug_log`、`log_format` | 调试日志和 `json`/`text` 格式。 |
 | `metrics_remote_access`、`metrics_allowed_cidrs` | `/metrics`、`/stats` 的远程访问控制。 |
 
-环境变量与配置键的完整默认值、上限和校验以 [`config.example.yaml`](../config.example.yaml) 与 `internal/config` 为准。
+环境变量与配置键的完整默认值、上限和校验以 [`config.example.yaml`](../config.example.yaml) 与 `internal/pkg/aiproxyconfig` 为准。
 
 ## DuckDB 用量存储
 

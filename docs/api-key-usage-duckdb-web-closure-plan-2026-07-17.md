@@ -479,7 +479,7 @@ ON usage_events(provider, model);
 建议新增独立 package：
 
 ```text
-internal/usage
+internal/pkg/aiproxyusage
 ```
 
 核心接口：
@@ -1099,13 +1099,13 @@ ai-proxy-usage-import \
 建议新增：
 
 ```text
-internal/clientauth/
+internal/pkg/aiproxyclientauth/
   identity.go
   index.go
   resolver.go
   resolver_test.go
 
-internal/usage/
+internal/pkg/aiproxyusage/
   store.go
   model.go
   filter.go
@@ -1124,16 +1124,20 @@ cmd/ai-proxy-usage-import/
 
 | 文件/目录 | 修改 |
 | --- | --- |
-| `internal/config/config.go` | client_api_keys、usage_store、删除 inbound/usage_file |
-| `internal/proxy/handler.go` | 身份解析、Start/Complete、删除 CSV Recorder |
-| `internal/proxy/anthropic.go` | Anthropic 路径身份保持与完成记账 |
-| `internal/proxy/models.go` | `/v1/models` 调用次数和零 Token 结算 |
-| `internal/archive/recorder.go` | metadata 增加 `api_key_id`、`event_id` |
-| `internal/metrics/*` | Key 维度和 store health 指标 |
-| `internal/admin/handler.go` | usage 查询、导出 API |
+| `internal/pkg/aiproxyconfig/config.go` | client_api_keys、usage_store、删除 inbound/usage_file |
+| `internal/modules/application/proxyapi/service/proxy/handler.go` | 身份解析、Start/Complete、删除 CSV Recorder |
+| `internal/modules/application/proxyapi/service/proxy/anthropic.go` | Anthropic 路径身份保持与完成记账 |
+| `internal/modules/application/proxyapi/service/proxy/models.go` | `/v1/models` 调用次数和零 Token 结算 |
+| `internal/pkg/aiproxyarchive/recorder.go` | metadata 增加 `api_key_id`、`event_id` |
+| `internal/pkg/aiproxymetrics/*` | Key 维度和 store health 指标 |
+| `internal/modules/application/adminapi/service/admin/handler.go` | usage 查询、导出 API |
 | `web/admin/index.html` | 页签、Dashboard、趋势和明细 |
-| `cmd/ai-proxy/app.go` | DuckDB Store 装配和关闭顺序 |
-| `cmd/ai-proxy/main.go` | 启动 migration/recovery 与日志 |
+| `internal/services/aiproxy/runtime.go` | magicCommon application lifecycle 与 RouteRegistry Initiator 的 listener 等待 |
+| `internal/modules/blocks/configruntime/module.go` | 当前配置快照与 Provider 热更新的 EventHub owner |
+| `internal/modules/blocks/usageruntime/module.go` | DuckDB Store 的 migration、checkpoint 与关闭顺序 |
+| `internal/modules/blocks/metricsruntime/module.go` | metrics/SLO 装配；通过 EventHub 读取 Usage Block |
+| `internal/initiators/routeregistry/` | magicEngine 路由注册、HTTP listener 生命周期与关闭信号 |
+| `cmd/ai-proxy/main.go` | 显式加载 Block / Application Module |
 | `config.example.yaml` | 新配置合同 |
 | `README.md` | Key、DuckDB、Web 使用说明 |
 | `prd.md` | Goals、Non-Goals 和 DoD 收口 |

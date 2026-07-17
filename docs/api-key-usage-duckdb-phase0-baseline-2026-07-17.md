@@ -6,7 +6,7 @@ Date: 2026-07-17
 - Platform: Linux amd64, Go 1.24, CGO_ENABLED=1, gcc 14.2
 - Binary size before DuckDB link (cmd/ai-proxy without usage import): ~11 MiB (11462077 bytes)
 - Binary size after DuckDB Store integration: ~76 MiB (79698632 bytes)
-- `go test ./internal/usage` smoke + full store tests: pass
+- `go test ./internal/pkg/aiproxyusage` smoke + full store tests: pass
 - `make check` (fmt/vet/test): pass
 
 Live validation remaining: deploy config migration, real client traffic, Web manual acceptance, backup/restore drill.

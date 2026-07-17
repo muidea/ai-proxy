@@ -46,6 +46,7 @@ make release-package VERSION=v1.2.3
 | 协议端点、模型路由、转换与错误合同 | [Provider Capability Contract](docs/provider-capability-contract-design-2026-07-15.md) |
 | DuckDB 用量、Admin API、Web 统计 | [API Key 用量与 DuckDB 收口方案](docs/api-key-usage-duckdb-web-closure-plan-2026-07-17.md) |
 | 运行、监控、归档、探针、备份与发布 | [运维与发布](docs/operations.md) |
+| 目录职责与 magicCommon 生命周期 | [代码结构](docs/structure.md) |
 | Provider 现场能力审计 | [Provider Capability Audit](docs/provider-capability-audit-2026-07-15.md) |
 | Provider profile 维护 | [Provider Profile Contract Register](docs/provider-profile-contracts-2026-07-15.md) |
 

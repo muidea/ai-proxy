@@ -1,0 +1,66 @@
+package aiproxy
+
+import (
+	"context"
+	"flag"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"ai-proxy/internal/pkg/aiproxyconfig"
+	"ai-proxy/internal/pkg/aiproxycontract"
+	"ai-proxy/internal/services/aiproxy/logging"
+)
+
+// Run 是 ai-proxy 主进程的 service shell。cmd 入口只传入构建版本；
+// 配置加载、信号处理及 magicCommon lifecycle 编排均归 process service 所有。
+func Run(version string) int {
+	configPath := flag.String("config", os.Getenv("AI_PROXY_CONFIG"), "config file path")
+	flag.Parse()
+
+	resolvedConfigPath := config.ResolvePath(*configPath)
+	cfg, err := config.Load(resolvedConfigPath)
+	if err != nil {
+		slog.Error("load config", slog.Any("error", err))
+		return 1
+	}
+	logging.ConfigureLogger(cfg.LogFormat, cfg.DebugLog)
+
+	runtime := NewRuntime(aiproxycontract.Bootstrap{Config: cfg, ConfigPath: resolvedConfigPath})
+	serviceCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runtime.Startup(serviceCtx); err != nil {
+		slog.Error("startup ai-proxy service", slog.Any("error", err))
+		return 1
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		slog.Info("ai-proxy listening",
+			slog.String("version", version),
+			slog.String("addr", cfg.ListenAddr),
+			slog.String("usage_store", cfg.UsageStore.Path),
+			slog.String("interactions", cfg.InteractionDir),
+			slog.String("metrics", MetricsAccessLabel(cfg.MetricsRemoteAccess)),
+		)
+		errCh <- runtime.Run(serviceCtx)
+	}()
+
+	exitCode := 0
+	select {
+	case <-serviceCtx.Done():
+		slog.Info("received signal, shutting down")
+	case err := <-errCh:
+		if err != nil {
+			slog.Error("server error", slog.Any("error", err))
+			exitCode = 1
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	runtime.Shutdown(ctx)
+	return exitCode
+}

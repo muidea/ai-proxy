@@ -14,10 +14,10 @@ Related:
 
 - [README.md](../README.md)
 - [prd.md](../prd.md)
-- `internal/config/config.go`
-- `internal/archive/recorder.go`
-- `internal/usage/`（当前实现；本文其余 CSV 内容为历史记录）
-- `internal/proxy/handler.go`
+- `internal/pkg/aiproxyconfig/config.go`
+- `internal/pkg/aiproxyarchive/recorder.go`
+- `internal/pkg/aiproxyusage/`（当前实现；本文其余 CSV 内容为历史记录）
+- `internal/modules/application/proxyapi/service/proxy/handler.go`
 
 ## Purpose
 
@@ -31,11 +31,11 @@ Related:
 
 | 能力 | 实现位置 | 落盘内容 |
 |---|---|---|
-| Per-interaction 全量归档 | `internal/archive/recorder.go:57-100` | `interactions/{round_id}/{metadata,request,request.meta,response,response.sse,upstream_request,upstream_response}.json` |
+| Per-interaction 全量归档 | `internal/pkg/aiproxyarchive/recorder.go:57-100` | `interactions/{round_id}/{metadata,request,request.meta,response,response.sse,upstream_request,upstream_response}.json` |
 | CSV 累计记录 | `internal/stats/recorder.go:36-40` | `usage.csv`(当前 6441 行,12 列:time / provider / model / input_tokens / output_tokens / total_tokens / duration_ms / stream / estimated / http_status,缺 cache 字段) |
-| Debug 日志 | `internal/proxy/debug.go:63-67` (`debugf`) | stderr 文本日志,每 round 一组 `client_request / selected / upstream_request / upstream_response / [ai-proxy][OK] provider=...` |
-| SSE 流式跟踪 | `internal/proxy/stream_archive.go:30,166` | `TrackSSELine` 累计 usage 与 content |
-| Health 端点 | `internal/proxy/handler.go:52-58` | `GET /healthz` 返回 `{"status":"ok"}` |
+| Debug 日志 | `internal/modules/application/proxyapi/service/proxy/debug.go:63-67` (`debugf`) | stderr 文本日志,每 round 一组 `client_request / selected / upstream_request / upstream_response / [ai-proxy][OK] provider=...` |
+| SSE 流式跟踪 | `internal/modules/application/proxyapi/service/proxy/stream_archive.go:30,166` | `TrackSSELine` 累计 usage 与 content |
+| Health 端点 | `internal/modules/application/proxyapi/service/proxy/handler.go:52-58` | `GET /healthz` 返回 `{"status":"ok"}` |
 
 ### 缺失的可观测性能力
 
@@ -125,7 +125,7 @@ Related:
 
 #### P0-2. 引入 request_id 注入
 
-**位置**:`internal/proxy/handler.go` `ServeHTTP` 入口
+**位置**:`internal/modules/application/proxyapi/service/proxy/handler.go` `ServeHTTP` 入口
 
 **改造**:
 - 在每个请求入口生成或透传 `X-Request-ID`:
@@ -140,7 +140,7 @@ Related:
 **位置**:`cmd/ai-proxy/main.go` 启动入口,新增路由
 
 **实现**:
-- 新建 `internal/metrics/prometheus.go`,实现轻量 Prometheus 文本格式输出(不引入 `github.com/prometheus/client_golang`,直接手写 minimal exposition format)
+- 新建 `internal/pkg/aiproxymetrics/prometheus.go`,实现轻量 Prometheus 文本格式输出(不引入 `github.com/prometheus/client_golang`,直接手写 minimal exposition format)
 - 暴露以下 metric:
  - `ai_proxy_requests_total{provider,model,route,status}` Counter
  - `ai_proxy_request_duration_seconds{provider,model,route}` Histogram
@@ -192,7 +192,7 @@ Related:
 
 #### P1-1. 滑动窗口聚合器
 
-**位置**:`internal/metrics/rolling.go`(新建)
+**位置**:`internal/pkg/aiproxymetrics/rolling.go`(新建)
 
 **实现**:
 - 滑动窗口:默认 5min / 15min / 1h / 24h 四个粒度
@@ -205,7 +205,7 @@ Related:
 
 #### P1-2. 延迟分位数估算
 
-**位置**:`internal/metrics/quantile.go`(新建)
+**位置**:`internal/pkg/aiproxymetrics/quantile.go`(新建)
 
 **实现**:
 - 轻量 t-digest 或 HDR Histogram 实现(不引入第三方库,或仅引入 `github.com/beorn7/perks/quantile`)
@@ -214,7 +214,7 @@ Related:
 
 #### P1-3. 结构化日志(slog)
 
-**位置**:`internal/proxy/debug.go`
+**位置**:`internal/modules/application/proxyapi/service/proxy/debug.go`
 
 **当前问题**:`debugf` 输出纯文本,无 request_id 串联,无结构化字段。
 
@@ -228,7 +228,7 @@ Related:
 
 #### P2-1. SLO 告警阈值
 
-**位置**:`internal/metrics/slo.go`(新建)
+**位置**:`internal/pkg/aiproxymetrics/slo.go`(新建)
 
 **实现**:
 - 启动时读取 config 中的 SLO 阈值
@@ -241,7 +241,7 @@ Related:
 
 #### P2-2. 实时 SSE 推送
 
-**位置**:`internal/metrics/stream.go`(新建)
+**位置**:`internal/modules/application/adminapi/service/observability/stream.go`(新建)
 
 **实现**:
 - `GET /stats/stream` 返回 SSE 流
@@ -250,7 +250,7 @@ Related:
 
 #### P2-3. Stable prefix 指纹
 
-**位置**:`internal/proxy/handler.go` 与 `internal/archive/recorder.go`
+**位置**:`internal/modules/application/proxyapi/service/proxy/handler.go` 与 `internal/pkg/aiproxyarchive/recorder.go`
 
 **实现**:
 - 在收到请求时,对 `request.json` 的 system 段或稳定前 N 字节计算 `sha256`
@@ -262,7 +262,7 @@ Related:
 
 #### P3-1. OpenTelemetry 接入(可选)
 
-**位置**:`internal/metrics/otel.go`(新建)
+**位置**:`internal/pkg/aiproxymetrics/otel.go`(新建)
 
 **实现**:
 - 引入 `go.opentelemetry.io/otel` SDK(可选,P3 阶段再决定是否引入)
@@ -271,7 +271,7 @@ Related:
 
 #### P3-2. 分布式 trace 关联
 
-**位置**:`internal/metrics/trace.go`(新建)
+**位置**:`internal/pkg/aiproxymetrics/trace.go`(新建)
 
 **实现**:
 - 解析 `traceparent` / `tracestate` 头(W3C Trace Context)
@@ -284,20 +284,20 @@ Related:
 | 文件 | 阶段 | 改动 |
 |---|---|---|
 | `internal/stats/recorder.go` | P0-1 | usage.csv 追加 cache 三列 |
-| `internal/proxy/handler.go` | P0-2 | 注入 request_id |
-| `internal/archive/recorder.go` | P0-2 | Metadata 增加 request_id 字段 |
-| `internal/metrics/prometheus.go`(新建) | P0-3 | Prometheus /metrics 端点 |
-| `internal/metrics/stats.go`(新建) | P0-4 | /stats JSON 端点 |
+| `internal/modules/application/proxyapi/service/proxy/handler.go` | P0-2 | 注入 request_id |
+| `internal/pkg/aiproxyarchive/recorder.go` | P0-2 | Metadata 增加 request_id 字段 |
+| `internal/pkg/aiproxymetrics/prometheus.go`(新建) | P0-3 | Prometheus /metrics 端点 |
+| `internal/pkg/aiproxymetrics/stats.go`(新建) | P0-4 | /stats JSON 端点 |
 | `cmd/ai-proxy/main.go` | P0-3, P0-4 | 注册新路由 |
-| `internal/metrics/rolling.go`(新建) | P1-1 | 滑动窗口聚合器 |
-| `internal/metrics/quantile.go`(新建) | P1-2 | 延迟分位数 |
-| `internal/proxy/debug.go` | P1-3 | 切到 slog |
-| `internal/metrics/slo.go`(新建) | P2-1 | SLO 告警 |
-| `internal/metrics/stream.go`(新建) | P2-2 | SSE 推送 |
-| `internal/proxy/handler.go` | P2-3 | stable prefix 指纹 |
-| `internal/archive/recorder.go` | P2-3 | Metadata 增加 stable_prefix_hash 字段 |
-| `internal/metrics/otel.go`(新建) | P3-1 | OpenTelemetry 接入 |
-| `internal/metrics/trace.go`(新建) | P3-2 | 分布式 trace 关联 |
+| `internal/pkg/aiproxymetrics/rolling.go`(新建) | P1-1 | 滑动窗口聚合器 |
+| `internal/pkg/aiproxymetrics/quantile.go`(新建) | P1-2 | 延迟分位数 |
+| `internal/modules/application/proxyapi/service/proxy/debug.go` | P1-3 | 切到 slog |
+| `internal/pkg/aiproxymetrics/slo.go`(新建) | P2-1 | SLO 告警 |
+| `internal/modules/application/adminapi/service/observability/stream.go`(新建) | P2-2 | SSE 推送 |
+| `internal/modules/application/proxyapi/service/proxy/handler.go` | P2-3 | stable prefix 指纹 |
+| `internal/pkg/aiproxyarchive/recorder.go` | P2-3 | Metadata 增加 stable_prefix_hash 字段 |
+| `internal/pkg/aiproxymetrics/otel.go`(新建) | P3-1 | OpenTelemetry 接入 |
+| `internal/pkg/aiproxymetrics/trace.go`(新建) | P3-2 | 分布式 trace 关联 |
 | `config.example.yaml` | P0~P3 | 增 SLO 阈值 / metrics 配置 |
 | `README.md` | P0~P3 | 文档更新 |
 
@@ -305,9 +305,9 @@ Related:
 
 ### 单元测试
 
-- `internal/metrics/prometheus_test.go`:文本格式输出与基本 metric 计数
-- `internal/metrics/rolling_test.go`:滑动窗口数据正确性
-- `internal/metrics/quantile_test.go`:分位数误差
+- `internal/pkg/aiproxymetrics/prometheus_test.go`:文本格式输出与基本 metric 计数
+- `internal/pkg/aiproxymetrics/rolling_test.go`:滑动窗口数据正确性
+- `internal/pkg/aiproxymetrics/quantile_test.go`:分位数误差
 - `internal/stats/recorder_test.go`:usage.csv 新增列写入与解析
 
 ### 集成测试
@@ -334,7 +334,7 @@ Related:
 
 1. usage.csv 补 cache 字段(纯结构改动,向后兼容)
 2. request_id 注入(请求入口加 middleware)
-3. 新建 `internal/metrics/` 目录骨架
+3. 新建 `internal/pkg/aiproxymetrics/` 目录骨架
 4. /metrics 与 /stats 端点
 5. README 增 "/metrics" 章节
 
@@ -393,10 +393,10 @@ Related:
 
 ## Reference
 
-- `internal/config/config.go` L12-32
-- `internal/archive/recorder.go` L17-100
+- `internal/pkg/aiproxyconfig/config.go` L12-32
+- `internal/pkg/aiproxyarchive/recorder.go` L17-100
 - `internal/stats/recorder.go` L11-40
-- `internal/proxy/handler.go`（唯一 RouteOwner 上游执行）
-- `internal/proxy/debug.go` L63-67(debugf), L190(upstream alert)
+- `internal/modules/application/proxyapi/service/proxy/handler.go`（唯一 RouteOwner 上游执行）
+- `internal/modules/application/proxyapi/service/proxy/debug.go` L63-67(debugf), L190(upstream alert)
 - `cmd/ai-proxy/main.go`(启动入口)
 - 配套 workorch 端设计:`workorch/docs/30-module-architecture/llm-cache-improvement-design.md`

@@ -20,9 +20,9 @@ make check        # fmt + vet + test（本地完整门禁）
 make clean
 
 # 单包 / 单测
-go test ./internal/proxy -count=1
-go test ./internal/proxy -run TestResolveTransportPlan -count=1
-go test ./internal/config -run TestValidateModelRoutes -count=1
+go test ./internal/modules/application/proxyapi/service/proxy -count=1
+go test ./internal/modules/application/proxyapi/service/proxy -run TestResolveTransportPlan -count=1
+go test ./internal/pkg/aiproxyconfig -run TestValidateModelRoutes -count=1
 
 # 上游 capability 现场探测（独立入口，不在服务启动时跑）
 go run ./cmd/ai-proxy-probe -config config.yaml \
@@ -34,29 +34,41 @@ go run ./cmd/ai-proxy-probe -config config.yaml \
 ## 架构总览
 
 ```
-cmd/ai-proxy          主服务：Load 配置 → buildApp 装配 → ListenAndServe + 优雅关闭
-cmd/ai-proxy-probe    运维探针：验证某 RouteOwner 的 direct endpoint capability
+cmd/ai-proxy          主服务入口：参数/信号 → internal/services/aiproxy Runtime
+cmd/ai-proxy-probe    运维探针入口：调用 internal/services/probe
+cmd/ai-proxy-usage-import  历史 CSV 导入入口：调用 internal/services/usageimport
 
-internal/config       配置加载、规范化、启动期校验；解析 model_catalog → RouteOwner
-internal/proxy        请求主路径：鉴权、TransportPlan、转发/转换、流式、归档钩子、typed error
-internal/admin        loopback-only Provider 管理页 API；校验后写回 config 并热更新 Handler
-internal/archive      interactions/{round_id}/ 轮次归档与保留策略
-internal/clientauth   客户端 API Key 身份解析（SHA-256 索引，仅内存）
-internal/usage        DuckDB 用量 Store（Start/Complete/Dashboard/Events/导出）
-internal/metrics      Registry、/metrics、/stats、/stats/stream、SLO 巡检与 webhook
+internal/services/aiproxy  主 gateway process service：驱动 magicCommon application 生命周期并等待 HTTP listener
+internal/services/probe    Provider live probe process service
+internal/services/usageimport  CSV → DuckDB 一次性导入 process service
+
+internal/modules/blocks/configruntime  配置 Block：启动快照与 Provider 热更新的当前配置 owner
+internal/modules/blocks/usageruntime  DuckDB 用量 Block
+internal/modules/blocks/metricsruntime  metrics/SLO Block（经 EventHub 获取 Usage Block）
+internal/modules/application/proxyapi  OpenAI/Anthropic Application Module：Proxy 路由与热更新契约
+internal/modules/application/adminapi  Provider 管理与 usage Application Module
+internal/initiators/routeregistry  magicEngine RouteRegistry 与 HTTP listener Initiator
+internal/pkg/aiproxycontract  Initiator / Block / Module 的 EventHub topic 与 DTO
+
+internal/pkg/aiproxyconfig       配置加载、规范化、启动期校验；解析 model_catalog → RouteOwner
+internal/pkg/aiproxyarchive      interactions/{round_id}/ 轮次归档与保留策略
+internal/pkg/aiproxyclientauth   客户端 API Key 身份解析（SHA-256 索引，仅内存）
+internal/pkg/aiproxyusage        DuckDB 用量 Store（Start/Complete/Dashboard/Events/导出）
+internal/pkg/aiproxymetrics      Registry、Prometheus 投影、SLO 巡检与 webhook（无 HTTP adapter）
+internal/pkg/aiproxymetricsport  Metrics Block 的 EventHub-backed 读写端口
 
 web/admin             嵌入二进制的管理页（Provider + 使用统计，go:embed，无 Node 构建链）
 cmd/ai-proxy-usage-import  旧 usage.csv 一次性导入 DuckDB
 ```
 
-装配入口在 `cmd/ai-proxy/app.go`：DuckDB usage store、interaction archive、metrics registry、proxy Handler、SLO evaluator、admin（含 usage API）、HTTP mux。`/metrics`、`/stats`、`/admin` 优先注册，其余由 proxy Handler 兜底。
+装配入口在 `internal/services/aiproxy/runtime.go`：通过 magicCommon `framework/application` + `framework/service.DefaultService` 管理 Initiator / Block / Module 生命周期。`cmd/ai-proxy/main.go` 显式 side-effect import 所需 Initiator、Block、Application Module；不得由业务包间接注册。Config Block 提供启动快照与配置激活；`routeregistry` Initiator 提供 magicEngine RouteRegistry 与 listener；Proxy、Admin Module 经 EventHub 获取 Usage 与 Metrics 端口，并经 `initiator.GetEntity` 注入 RouteRegistry 后注册路由。`cmd/` 不放业务装配。
 
 ## 路由与协议合同（核心）
 
 两阶段权威，不要绕过：
 
 1. **启动期** `config.Load`：每个 `model_catalog` 条目必须 **exact、大小写敏感** 地唯一匹配一个 enabled provider 的 `models` pattern，写入 `ModelInfo.RouteOwner` / `ResolvedModelRoute`。`operations` 必填且仅允许 `chat_completions` / `embeddings`。enabled provider 必须显式配置 `endpoint_capabilities`（不得从 protocol 推断）。
-2. **请求期** `ResolveTransportPlan(cfg, method, path, model)`（`internal/proxy/route.go`）：只消费已解析 RouteOwner + 固定转发矩阵，生成 `TransportPlan`（入站协议/path、上游协议/path、mode）。**禁止**再扫 provider 选路、fallback、`default_provider`、`X-AI-Provider` / `?provider=` / `provider/model` 前缀。
+2. **请求期** `ResolveTransportPlan(cfg, method, path, model)`（`internal/modules/application/proxyapi/service/proxy/route.go`）：只消费已解析 RouteOwner + 固定转发矩阵，生成 `TransportPlan`（入站协议/path、上游协议/path、mode）。**禁止**再扫 provider 选路、fallback、`default_provider`、`X-AI-Provider` / `?provider=` / `provider/model` 前缀。
 
 入站白名单：
 
@@ -84,7 +96,7 @@ cmd/ai-proxy-usage-import  旧 usage.csv 一次性导入 DuckDB
 
 ## 请求处理路径（proxy）
 
-`Handler.ServeHTTP`：路径白名单 → `clientauth` 身份解析（无 Key→`default`；未知/禁用/冲突→401）→ `UsageStore.Start`（失败 503，不访问上游）→ 读限大体 → 解析 model → `ResolveTransportPlan` → native 或 conversion → `doUpstream*` → 缓冲或 SSE 流式 → `UsageStore.Complete` / metrics / archive。
+`proxyapi/service/proxy.Handler.ServeHTTP`：路径白名单 → `clientauth` 身份解析（无 Key→`default`；未知/禁用/冲突→401）→ `UsageStore.Start`（失败 503，不访问上游）→ 读限大体 → 解析 model → `ResolveTransportPlan` → native 或 conversion → `doUpstream*` → 缓冲或 SSE 流式 → `UsageStore.Complete` / metrics / archive。
 
 流式：首包写出后 HTTP 状态不可改写；真实结束态用 **outcome**（`success`、`client_canceled`、`idle_timeout`、`upstream_truncated`、`upstream_failed` 等）统一写入 DuckDB / Prometheus / `metadata.json`。客户端取消不得计为 upstream 故障。
 
@@ -108,7 +120,7 @@ cmd/ai-proxy-usage-import  旧 usage.csv 一次性导入 DuckDB
 ## 修改时注意
 
 - **model id 严格大小写敏感**；catalog 与 body 必须原文 exact 匹配。
-- 改路由/能力矩阵时同步：`internal/config` 校验、`ResolveTransportPlan`、`prd.md` DoD、相关 `*_test.go`、必要时 `README.md` / `docs/`。
+- 改路由/能力矩阵时同步：`internal/pkg/aiproxyconfig` 校验、`ResolveTransportPlan`、`prd.md` DoD、相关 `*_test.go`、必要时 `README.md` / `docs/`。
 - 不引入 provider fallback、default_provider，或从 protocol 推断 `endpoint_capabilities`。
 - `Makefile` 默认 `-buildvcs=false`，避免非完整 git worktree 下 build 失败。
 - 文档、管理 UI 文案以中文为主；代码标识符保持英文。

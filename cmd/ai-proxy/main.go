@@ -1,71 +1,18 @@
 package main
 
 import (
-	"context"
-	"errors"
-	"flag"
-	"log/slog"
-	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
 
-	"ai-proxy/internal/config"
-	"ai-proxy/internal/proxy"
+	_ "ai-proxy/internal/initiators/routeregistry"
+	_ "ai-proxy/internal/modules/application/adminapi"
+	_ "ai-proxy/internal/modules/application/proxyapi"
+	_ "ai-proxy/internal/modules/blocks/configruntime"
+	_ "ai-proxy/internal/modules/blocks/metricsruntime"
+	_ "ai-proxy/internal/modules/blocks/usageruntime"
+	"ai-proxy/internal/services/aiproxy"
 )
 
 // version 由 scripts/build-release.sh 通过 -ldflags 注入；本地开发保持 dev。
 var version = "dev"
 
-func main() {
-	configPath := flag.String("config", os.Getenv("AI_PROXY_CONFIG"), "config file path")
-	flag.Parse()
-
-	resolvedConfigPath := config.ResolvePath(*configPath)
-	cfg, err := config.Load(resolvedConfigPath)
-	if err != nil {
-		slog.Error("load config", slog.Any("error", err))
-		os.Exit(1)
-	}
-	proxy.ConfigureLogger(cfg.LogFormat, cfg.DebugLog)
-
-	application, err := buildAppWithConfigPath(cfg, resolvedConfigPath)
-	if err != nil {
-		slog.Error("build app", slog.Any("error", err))
-		os.Exit(1)
-	}
-	defer application.Close()
-
-	errCh := make(chan error, 1)
-	go func() {
-		slog.Info("ai-proxy listening",
-			slog.String("version", version),
-			slog.String("addr", cfg.ListenAddr),
-			slog.String("usage_store", cfg.UsageStore.Path),
-			slog.String("interactions", cfg.InteractionDir),
-			slog.String("metrics", metricsURL(cfg.MetricsRemoteAccess)),
-		)
-		errCh <- application.server.ListenAndServe()
-	}()
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	select {
-	case sig := <-stop:
-		slog.Info("received signal, shutting down", slog.String("signal", sig.String()))
-	case err := <-errCh:
-		if !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("server error", slog.Any("error", err))
-			os.Exit(1)
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := application.server.Shutdown(ctx); err != nil {
-		slog.Error("shutdown", slog.Any("error", err))
-		os.Exit(1)
-	}
-}
+func main() { os.Exit(aiproxy.Run(version)) }

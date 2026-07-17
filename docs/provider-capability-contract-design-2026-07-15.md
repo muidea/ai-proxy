@@ -56,10 +56,10 @@ Related:
 
 - [WorkOrch 模型目录与 Operation 合同收口计划](workorch-model-catalog-operation-closure-plan-2026-07-15.md)
 - `/home/rangh/aispace/workorch/docs/70-roadmap/active/ai-proxy-primary-llm-provider-cutover-design-2026-07-15.md`
-- `internal/config/config.go`
-- `internal/proxy/route.go`
-- `internal/proxy/handler.go`
-- `internal/proxy/anthropic.go`
+- `internal/pkg/aiproxyconfig/config.go`
+- `internal/modules/application/proxyapi/service/proxy/route.go`
+- `internal/modules/application/proxyapi/service/proxy/handler.go`
+- `internal/modules/application/proxyapi/service/proxy/anthropic.go`
 
 ## 1. 功能定位
 
@@ -616,14 +616,14 @@ go run ./cmd/ai-proxy-probe -config ./config.yaml -provider <route-owner> -capab
 
 不新增 framework module，沿用现有 focused package：
 
-- `internal/config/config.go`：配置解析、normalize、RouteOwner 和 canonical readiness。
-- `internal/proxy/route.go`：Client Endpoint/Operation 解析和 TransportPlan 矩阵。
-- `internal/proxy/handler.go`：公共请求生命周期、authority 查找、native 转发。
-- `internal/proxy/anthropic.go`：OpenAI↔Anthropic 请求、响应和 SSE 转换器。
-- `internal/proxy/api_error.go`：稳定 typed error DTO 和 code。
-- `internal/proxy/models.go`：模型目录外部 DTO。
-- `internal/usage/`：DuckDB usage event、聚合查询、导出与 schema migration。
-- `internal/metrics/registry.go`：有界 TransportPlan request label 与 RouteOwner SLO 聚合数据。
+- `internal/pkg/aiproxyconfig/config.go`：配置解析、normalize、RouteOwner 和 canonical readiness。
+- `internal/modules/application/proxyapi/service/proxy/route.go`：Client Endpoint/Operation 解析和 TransportPlan 矩阵。
+- `internal/modules/application/proxyapi/service/proxy/handler.go`：公共请求生命周期、authority 查找、native 转发。
+- `internal/modules/application/proxyapi/service/proxy/anthropic.go`：OpenAI↔Anthropic 请求、响应和 SSE 转换器。
+- `internal/modules/application/proxyapi/service/proxy/api_error.go`：稳定 typed error DTO 和 code。
+- `internal/modules/application/proxyapi/service/proxy/models.go`：模型目录外部 DTO。
+- `internal/pkg/aiproxyusage/`：DuckDB usage event、聚合查询、导出与 schema migration。
+- `internal/pkg/aiproxymetrics/registry.go`：有界 TransportPlan request label 与 RouteOwner SLO 聚合数据。
 - `cmd/ai-proxy-probe`：独立运维 probe 入口；不参与 ai-proxy server 运行时路由。
 
 Handler 只消费已解析 authority 和 TransportPlan。转换器不选择 provider，config 包不解析请求 body，models

@@ -312,8 +312,8 @@ model_catalog:
 
 涉及：
 
-- `internal/proxy/models.go`
-- `internal/proxy/handler_test.go`
+- `internal/modules/application/proxyapi/service/proxy/models.go`
+- `internal/modules/application/proxyapi/service/proxy/handler_test.go`
 
 要求：
 
@@ -328,8 +328,8 @@ model_catalog:
 
 涉及：
 
-- `internal/config/config.go`
-- `internal/proxy/models.go`
+- `internal/pkg/aiproxyconfig/config.go`
+- `internal/modules/application/proxyapi/service/proxy/models.go`
 - provider routing helper
 
 要求：
@@ -352,9 +352,9 @@ model_catalog:
 
 涉及：
 
-- `internal/proxy/handler.go`
-- `internal/proxy/anthropic.go`
-- `internal/proxy/route.go`
+- `internal/modules/application/proxyapi/service/proxy/handler.go`
+- `internal/modules/application/proxyapi/service/proxy/anthropic.go`
+- `internal/modules/application/proxyapi/service/proxy/route.go`
 - operation/error helper
 
 要求：
@@ -371,7 +371,7 @@ model_catalog:
 
 涉及：
 
-- `internal/config/config.go`
+- `internal/pkg/aiproxyconfig/config.go`
 - endpoint capability 解析、规范化和配置校验
 - `config.example.yaml` / 部署 `config.yaml`
 
@@ -432,7 +432,7 @@ error 拒绝，不会访问错误 endpoint 或其它 provider。
 - `NewHandler` 对 unknown protocol、重复或未规范排序的 operations/capabilities fail-fast；空 catalog 不能绕过
   provider authority 校验。
 - GET、POST `/v1/models` 的整个 typed payload 深度一致，不只比较部分字段。
-- `internal/proxy/api_error.go`、`internal/proxy/handler_test_helpers.go` 已纳入变更集并通过 `gofmt`。
+- `internal/modules/application/proxyapi/service/proxy/api_error.go`、`internal/modules/application/proxyapi/service/proxy/handler_test_helpers.go` 已纳入变更集并通过 `gofmt`。
 
 已补齐的直接测试包括：
 
@@ -450,7 +450,7 @@ error 拒绝，不会访问错误 endpoint 或其它 provider。
 ```bash
 gofmt -l $(rg --files -g '*.go')
 git diff --check
-go test ./internal/config -count=1
+go test ./internal/pkg/aiproxyconfig -count=1
 go test ./internal/proxy -count=1
 go test ./cmd/ai-proxy -count=1
 go test ./... -count=1
@@ -462,8 +462,8 @@ go vet ./...
 提交前同时确认：
 
 ```bash
-git ls-files --error-unmatch internal/proxy/api_error.go
-git ls-files --error-unmatch internal/proxy/handler_test_helpers.go
+git ls-files --error-unmatch internal/modules/application/proxyapi/service/proxy/api_error.go
+git ls-files --error-unmatch internal/modules/application/proxyapi/service/proxy/handler_test_helpers.go
 git ls-files --error-unmatch docs/workorch-model-catalog-operation-closure-plan-2026-07-15.md
 ```
 
