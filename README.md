@@ -375,7 +375,7 @@ make build BINARY=bin/ai-proxy
 
 ## CI 与发布
 
-GitHub Actions 的 CI 在 Linux amd64/arm64、macOS amd64/arm64 与 Windows amd64 的**原生 runner**上执行测试和打包；这样不会触发 DuckDB bindings 不支持的 amd64→arm64 交叉编译。推送 `vX.Y.Z` tag 会生成 GitHub Release 和各平台 `tar.gz`、SHA-256 校验文件。若手动重跑 Release workflow，输入的版本必须是已存在的 tag。
+普通代码提交的 CI 只在 Linux amd64 上执行格式、依赖、vet、全量测试和构建。推送 `vX.Y.Z` tag 后才进入发布流程：先统一验证一次，再在 Linux amd64/arm64、macOS arm64 与 Windows amd64 的**原生 runner**上打包。这样既避免 DuckDB bindings 的跨架构编译，也不会让日常提交重复执行多平台工作。若手动重跑 Release workflow，输入的版本必须是已存在的 tag。
 
 本地仅可打包当前原生平台：
 

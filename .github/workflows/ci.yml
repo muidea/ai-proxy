@@ -30,29 +30,10 @@ jobs:
       - name: Test
         run: go test ./... -count=1
 
-  native-build:
-    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+  build:
+    name: linux/amd64 build
     needs: quality
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            goos: linux
-            goarch: amd64
-          - runner: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
-          - runner: macos-13
-            goos: darwin
-            goarch: amd64
-          - runner: macos-14
-            goos: darwin
-            goarch: arm64
-          - runner: windows-latest
-            goos: windows
-            goarch: amd64
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -62,11 +43,6 @@ jobs:
       - name: Native build and package
         shell: bash
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+          GOOS: linux
+          GOARCH: amd64
         run: scripts/build-release.sh 0.0.0-ci dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ai-proxy-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*
-          if-no-files-found: error

@@ -15,9 +15,29 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  # 同一 tag 被修正并重新推送时，取消旧构建，防止竞争同一个 Release。
+  cancel-in-progress: true
 
 jobs:
+  verify:
+    name: Verify release source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # 手动重跑时 version 必须是已存在的 tag；不能从未审计的默认分支发布。
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify source once
+        run: |
+          scripts/check-format.sh
+          go vet ./...
+          go test ./... -count=1
+
   package:
     name: Package ${{ matrix.goos }}/${{ matrix.goarch }}
     strategy:
@@ -30,15 +50,13 @@ jobs:
           - runner: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
-          - runner: macos-13
-            goos: darwin
-            goarch: amd64
           - runner: macos-14
             goos: darwin
             goarch: arm64
           - runner: windows-latest
             goos: windows
             goarch: amd64
+    needs: verify
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -56,12 +74,6 @@ jobs:
         run: |
           version='${{ inputs.version || github.ref_name }}'
           echo "value=${version#v}" >> "$GITHUB_OUTPUT"
-      - name: Verify native target
-        shell: bash
-        run: |
-          scripts/check-format.sh
-          go vet ./...
-          go test ./... -count=1
       - name: Build release archive
         shell: bash
         env:
