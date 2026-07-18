@@ -38,7 +38,8 @@ type DuckDBStore struct {
 	healthy   atomic.Int32
 	recovered atomic.Int64
 
-	cache *dashboardCache
+	cache        *dashboardCache
+	optionsCache *filterOptionsCache
 }
 
 // OpenDuckDB 打开(或创建)DuckDB 文件,应用安全设置,执行 migration,并恢复遗留 started 行。
@@ -83,10 +84,11 @@ func OpenDuckDB(cfg config.UsageStoreConfig) (*DuckDBStore, error) {
 	}
 
 	s := &DuckDBStore{
-		db:    db,
-		path:  path,
-		cfg:   cfg,
-		cache: newDashboardCache(cfg.QueryCacheSeconds, 64),
+		db:           db,
+		path:         path,
+		cfg:          cfg,
+		cache:        newDashboardCache(cfg.QueryCacheSeconds, 64),
+		optionsCache: newFilterOptionsCache(cfg.QueryCacheSeconds, 32),
 	}
 	s.healthy.Store(1)
 

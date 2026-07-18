@@ -90,6 +90,8 @@ func (m *Module) handleCall(ev event.Event, result event.Result) {
 		var buffer bytes.Buffer
 		err = store.ExportCSV(ev.Context(), command.Filter, &buffer)
 		value = aiproxycontract.UsageExportResult{Data: buffer.Bytes()}
+	case aiproxycontract.UsageFilterOptionsCommand:
+		value, err = store.FilterOptions(ev.Context(), command.Query)
 	case aiproxycontract.UsageRecoverCommand:
 		value, err = store.RecoverInterrupted(ev.Context(), command.At)
 	case aiproxycontract.UsageCheckpointCommand:

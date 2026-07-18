@@ -94,6 +94,11 @@ func (c usageClient) ExportCSV(ctx context.Context, v usage.UsageFilter, w io.Wr
 	_, e = w.Write(result.Data)
 	return e
 }
+func (c usageClient) FilterOptions(ctx context.Context, v usage.FilterOptionsQuery) (usage.FilterOptionsResult, error) {
+	r, e := c.call(ctx, UsageFilterOptionsCommand{Query: v})
+	x, _ := r.(usage.FilterOptionsResult)
+	return x, e
+}
 func (c usageClient) RecoverInterrupted(ctx context.Context, v time.Time) (int64, error) {
 	r, e := c.call(ctx, UsageRecoverCommand{At: v})
 	x, _ := r.(int64)

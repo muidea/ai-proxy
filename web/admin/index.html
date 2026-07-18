@@ -67,15 +67,16 @@
       </section>
       <section class="card" style="padding:14px 16px">
         <div class="usage-filters">
-          <input id="usageKeyFilter" class="control" placeholder="API Key ID">
-          <input id="usageProviderFilter" class="control" placeholder="Provider">
-          <input id="usageModelFilter" class="control" placeholder="Model">
-          <input id="usageOutcomeFilter" class="control" placeholder="Outcome，例如 success">
+          <select id="usageKeyFilter" class="control"><option value="">全部 API Key</option></select>
+          <select id="usageProviderFilter" class="control"><option value="">全部 Provider</option></select>
+          <select id="usageModelFilter" class="control"><option value="">全部 Model</option></select>
+          <select id="usageOutcomeFilter" class="control"><option value="">全部 Outcome</option></select>
           <select id="usageEstimatedFilter" class="control"><option value="">精确与估算</option><option value="false">仅精确</option><option value="true">仅估算</option></select>
           <input id="usageFrom" class="control" type="datetime-local" title="开始时间（UTC）">
           <input id="usageTo" class="control" type="datetime-local" title="结束时间（UTC）">
           <button class="btn" id="usageApply">应用筛选</button>
         </div>
+        <div class="subtle" id="filterOptionsHint" style="margin:-8px 0 12px;min-height:18px"></div>
       </section>
       <section class="stats">
         <div class="stat"><div class="stat-label">调用次数</div><div class="stat-value" id="uRequests" title="0">—</div></div>
@@ -125,7 +126,7 @@
 
 <script>
 const capabilityOptions={openai:["chat_completions","responses","completions","embeddings"],anthropic:["messages"]};
-const state={providers:[],writable:false,editing:-1,query:"",tab:"providers",range:"today",usage:null,events:[],cursor:"",usageTimer:null,apiKeyFilter:"",providerFilter:"",modelFilter:"",outcomeFilter:"",estimatedFilter:"",from:"",to:""};
+const state={providers:[],writable:false,editing:-1,query:"",tab:"providers",range:"today",usage:null,events:[],cursor:"",usageTimer:null,apiKeyFilter:"",providerFilter:"",modelFilter:"",outcomeFilter:"",estimatedFilter:"",from:"",to:"",filterOptions:null,filterOptionsKey:"",filterOptionsWarned:false};
 const $=id=>document.getElementById(id);
 const esc=v=>String(v??"").replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
 const splitList=v=>v.split(/[\n,]/).map(x=>x.trim()).filter(Boolean);
@@ -134,7 +135,7 @@ async function request(url,options={}){const r=await fetch(url,{cache:"no-store"
 
 function parseHash(){const h=location.hash||"#/providers";const [path,qs]=h.replace(/^#\/?/,"").split("?");const p=new URLSearchParams(qs||"");return {tab:path.startsWith("usage")?"usage":"providers",range:p.get("range")||"today",apiKeyFilter:p.get("api_key_id")||"",providerFilter:p.get("provider")||"",modelFilter:p.get("model")||"",outcomeFilter:p.get("outcome")||"",estimatedFilter:p.get("estimated")||"",from:p.get("from")||"",to:p.get("to")||""}}
 function setHash(){const q=new URLSearchParams();if(state.tab==="usage"){q.set("range",state.range);[["api_key_id",state.apiKeyFilter],["provider",state.providerFilter],["model",state.modelFilter],["outcome",state.outcomeFilter],["estimated",state.estimatedFilter],["from",state.from],["to",state.to]].forEach(([k,v])=>{if(v)q.set(k,v)});location.hash="#/usage?"+q.toString()}else location.hash="#/providers"}
-function showTab(tab){state.tab=tab;$("panelProviders").classList.toggle("active",tab==="providers");$("panelUsage").classList.toggle("active",tab==="usage");$("navProviders").classList.toggle("active",tab==="providers");$("navUsage").classList.toggle("active",tab==="usage");if(tab==="usage")loadUsage();else loadProviders()}
+function showTab(tab){state.tab=tab;$("panelProviders").classList.toggle("active",tab==="providers");$("panelUsage").classList.toggle("active",tab==="usage");$("navProviders").classList.toggle("active",tab==="providers");$("navUsage").classList.toggle("active",tab==="usage");if(tab==="usage"){loadFilterOptions(false);loadUsage(true)}else loadProviders()}
 
 async function loadProviders(){try{const data=await request("/admin/api/providers");state.providers=data.providers||[];state.writable=Boolean(data.writable);$("readonlyNotice").style.display=state.writable?"none":"block";$("addButton").disabled=!state.writable;renderProviders()}catch(e){$("content").innerHTML=`<div class="empty">${esc(e.message)}</div>`}}
 function renderProviders(){
@@ -157,6 +158,56 @@ async function toggleProvider(index,enabled){const next=state.providers.map(p=>(
 async function removeProvider(index){const p=state.providers[index];if(!confirm(`确认删除 Provider “${p.name}”？`))return;const next=state.providers.filter((_,i)=>i!==index);await save(next,"Provider 已删除")}
 function toast(message,type="success"){const el=document.createElement("div");el.className=`toast toast-${type}`;el.innerHTML=`<span>${type==="success"?"✓":"!"}</span><div>${esc(message)}</div>`;$("toasts").appendChild(el);setTimeout(()=>el.remove(),4200)}
 
+function usageRangeParams(){const p=new URLSearchParams();if(state.range!=="today")p.set("range",state.range);[["from",state.from],["to",state.to]].forEach(([k,v])=>{if(v)p.set(k,v)});return p}
+function filterOptionsCacheKey(){return [state.range||"today",state.from||"",state.to||""].join("|")}
+function fillSelect(el,placeholder,items,selected){
+  const opts=[{value:"",label:placeholder}];
+  const seen=new Set([""]);
+  (items||[]).forEach(it=>{
+    const id=typeof it==="string"?it:(it&&it.id)||"";
+    if(!id||seen.has(id))return;
+    seen.add(id);
+    opts.push({value:id,label:id});
+  });
+  if(selected&&!seen.has(selected))opts.push({value:selected,label:selected});
+  el.innerHTML=opts.map(o=>`<option value="${esc(o.value)}"${o.value===selected?" selected":""}>${esc(o.label)}</option>`).join("");
+  el.value=selected||"";
+}
+function fillFilterOptions(data){
+  state.filterOptions=data||null;
+  const keys=(data&&data.api_key_ids)||[];
+  const providers=(data&&data.providers)||[];
+  const models=(data&&data.models)||[];
+  const outcomes=(data&&data.outcomes)||[];
+  fillSelect($("usageKeyFilter"),"全部 API Key",keys,state.apiKeyFilter);
+  fillSelect($("usageProviderFilter"),"全部 Provider",providers,state.providerFilter);
+  fillSelect($("usageModelFilter"),"全部 Model",models,state.modelFilter);
+  fillSelect($("usageOutcomeFilter"),"全部 Outcome",outcomes,state.outcomeFilter);
+  const trunc=data&&data.limits&&data.limits.truncated;
+  const hint=$("filterOptionsHint");
+  if(trunc&&(trunc.api_key_ids||trunc.providers||trunc.models))hint.textContent="选项已截断至 200 项（当前时间范围内 distinct 值过多）";
+  else hint.textContent="";
+}
+async function loadFilterOptions(force=false){
+  const key=filterOptionsCacheKey();
+  if(!force&&state.filterOptions&&state.filterOptionsKey===key)return;
+  try{
+    const data=await request(`/admin/api/usage/filter-options?${usageRangeParams().toString()}`);
+    // 时间范围变更后，过期请求不得覆盖当前下拉选项。
+    if(key!==filterOptionsCacheKey())return;
+    state.filterOptionsKey=key;
+    fillFilterOptions(data);
+    if(data&&data.store&&data.store.usage_query_ok===false&&!state.filterOptionsWarned){
+      state.filterOptionsWarned=true;
+      toast("历史筛选选项加载失败，已仅显示配置项","error");
+    }
+  }catch(e){
+    if(key!==filterOptionsCacheKey())return;
+    // 保留现有选项；注入 orphan 以保证当前筛选值可见
+    fillFilterOptions(state.filterOptions||{api_key_ids:[],providers:[],models:[],outcomes:[]});
+    if(!state.filterOptionsWarned){state.filterOptionsWarned=true;toast(e.message||"筛选选项加载失败","error")}
+  }
+}
 async function loadUsage(resetEvents=true){
   try{
     const data=await request(`/admin/api/usage/dashboard?${usageParams().toString()}`);
@@ -216,12 +267,12 @@ $("closeDialog").onclick=closeDialog;$("cancelDialog").onclick=closeDialog;
 $("protocol").onchange=()=>renderCapabilities();
 $("providerForm").onsubmit=submitForm;
 $("search").oninput=e=>{state.query=e.target.value;renderProviders()};
-$("usageRefresh").onclick=()=>loadUsage(true);
+$("usageRefresh").onclick=()=>{loadFilterOptions(true);loadUsage(true)};
 $("loadMoreEvents").onclick=()=>loadEvents(false);
-$("usageApply").onclick=()=>{state.apiKeyFilter=$("usageKeyFilter").value.trim();state.providerFilter=$("usageProviderFilter").value.trim();state.modelFilter=$("usageModelFilter").value.trim();state.outcomeFilter=$("usageOutcomeFilter").value.trim();state.estimatedFilter=$("usageEstimatedFilter").value;state.from=$("usageFrom").value?new Date($("usageFrom").value).toISOString():"";state.to=$("usageTo").value?new Date($("usageTo").value).toISOString():"";if(state.from||state.to)state.range="custom";setHash();loadUsage(true)};
+$("usageApply").onclick=()=>{const prevKey=filterOptionsCacheKey();state.apiKeyFilter=$("usageKeyFilter").value.trim();state.providerFilter=$("usageProviderFilter").value.trim();state.modelFilter=$("usageModelFilter").value.trim();state.outcomeFilter=$("usageOutcomeFilter").value.trim();state.estimatedFilter=$("usageEstimatedFilter").value;state.from=$("usageFrom").value?new Date($("usageFrom").value).toISOString():"";state.to=$("usageTo").value?new Date($("usageTo").value).toISOString():"";if(state.from||state.to)state.range="custom";setHash();if(filterOptionsCacheKey()!==prevKey)loadFilterOptions(true);loadUsage(true)};
 $("closeUsageEvent").onclick=()=>$("usageEventDialog").close();
-document.querySelectorAll("#rangeGroup .btn").forEach(btn=>btn.onclick=()=>{state.range=btn.dataset.range;if(state.range!=="custom"){state.from="";state.to=""}document.querySelectorAll("#rangeGroup .btn").forEach(b=>b.classList.toggle("active",b===btn));setHash();loadUsage(true)});
-function applyUsageState(p){Object.assign(state,p);$("usageKeyFilter").value=state.apiKeyFilter;$("usageProviderFilter").value=state.providerFilter;$("usageModelFilter").value=state.modelFilter;$("usageOutcomeFilter").value=state.outcomeFilter;$("usageEstimatedFilter").value=state.estimatedFilter;$("usageFrom").value=state.from?state.from.slice(0,16):"";$("usageTo").value=state.to?state.to.slice(0,16):"";document.querySelectorAll("#rangeGroup .btn").forEach(b=>b.classList.toggle("active",b.dataset.range===state.range))}
+document.querySelectorAll("#rangeGroup .btn").forEach(btn=>btn.onclick=()=>{state.range=btn.dataset.range;if(state.range!=="custom"){state.from="";state.to=""}document.querySelectorAll("#rangeGroup .btn").forEach(b=>b.classList.toggle("active",b===btn));setHash();loadFilterOptions(true);loadUsage(true)});
+function applyUsageState(p){Object.assign(state,p);$("usageEstimatedFilter").value=state.estimatedFilter;$("usageFrom").value=state.from?state.from.slice(0,16):"";$("usageTo").value=state.to?state.to.slice(0,16):"";document.querySelectorAll("#rangeGroup .btn").forEach(b=>b.classList.toggle("active",b.dataset.range===state.range));if(state.filterOptions)fillFilterOptions(state.filterOptions);else{fillSelect($("usageKeyFilter"),"全部 API Key",[],state.apiKeyFilter);fillSelect($("usageProviderFilter"),"全部 Provider",[],state.providerFilter);fillSelect($("usageModelFilter"),"全部 Model",[],state.modelFilter);fillSelect($("usageOutcomeFilter"),"全部 Outcome",[],state.outcomeFilter)}}
 window.addEventListener("hashchange",()=>{const p=parseHash();applyUsageState(p);showTab(p.tab)});
 // boot
 const boot=parseHash();applyUsageState(boot);showTab(boot.tab);

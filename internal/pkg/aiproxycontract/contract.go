@@ -46,6 +46,7 @@ type UsageCountCommand struct{ Filter usage.UsageFilter }
 type UsageEventsCommand struct{ Filter usage.EventFilter }
 type UsageExportCommand struct{ Filter usage.UsageFilter }
 type UsageExportResult struct{ Data []byte }
+type UsageFilterOptionsCommand struct{ Query usage.FilterOptionsQuery }
 type UsageRecoverCommand struct{ At time.Time }
 type UsageCheckpointCommand struct{}
 type UsageHealthyCommand struct{}

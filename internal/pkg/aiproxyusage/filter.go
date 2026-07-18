@@ -2,6 +2,7 @@ package usage
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -12,6 +13,9 @@ const (
 	maxPageSize     = 100
 	maxFilterLen    = 256
 	maxRangeDays    = 366
+
+	// MaxFilterOptionValues 是 filter-options 每个维度的返回上限。
+	MaxFilterOptionValues = 200
 )
 
 // ValidateUsageFilter 规范化并校验时间范围与筛选字段。
@@ -119,4 +123,69 @@ func fillMissingDays(from, to time.Time, got []DailyBucket) []DailyBucket {
 		day = day.Add(24 * time.Hour)
 	}
 	return out
+}
+
+// ResolveFilterOptionsRange 规范化 filter-options 扫描窗口。
+// all-time 与 Dashboard 保持同一完整历史范围；每个维度的返回数量由
+// MaxFilterOptionValues 限制。
+func ResolveFilterOptionsRange(q FilterOptionsQuery) (from, to time.Time, err error) {
+	if q.AllTime {
+		now := time.Now().UTC()
+		to = now.Add(24 * time.Hour)
+		from = time.Unix(0, 0).UTC()
+		return from, to, nil
+	}
+	from, to = q.From.UTC(), q.To.UTC()
+	if from.IsZero() && to.IsZero() {
+		now := time.Now().UTC()
+		from = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		to = from.Add(24 * time.Hour)
+		return from, to, nil
+	}
+	if from.IsZero() || to.IsZero() {
+		return time.Time{}, time.Time{}, fmt.Errorf("from and to are required")
+	}
+	if !from.Before(to) {
+		return time.Time{}, time.Time{}, fmt.Errorf("from must be before to")
+	}
+	if to.Sub(from) > time.Duration(maxRangeDays)*24*time.Hour {
+		return time.Time{}, time.Time{}, fmt.Errorf("range must not exceed %d days", maxRangeDays)
+	}
+	return from, to, nil
+}
+
+// KnownOutcomes 返回 usage outcome 闭集（筛选下拉用，不查库）。
+// 与 proxy/stream_result.go 注释及 process_interrupted 恢复常量对齐。
+func KnownOutcomes() []string {
+	return []string{
+		"success",
+		"client_canceled",
+		"idle_timeout",
+		"limit_exceeded",
+		"upstream_truncated",
+		"upstream_failed",
+		"incomplete",
+		"client_write",
+		"conversion",
+		"protocol",
+		"error",
+		OutcomeProcessInterrupted,
+	}
+}
+
+// capSortedStrings 将集合排序并截断到 MaxFilterOptionValues，返回截断标志。
+func capSortedStrings(set map[string]struct{}) (values []string, truncated bool) {
+	values = make([]string, 0, len(set))
+	for v := range set {
+		if v == "" {
+			continue
+		}
+		values = append(values, v)
+	}
+	sort.Strings(values)
+	if len(values) > MaxFilterOptionValues {
+		values = values[:MaxFilterOptionValues]
+		truncated = true
+	}
+	return values, truncated
 }

@@ -456,6 +456,42 @@ func (s *MemoryStore) AllTimeByKey(_ context.Context) (map[string]Summary, error
 	return out, nil
 }
 
+// FilterOptions 扫描内存事件，按时间窗提取 distinct 值并截断。
+func (s *MemoryStore) FilterOptions(_ context.Context, q FilterOptionsQuery) (FilterOptionsResult, error) {
+	if s.closed.Load() {
+		return FilterOptionsResult{}, ErrStoreClosed
+	}
+	from, to, err := ResolveFilterOptionsRange(q)
+	if err != nil {
+		return FilterOptionsResult{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	keys := make(map[string]struct{})
+	providers := make(map[string]struct{})
+	models := make(map[string]struct{})
+	for _, e := range s.events {
+		if e.StartedAt.Before(from) || !e.StartedAt.Before(to) {
+			continue
+		}
+		if e.APIKeyID != "" {
+			keys[e.APIKeyID] = struct{}{}
+		}
+		if e.Provider != "" {
+			providers[e.Provider] = struct{}{}
+		}
+		if e.Model != "" {
+			models[e.Model] = struct{}{}
+		}
+	}
+	out := FilterOptionsResult{From: from, To: to}
+	out.APIKeyIDs, out.Truncated.APIKeyIDs = capSortedStrings(keys)
+	out.Providers, out.Truncated.Providers = capSortedStrings(providers)
+	out.Models, out.Truncated.Models = capSortedStrings(models)
+	return out, nil
+}
+
 func matchEvent(e *Event, f UsageFilter, from, to time.Time) bool {
 	if e.StartedAt.Before(from) || !e.StartedAt.Before(to) {
 		return false

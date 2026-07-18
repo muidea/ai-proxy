@@ -156,6 +156,32 @@ type EventPage struct {
 	NextCursor string  `json:"next_cursor,omitempty"`
 }
 
+// FilterOptionsQuery 限定用量观测 facet 的提取时间窗。
+// 配置侧合并由 admin 层完成；Store 只返回 usage 半结果。
+type FilterOptionsQuery struct {
+	From    time.Time
+	To      time.Time
+	AllTime bool
+}
+
+// FilterOptionsTruncation 标记各维度是否因上限被截断。
+type FilterOptionsTruncation struct {
+	APIKeyIDs bool
+	Providers bool
+	Models    bool
+}
+
+// FilterOptionsResult 是 usage 观测到的 distinct 值（不含配置合并）。
+type FilterOptionsResult struct {
+	APIKeyIDs []string
+	Providers []string
+	Models    []string
+	Truncated FilterOptionsTruncation
+	// 实际扫描窗口。
+	From time.Time
+	To   time.Time
+}
+
 // Store 是用量持久化权威接口。
 type Store interface {
 	Start(context.Context, StartRecord) error
@@ -164,6 +190,8 @@ type Store interface {
 	Count(context.Context, UsageFilter) (int64, error)
 	Events(context.Context, EventFilter) (EventPage, error)
 	ExportCSV(context.Context, UsageFilter, io.Writer) error
+	// FilterOptions 返回时间窗内的 distinct api_key_id/provider/model（有上限）。
+	FilterOptions(context.Context, FilterOptionsQuery) (FilterOptionsResult, error)
 	RecoverInterrupted(context.Context, time.Time) (int64, error)
 	Checkpoint(context.Context) error
 	Close() error
