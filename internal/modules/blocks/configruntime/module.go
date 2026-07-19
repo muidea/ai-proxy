@@ -3,10 +3,9 @@ package configruntime
 
 import (
 	"context"
-	"sync"
 
-	"ai-proxy/internal/pkg/aiproxybootstrap"
-	"ai-proxy/internal/pkg/aiproxycontract"
+	"ai-proxy/internal/modules/blocks/configruntime/biz"
+	configcommon "ai-proxy/internal/modules/blocks/configruntime/pkg/common"
 
 	cd "github.com/muidea/magicCommon/def"
 	"github.com/muidea/magicCommon/event"
@@ -17,67 +16,32 @@ import (
 func init() { pluginmodule.Register(New()) }
 
 type Module struct {
-	mu        sync.RWMutex
-	bootstrap aiproxycontract.Bootstrap
-	hub       event.Hub
-	observer  event.SimpleObserver
+	bizPtr *biz.ConfigRuntime
 }
 
 func New() *Module            { return &Module{} }
-func (i *Module) ID() string  { return aiproxycontract.ConfigBlockID }
+func (i *Module) ID() string  { return configcommon.UnitID }
 func (i *Module) Weight() int { return 10 }
 
-func (i *Module) Setup(_ context.Context, hub event.Hub, _ task.BackgroundRoutine) *cd.Error {
-	bootstrap, ok := aiproxybootstrap.Current()
-	if !ok {
-		return cd.NewError(cd.IllegalParam, "ai-proxy bootstrap is not configured")
+func (i *Module) Setup(_ context.Context, hub event.Hub, background task.BackgroundRoutine) *cd.Error {
+	bizPtr, err := biz.New(hub, background)
+	if err != nil {
+		return err
 	}
-	if hub == nil {
-		return cd.NewError(cd.IllegalParam, "event hub is unavailable")
-	}
-	i.bootstrap = bootstrap
-	i.hub = hub
-	i.observer = event.NewSimpleObserver(i.ID(), hub)
-	i.observer.Subscribe(aiproxycontract.TopicBootstrap, i.handleBootstrap)
-	i.observer.Subscribe(aiproxycontract.TopicActivateConfig, i.handleActivate)
+	i.bizPtr = bizPtr
 	return nil
 }
 
-func (i *Module) Run(context.Context) *cd.Error { return nil }
-
-func (i *Module) Teardown(context.Context) {
-	if i.observer != nil {
-		i.observer.Unsubscribe(aiproxycontract.TopicBootstrap)
-		i.observer.Unsubscribe(aiproxycontract.TopicActivateConfig)
+func (i *Module) Run(ctx context.Context) *cd.Error {
+	if i.bizPtr == nil {
+		return cd.NewError(cd.IllegalParam, "config runtime biz is not configured")
 	}
-	i.observer = nil
-	i.hub = nil
-	i.bootstrap = aiproxycontract.Bootstrap{}
+	return i.bizPtr.Run(ctx)
 }
 
-func (i *Module) handleBootstrap(ev event.Event, result event.Result) {
-	if _, ok := ev.Data().(aiproxycontract.BootstrapCommand); !ok {
-		result.Set(nil, cd.NewError(cd.IllegalParam, "invalid bootstrap command"))
-		return
+func (i *Module) Teardown(ctx context.Context) {
+	if i.bizPtr != nil {
+		i.bizPtr.Teardown(ctx)
 	}
-	i.mu.RLock()
-	bootstrap := i.bootstrap
-	i.mu.RUnlock()
-	result.Set(aiproxycontract.BootstrapResult{Bootstrap: bootstrap}, nil)
-}
-
-func (i *Module) handleActivate(ev event.Event, result event.Result) {
-	command, ok := ev.Data().(aiproxycontract.ActivateConfigCommand)
-	if !ok {
-		result.Set(nil, cd.NewError(cd.IllegalParam, "invalid config activate command"))
-		return
-	}
-	if err := aiproxycontract.UpdateProxyConfig(ev.Context(), i.hub, i.ID(), command.Config); err != nil {
-		result.Set(nil, cd.NewError(cd.Unexpected, "activate proxy config: "+err.Error()))
-		return
-	}
-	i.mu.Lock()
-	i.bootstrap.Config = command.Config
-	i.mu.Unlock()
-	result.Set(struct{}{}, nil)
+	i.bizPtr = nil
 }

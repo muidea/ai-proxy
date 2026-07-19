@@ -6,23 +6,23 @@ package aiproxybootstrap
 import (
 	"sync"
 
-	"ai-proxy/internal/pkg/aiproxycontract"
+	configevents "ai-proxy/internal/modules/blocks/configruntime/pkg/events"
 )
 
 var state struct {
 	sync.RWMutex
-	value aiproxycontract.Bootstrap
+	value configevents.Bootstrap
 	set   bool
 }
 
-func Configure(value aiproxycontract.Bootstrap) {
+func Configure(value configevents.Bootstrap) {
 	state.Lock()
 	defer state.Unlock()
 	state.value = value
 	state.set = true
 }
 
-func Current() (aiproxycontract.Bootstrap, bool) {
+func Current() (configevents.Bootstrap, bool) {
 	state.RLock()
 	defer state.RUnlock()
 	return state.value, state.set

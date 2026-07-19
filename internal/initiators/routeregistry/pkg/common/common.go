@@ -15,5 +15,6 @@ type RouteRegistryHelper interface {
 // 它不应被业务 Module 用作跨组件通信通道。
 type GatewayRuntimeHelper interface {
 	RouteRegistryHelper
+	Start() error
 	Done() <-chan error
 }

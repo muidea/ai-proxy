@@ -1,18 +1,18 @@
-// Package service 管理 usageruntime Block 的 DuckDB 生命周期。
-package service
+package biz
 
 import (
 	"context"
 	"log/slog"
 	"time"
 
-	"ai-proxy/internal/pkg/aiproxycontract"
+	configevents "ai-proxy/internal/modules/blocks/configruntime/pkg/events"
 	"ai-proxy/internal/pkg/aiproxyusage"
 )
 
+// Runtime is the Usage Block's private DuckDB lifecycle owner.
 type Runtime struct{ store usage.Store }
 
-func NewRuntime(bootstrap aiproxycontract.Bootstrap) (*Runtime, error) {
+func NewRuntime(bootstrap configevents.Bootstrap) (*Runtime, error) {
 	store, err := usage.OpenDuckDB(bootstrap.Config.UsageStore)
 	if err != nil {
 		return nil, err

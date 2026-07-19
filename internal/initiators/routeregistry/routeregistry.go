@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"ai-proxy/internal/initiators/routeregistry/pkg/common"
@@ -28,6 +29,8 @@ type routeRegistry struct {
 	server   *http.Server
 	listener net.Listener
 	done     chan error
+	mu       sync.Mutex
+	started  bool
 }
 
 var routeRegistryListen = net.Listen
@@ -70,11 +73,26 @@ func (r *routeRegistry) Setup(_ context.Context, _ event.Hub, _ task.BackgroundR
 	return nil
 }
 
+// Run only validates the prepared gateway. The process service starts serving
+// after every Module has registered its routes.
 func (r *routeRegistry) Run(context.Context) *cd.Error {
 	if r.server == nil || r.listener == nil || r.done == nil {
 		return cd.NewError(cd.IllegalParam, "http route registry is not configured")
 	}
+	return nil
+}
+
+func (r *routeRegistry) Start() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.server == nil || r.listener == nil || r.done == nil {
+		return errors.New("http route registry is not configured")
+	}
+	if r.started {
+		return nil
+	}
 	server, listener, done := r.server, r.listener, r.done
+	r.started = true
 	go func() {
 		err := server.Serve(listener)
 		if errors.Is(err, http.ErrServerClosed) {
@@ -99,6 +117,9 @@ func (r *routeRegistry) Teardown(ctx context.Context) {
 	r.handler = nil
 	r.server = nil
 	r.listener = nil
+	r.mu.Lock()
+	r.started = false
+	r.mu.Unlock()
 }
 
 func (r *routeRegistry) GetRouteRegistry() enginehttp.RouteRegistry { return r.routes }

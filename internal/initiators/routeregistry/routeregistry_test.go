@@ -5,10 +5,11 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
+	configevents "ai-proxy/internal/modules/blocks/configruntime/pkg/events"
 	"ai-proxy/internal/pkg/aiproxybootstrap"
 	"ai-proxy/internal/pkg/aiproxyconfig"
-	"ai-proxy/internal/pkg/aiproxycontract"
 )
 
 type testAddr string
@@ -25,7 +26,7 @@ func (l *testListener) Addr() net.Addr            { return testAddr("127.0.0.1:0
 func TestSetupFailsWhenListenerCannotBind(t *testing.T) {
 	oldListen := routeRegistryListen
 	t.Cleanup(func() { routeRegistryListen = oldListen })
-	aiproxybootstrap.Configure(aiproxycontract.Bootstrap{Config: config.Config{ListenAddr: "127.0.0.1:0"}})
+	aiproxybootstrap.Configure(configevents.Bootstrap{Config: config.Config{ListenAddr: "127.0.0.1:0"}})
 	routeRegistryListen = func(string, string) (net.Listener, error) { return nil, errors.New("listen failed") }
 
 	if err := New().Setup(context.Background(), nil, nil); err == nil {
@@ -36,7 +37,7 @@ func TestSetupFailsWhenListenerCannotBind(t *testing.T) {
 func TestTeardownClosesHTTPListener(t *testing.T) {
 	oldListen := routeRegistryListen
 	t.Cleanup(func() { routeRegistryListen = oldListen })
-	aiproxybootstrap.Configure(aiproxycontract.Bootstrap{Config: config.Config{ListenAddr: "127.0.0.1:0"}})
+	aiproxybootstrap.Configure(configevents.Bootstrap{Config: config.Config{ListenAddr: "127.0.0.1:0"}})
 	listener := &testListener{}
 	routeRegistryListen = func(string, string) (net.Listener, error) { return listener, nil }
 
@@ -50,5 +51,34 @@ func TestTeardownClosesHTTPListener(t *testing.T) {
 	router.Teardown(context.Background())
 	if !listener.closed {
 		t.Fatal("expected listener to be closed")
+	}
+}
+
+func TestRunDefersServingUntilStart(t *testing.T) {
+	oldListen := routeRegistryListen
+	t.Cleanup(func() { routeRegistryListen = oldListen })
+	aiproxybootstrap.Configure(configevents.Bootstrap{Config: config.Config{ListenAddr: "127.0.0.1:0"}})
+	listener := &testListener{}
+	routeRegistryListen = func(string, string) (net.Listener, error) { return listener, nil }
+
+	router := New()
+	if err := router.Setup(context.Background(), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-router.Done():
+		t.Fatalf("Run unexpectedly started serving: %v", err)
+	default:
+	}
+	if err := router.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-router.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Start did not begin serving")
 	}
 }

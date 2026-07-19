@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"time"
 
+	configevents "ai-proxy/internal/modules/blocks/configruntime/pkg/events"
 	"ai-proxy/internal/pkg/aiproxyconfig"
-	"ai-proxy/internal/pkg/aiproxycontract"
 	"ai-proxy/internal/services/aiproxy/logging"
 )
 
@@ -28,7 +28,7 @@ func Run(version string) int {
 	}
 	logging.ConfigureLogger(cfg.LogFormat, cfg.DebugLog)
 
-	runtime := NewRuntime(aiproxycontract.Bootstrap{Config: cfg, ConfigPath: resolvedConfigPath})
+	runtime := NewRuntime(configevents.Bootstrap{Config: cfg, ConfigPath: resolvedConfigPath})
 	serviceCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := runtime.Startup(serviceCtx); err != nil {

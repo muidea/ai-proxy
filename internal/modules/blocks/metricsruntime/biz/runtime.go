@@ -1,5 +1,4 @@
-// Package service 管理 metricsruntime Block 的 Registry 与 SLO 生命周期。
-package service
+package biz
 
 import (
 	"context"
@@ -7,21 +6,22 @@ import (
 	"log/slog"
 	"time"
 
-	"ai-proxy/internal/pkg/aiproxycontract"
+	configevents "ai-proxy/internal/modules/blocks/configruntime/pkg/events"
 	"ai-proxy/internal/pkg/aiproxymetrics"
 	"ai-proxy/internal/pkg/aiproxyusage"
 	"github.com/muidea/magicCommon/task"
 )
 
+// Runtime is the Metrics Block's private registry and SLO lifecycle owner.
 type Runtime struct {
 	registry  *metrics.Registry
 	evaluator *metrics.SLOEvaluator
-	config    aiproxycontract.Bootstrap
+	config    configevents.Bootstrap
 	cancel    context.CancelFunc
 	done      chan struct{}
 }
 
-func NewRuntime(ctx context.Context, bootstrap aiproxycontract.Bootstrap, store usage.Store) (*Runtime, error) {
+func NewRuntime(ctx context.Context, bootstrap configevents.Bootstrap, store usage.Store) (*Runtime, error) {
 	registry := metrics.NewRegistry()
 	if allTime, err := store.AllTimeByKey(ctx); err != nil {
 		registry.RecordUsageStoreQuery(0, err, store.Healthy())

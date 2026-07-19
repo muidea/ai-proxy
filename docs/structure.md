@@ -30,18 +30,24 @@ internal/services/
   usageimport/            CSV → DuckDB 一次性导入进程服务
 
 internal/modules/
-  blocks/configruntime/   Provider 配置 Block；拥有启动快照与热更新后的当前配置
-  blocks/usageruntime/    DuckDB 用量 Block；service/ 管理 migration、checkpoint 与关闭
-  blocks/metricsruntime/  metrics/SLO Block；通过 EventHub 读取 Usage Block 并提供 MetricsPort
+  base/biz/               Module/Block 的共享 EventHub、observer 与 BackgroundRoutine 基座
+  blocks/configruntime/   Provider 配置 Block；biz/ 拥有启动快照与热更新后的当前配置
+    pkg/events/                 Config Block 自有的启动快照与配置激活合同
+  blocks/usageruntime/    DuckDB 用量 Block；biz/ 管理 migration、checkpoint 与关闭
+    pkg/events/                 Usage Block 的逐命令 typed 合同
+  blocks/metricsruntime/  metrics/SLO Block；biz/ 管理 Registry 与 SLO 生命周期
+    pkg/events/                 Metrics Block 的记录与查询 typed 合同及 EventHub-backed Port
   application/proxyapi/         OpenAI/Anthropic Application Module
+    biz/                         EventHub 配置更新与运行期依赖
+    pkg/events/                  Proxy Module 自有的配置更新合同
     service/proxy/               入站鉴权、路由、转换、转发与归档钩子
   application/adminapi/         Provider 管理与 usage Application Module
+    biz/                         EventHub-backed 配置、Usage 与 Metrics 依赖
     service/admin/               loopback-only Provider 管理与 usage HTTP adapter
     service/observability/       metrics、stats 与 stats SSE HTTP adapter
 
 internal/pkg/
   aiproxybootstrap/       process service → framework 启动基础设施的单次启动快照桥接
-  aiproxycontract/        Initiator、Block、Module 之间的 EventHub DTO/topic 契约
   aiproxyconfig/          YAML 配置、环境变量展开与启动期 route 校验
   aiproxyarchive/         interaction round 归档
   aiproxyclientauth/      客户端 API Key 身份索引与解析（由 Proxy Module 持有）
@@ -58,11 +64,11 @@ web/admin/                嵌入二进制的管理页
 
 - `cmd/*` 不承载业务装配、HTTP server、存储或 CLI 业务逻辑；它们只调用对应 process service。
 - `internal/services/aiproxy` 是进程级 service，不是 plugin module：它只驱动 application lifecycle，并通过 RouteRegistry Initiator 等待 HTTP listener 退出。
-- Config Block 是启动配置与 Provider 热更新后的当前配置 owner。`routeregistry` Initiator 是 magicEngine RouteRegistry 与 listener 的进程级基础设施 owner；它只暴露窄的 `RouteRegistryHelper`，不承载任何业务状态。
+- Config Block 是启动配置与 Provider 热更新后的当前配置 owner。`routeregistry` Initiator 是 magicEngine RouteRegistry 与 listener 的进程级基础设施 owner；它只暴露窄的 `RouteRegistryHelper`，不承载任何业务状态。listener 由 process service 在所有 Module 路由注册后启动，避免启动窗口 404。
 - Usage 与 Metrics/SLO 是独立技术 Block，不暴露 HTTP route 或可变资源对象。Metrics Block 经 `MetricsPort` 接收记录事件和返回只读投影；Proxy 直接持有其唯一使用的 Client API Key 索引与 interaction archive。
 - Proxy API 与 Provider Admin 是有状态业务聚合 Module：它们通过 EventHub 获取 Block 依赖，并在 `Setup` 中注入 `RouteRegistryHelper`、在 `Run` 中注册各自路由。Admin 请求 Config Block 激活新配置，Config Block 同步命令 Proxy 应用新快照。Proxy 仅注册协议白名单路径，不依赖 Module Weight 确保路由优先级。
 - `internal/pkg/aiproxyarchive`、`internal/pkg/aiproxyclientauth`、`internal/pkg/aiproxyconfig`、`internal/pkg/aiproxyusage`、`internal/pkg/aiproxymetrics` 是对应运行单元使用的 focused package；它们不拥有 HTTP route 或 framework 生命周期。
-- `aiproxycontract` 是当前跨运行单元的稳定 EventHub DTO/topic 契约；`aiproxymetricsport` 提供 Metrics 的窄端口。其它契约在出现第二个调用方或独立 transport adapter 时再抽取。
+- EventHub topic、Command 与 Result 由投递 owner 的 `pkg/events` 定义：Config、Usage、Metrics 和 Proxy 各自拥有其合同；`aiproxymetricsport` 仅定义 Metrics 的窄端口，生产实现由 Metrics owner-local EventHub client 提供。
 - 新增 magicCommon plugin module 的前提是：具备独立 Setup/Run/Teardown、正式状态 owner、route/listener 或 EventHub 订阅，并由 `cmd` 显式加载；不得仅为缩短文件而创建 module。
 
 ## 变更规则

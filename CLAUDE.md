@@ -48,7 +48,6 @@ internal/modules/blocks/metricsruntime  metrics/SLO Block（经 EventHub 获取 
 internal/modules/application/proxyapi  OpenAI/Anthropic Application Module：Proxy 路由与热更新契约
 internal/modules/application/adminapi  Provider 管理与 usage Application Module
 internal/initiators/routeregistry  magicEngine RouteRegistry 与 HTTP listener Initiator
-internal/pkg/aiproxycontract  Initiator / Block / Module 的 EventHub topic 与 DTO
 
 internal/pkg/aiproxyconfig       配置加载、规范化、启动期校验；解析 model_catalog → RouteOwner
 internal/pkg/aiproxyarchive      interactions/{round_id}/ 轮次归档与保留策略
@@ -61,7 +60,7 @@ web/admin             嵌入二进制的管理页（Provider + 使用统计，go
 cmd/ai-proxy-usage-import  旧 usage.csv 一次性导入 DuckDB
 ```
 
-装配入口在 `internal/services/aiproxy/runtime.go`：通过 magicCommon `framework/application` + `framework/service.DefaultService` 管理 Initiator / Block / Module 生命周期。`cmd/ai-proxy/main.go` 显式 side-effect import 所需 Initiator、Block、Application Module；不得由业务包间接注册。Config Block 提供启动快照与配置激活；`routeregistry` Initiator 提供 magicEngine RouteRegistry 与 listener；Proxy、Admin Module 经 EventHub 获取 Usage 与 Metrics 端口，并经 `initiator.GetEntity` 注入 RouteRegistry 后注册路由。`cmd/` 不放业务装配。
+装配入口在 `internal/services/aiproxy/runtime.go`：通过 magicCommon `framework/application` + `framework/service.DefaultService` 管理 Initiator / Block / Module 生命周期。`cmd/ai-proxy/main.go` 显式 side-effect import 所需 Initiator、Block、Application Module；不得由业务包间接注册。Config、Usage、Metrics 和 Proxy 各自的 `pkg/events` 拥有 EventHub topic 与 typed DTO；Config Block 提供启动快照与配置激活；`routeregistry` Initiator 提供 magicEngine RouteRegistry 与 listener；Proxy、Admin Module 经 EventHub 获取 Usage 与 Metrics 端口，并经 `initiator.GetEntity` 注入 RouteRegistry 后注册路由。`cmd/` 不放业务装配。
 
 ## 路由与协议合同（核心）
 

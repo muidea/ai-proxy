@@ -8,14 +8,14 @@ import (
 	"testing"
 
 	registrycommon "ai-proxy/internal/initiators/routeregistry/pkg/common"
+	configevents "ai-proxy/internal/modules/blocks/configruntime/pkg/events"
 	"ai-proxy/internal/pkg/aiproxyconfig"
-	"ai-proxy/internal/pkg/aiproxycontract"
 	"github.com/muidea/magicCommon/framework/plugin/initiator"
 	enginehttp "github.com/muidea/magicEngine/http"
 )
 
 func TestRuntimeNeedsRegisteredFrameworkComponents(t *testing.T) {
-	runtime := NewRuntime(aiproxycontract.Bootstrap{Config: testConfig(t.TempDir())})
+	runtime := NewRuntime(configevents.Bootstrap{Config: testConfig(t.TempDir())})
 	if err := runtime.Startup(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -27,6 +27,9 @@ func TestRuntimeNeedsRegisteredFrameworkComponents(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertGatewayRoutes(t)
+	if err := startGateway(); err != nil {
+		t.Fatalf("start gateway: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := waitGateway(ctx); err != nil {

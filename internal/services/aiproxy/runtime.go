@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 
 	registrycommon "ai-proxy/internal/initiators/routeregistry/pkg/common"
+	configevents "ai-proxy/internal/modules/blocks/configruntime/pkg/events"
 	"ai-proxy/internal/pkg/aiproxybootstrap"
-	"ai-proxy/internal/pkg/aiproxycontract"
 
 	frameworkapplication "github.com/muidea/magicCommon/framework/application"
 	"github.com/muidea/magicCommon/framework/plugin/initiator"
@@ -21,10 +21,10 @@ import (
 // HTTP gateway Initiator、运行时 Block 和启动快照均由入口显式加载的组件提供。
 type Runtime struct {
 	application frameworkapplication.Application
-	bootstrap   aiproxycontract.Bootstrap
+	bootstrap   configevents.Bootstrap
 }
 
-func NewRuntime(cfg aiproxycontract.Bootstrap) *Runtime {
+func NewRuntime(cfg configevents.Bootstrap) *Runtime {
 	configDir := "."
 	if cfg.ConfigPath != "" {
 		configDir = filepath.Dir(cfg.ConfigPath)
@@ -55,7 +55,21 @@ func (r *Runtime) Run(ctx context.Context) error {
 	if err := r.application.Run(ctx); err != nil {
 		return err
 	}
+	if err := startGateway(); err != nil {
+		return err
+	}
 	return waitGateway(ctx)
+}
+
+func startGateway() error {
+	gateway, getErr := initiator.GetEntity(registrycommon.RouteRegistryInitiator, registrycommon.GatewayRuntimeHelper(nil))
+	if getErr != nil {
+		return fmt.Errorf("get HTTP route registry initiator: %s", getErr.Message)
+	}
+	if err := gateway.Start(); err != nil {
+		return fmt.Errorf("start HTTP route registry: %w", err)
+	}
+	return nil
 }
 
 func (r *Runtime) Shutdown(ctx context.Context) {
