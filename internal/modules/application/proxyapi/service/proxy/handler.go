@@ -124,7 +124,7 @@ func buildClientKeyIndex(cfg config.Config) *clientauth.Index {
 	entries := config.ClientAPIKeyEntries(cfg)
 	keys := make([]clientauth.KeyEntry, 0, len(entries))
 	for _, e := range entries {
-		keys = append(keys, clientauth.KeyEntry{ID: e.ID, APIKey: e.APIKey, Enabled: e.Enabled})
+		keys = append(keys, clientauth.KeyEntry{ID: e.ID, APIKey: e.APIKey, APIKeyHash: e.APIKeyHash, Enabled: e.Enabled})
 	}
 	return clientauth.BuildIndex(keys)
 }

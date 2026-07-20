@@ -43,6 +43,7 @@ make release-package VERSION=v1.2.3
 | 主题 | 文档 |
 | --- | --- |
 | 配置、客户端 Key、Provider 管理 | [配置参考](docs/configuration.md) |
+| 客户端 Key 管理收口 | [客户端 API Key 管理设计](docs/client-api-key-management-design-2026-07-20.md) |
 | 协议端点、模型路由、转换与错误合同 | [Provider Capability Contract](docs/provider-capability-contract-design-2026-07-15.md) |
 | DuckDB 用量、Admin API、Web 统计 | [API Key 用量与 DuckDB 收口方案](docs/api-key-usage-duckdb-web-closure-plan-2026-07-17.md) |
 | 运行、监控、归档、探针、备份与发布 | [运维与发布](docs/operations.md) |

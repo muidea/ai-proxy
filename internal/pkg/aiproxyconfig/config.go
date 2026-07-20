@@ -2,6 +2,8 @@ package config
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/url"
@@ -58,9 +60,10 @@ type Config struct {
 // ClientAPIKey 描述一个客户端调用方密钥条目。
 // ID 规范化为小写;APIKey 可含 ${ENV} 展开结果;Enabled=false 时请求返回 401。
 type ClientAPIKey struct {
-	ID      string
-	APIKey  string
-	Enabled bool
+	ID         string
+	APIKey     string
+	APIKeyHash string
+	Enabled    bool
 }
 
 // UsageStoreConfig 是 DuckDB usage 持久化配置。
@@ -418,6 +421,8 @@ func setClientAPIKey(cfg *Config, id, key, value string) error {
 	switch key {
 	case "api_key":
 		entry.APIKey = value
+	case "api_key_hash":
+		entry.APIKeyHash = value
 	case "enabled":
 		b, err := parseStrictBool(value)
 		if err != nil {
@@ -1596,6 +1601,7 @@ func normalizeClientAPIKeys(cfg *Config) error {
 		}
 		entry.ID = id
 		entry.APIKey = strings.TrimSpace(entry.APIKey)
+		entry.APIKeyHash = strings.ToLower(strings.TrimSpace(entry.APIKeyHash))
 		normalized[id] = entry
 	}
 	cfg.ClientAPIKeys = normalized
@@ -1603,8 +1609,8 @@ func normalizeClientAPIKeys(cfg *Config) error {
 }
 
 func validateClientAPIKeys(cfg Config) error {
-	// 用展开后密钥做唯一性检查;错误信息不得包含密钥明文。
-	seenSecrets := make(map[string]string, len(cfg.ClientAPIKeys)) // secret -> id
+	// 用摘要做唯一性检查;错误信息不得包含密钥明文。
+	seenDigests := make(map[string]string, len(cfg.ClientAPIKeys))
 	for id, entry := range cfg.ClientAPIKeys {
 		if id == BuiltinDefaultAPIKeyID {
 			return fmt.Errorf("client_api_keys: %q is a reserved builtin id", BuiltinDefaultAPIKeyID)
@@ -1612,18 +1618,39 @@ func validateClientAPIKeys(cfg Config) error {
 		if !clientAPIKeyIDPattern.MatchString(id) {
 			return fmt.Errorf("client_api_keys: invalid id %q", id)
 		}
-		if entry.Enabled && entry.APIKey == "" {
-			return fmt.Errorf("client_api_keys.%s: api_key is required when enabled", id)
+		if entry.APIKey != "" && entry.APIKeyHash != "" {
+			return fmt.Errorf("client_api_keys.%s: api_key and api_key_hash are mutually exclusive", id)
 		}
-		if entry.APIKey == "" {
+		if entry.Enabled && entry.APIKey == "" && entry.APIKeyHash == "" {
+			return fmt.Errorf("client_api_keys.%s: api_key or api_key_hash is required when enabled", id)
+		}
+		if entry.APIKey == "" && entry.APIKeyHash == "" {
 			continue
 		}
-		if prev, ok := seenSecrets[entry.APIKey]; ok {
-			return fmt.Errorf("client_api_keys: duplicate api_key shared by %q and %q", prev, id)
+		digest := entry.APIKeyHash
+		if entry.APIKey != "" {
+			sum := sha256.Sum256([]byte(entry.APIKey))
+			digest = "sha256:" + hex.EncodeToString(sum[:])
+		} else if !isClientAPIKeyHash(digest) {
+			return fmt.Errorf("client_api_keys.%s: invalid api_key_hash", id)
 		}
-		seenSecrets[entry.APIKey] = id
+		if prev, ok := seenDigests[digest]; ok {
+			if entry.APIKey != "" && cfg.ClientAPIKeys[prev].APIKey != "" {
+				return fmt.Errorf("client_api_keys: duplicate api_key shared by %q and %q", prev, id)
+			}
+			return fmt.Errorf("client_api_keys: duplicate credential shared by %q and %q", prev, id)
+		}
+		seenDigests[digest] = id
 	}
 	return nil
+}
+
+func isClientAPIKeyHash(value string) bool {
+	if !strings.HasPrefix(value, "sha256:") || len(value) != len("sha256:")+64 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil
 }
 
 func validateUsageStore(us UsageStoreConfig) error {

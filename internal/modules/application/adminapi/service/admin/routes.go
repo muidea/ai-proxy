@@ -16,7 +16,7 @@ func RegisterRoutes(routes enginehttp.RouteRegistry, handler http.Handler, regis
 	if routes == nil || handler == nil || registry == nil {
 		return
 	}
-	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut} {
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
 		routes.AddHandler("/admin", method, serve(handler))
 		routes.AddHandler("/admin/**", method, serve(handler))
 	}

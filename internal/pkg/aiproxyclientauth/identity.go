@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"strings"
@@ -26,9 +27,10 @@ func DefaultIdentity() ClientIdentity {
 
 // KeyEntry 描述配置中的一个客户端 API Key（校验后视图）。
 type KeyEntry struct {
-	ID      string
-	APIKey  string
-	Enabled bool
+	ID         string
+	APIKey     string
+	APIKeyHash string
+	Enabled    bool
 }
 
 // Index 是密钥 digests 到身份的只读查找表。
@@ -53,11 +55,16 @@ func BuildIndex(entries []KeyEntry) *Index {
 	}
 	for _, e := range entries {
 		id := strings.TrimSpace(e.ID)
-		key := strings.TrimSpace(e.APIKey)
-		if id == "" || key == "" {
+		if id == "" {
 			continue
 		}
-		d := sha256.Sum256([]byte(key))
+		var d [32]byte
+		key := strings.TrimSpace(e.APIKey)
+		if key != "" {
+			d = sha256.Sum256([]byte(key))
+		} else if !parseHash(e.APIKeyHash, &d) {
+			continue
+		}
 		ident := ClientIdentity{KeyID: id, Builtin: false}
 		idx.byDigest[d] = ident
 		if e.Enabled {
@@ -67,6 +74,15 @@ func BuildIndex(entries []KeyEntry) *Index {
 		}
 	}
 	return idx
+}
+
+func parseHash(value string, target *[32]byte) bool {
+	value = strings.TrimPrefix(strings.TrimSpace(value), "sha256:")
+	if len(value) != 64 || target == nil {
+		return false
+	}
+	_, err := hex.Decode(target[:], []byte(value))
+	return err == nil
 }
 
 // ResolveHeaders 按方案 §8 从标准请求头解析身份。

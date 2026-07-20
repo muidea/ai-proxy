@@ -92,6 +92,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.updateProviders(w, r)
+	case r.URL.Path == "/admin/api/client-api-keys" && r.Method == http.MethodGet:
+		h.listClientAPIKeys(w)
+	case r.URL.Path == "/admin/api/client-api-keys" && r.Method == http.MethodPost:
+		h.createClientAPIKey(w, r)
+	case strings.HasPrefix(r.URL.Path, "/admin/api/client-api-keys/"):
+		h.clientAPIKeyAction(w, r)
 	case strings.HasPrefix(r.URL.Path, "/admin/api/usage/"):
 		h.usageAPI(w, r)
 	default:

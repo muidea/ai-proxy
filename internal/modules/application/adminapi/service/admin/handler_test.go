@@ -151,6 +151,60 @@ func TestHandlerUpdatesProvidersPreservesRawSecretAndHotReloads(t *testing.T) {
 	}
 }
 
+func TestHandlerManagesHashedClientAPIKeys(t *testing.T) {
+	t.Setenv("ADMIN_TEST_API_KEY", "secret-value")
+	path := writeAdminTestConfig(t)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &testRuntime{cfg: cfg}
+	handler := NewHandler(path, runtime)
+
+	create := httptest.NewRequest(http.MethodPost, "/admin/api/client-api-keys", strings.NewReader(`{"id":"ci-agent"}`))
+	create.RemoteAddr = "127.0.0.1:1234"
+	create.Header.Set("X-AI-Proxy-Admin", "1")
+	create.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, create)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		APIKey string `json:"api_key"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil || !strings.HasPrefix(created.APIKey, "aip_") {
+		t.Fatalf("created = %#v err=%v", created, err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), created.APIKey) || !strings.Contains(string(raw), "api_key_hash") {
+		t.Fatalf("key storage leaked secret: %s", raw)
+	}
+
+	list := httptest.NewRequest(http.MethodGet, "/admin/api/client-api-keys", nil)
+	list.RemoteAddr = "127.0.0.1:1234"
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, list)
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), created.APIKey) || !strings.Contains(rec.Body.String(), `"credential_source":"managed"`) {
+		t.Fatalf("list = %d %s", rec.Code, rec.Body.String())
+	}
+
+	disable := httptest.NewRequest(http.MethodPatch, "/admin/api/client-api-keys/ci-agent", strings.NewReader(`{"enabled":false}`))
+	disable.RemoteAddr = "127.0.0.1:1234"
+	disable.Header.Set("X-AI-Proxy-Admin", "1")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, disable)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable = %d %s", rec.Code, rec.Body.String())
+	}
+	if runtime.cfg.ClientAPIKeys["ci-agent"].Enabled {
+		t.Fatal("key remained enabled")
+	}
+}
+
 func TestHandlerRejectsInvalidProviderChangeWithoutReplacingConfig(t *testing.T) {
 	t.Setenv("ADMIN_TEST_API_KEY", "secret-value")
 	path := writeAdminTestConfig(t)
