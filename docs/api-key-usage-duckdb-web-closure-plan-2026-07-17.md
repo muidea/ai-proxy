@@ -1,10 +1,12 @@
 # API Key 用量统计、DuckDB 持久化与 Web 展示收口方案
 
-Status: implemented-for-live-validation
+Status: superseded-in-part
 
 Type: closure-plan
 
 Last Updated: 2026-07-17
+
+> 认证策略更新（2026-07-20）：本文件中任何“未携带客户端 Key 归入 `default` 并允许访问”的描述均已废止。所有数据端点现在必须携带已启用客户端 Key；缺失、空白、未知、禁用、格式错误或冲突 Key 均返回 401，且不产生 usage。既有 `default` 行仅作为历史 usage 数据保留。
 
 ## 1. 文档目的
 
@@ -1298,7 +1300,7 @@ cmd/ai-proxy-usage-import/
 
 - [x] 只有 client_api_keys 是客户端 Key 配置 authority。
 - [x] inbound_api_key 和对应环境变量完全删除。
-- [x] 未携带 Key 稳定归入 default。
+- [x] （已废止）未携带 Key 稳定归入 default；现已改为 401 且不计 usage。
 - [x] 已知 Key 稳定归入配置 ID。
 - [x] 未知、禁用、格式错误、冲突 Key 返回 401。
 - [x] 入站 Key 不转发上游。

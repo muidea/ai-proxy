@@ -609,7 +609,7 @@
 ### Goals
 
 - **G-USAGE.01** 客户端 API Key 用于调用方识别与用量归属；唯一配置 authority 为 `client_api_keys`。
-- **G-USAGE.02** 未携带 Key 归入内置 `default`；未知/禁用/格式错误/冲突 Key 返回 401 且不计 usage。
+- **G-USAGE.02** 每个数据请求必须携带已启用 Key；缺失/未知/禁用/格式错误/冲突 Key 返回 401 且不计 usage。
 - **G-USAGE.03** DuckDB `usage_events` 是唯一在线用量持久化 authority；CSV 仅导出与一次性导入。
 - **G-USAGE.04** 调用在访问上游前持久化 `started`，所有退出路径尝试 `completed`。
 - **G-USAGE.05** Web 管理端提供使用统计页签（Dashboard/趋势/Key 汇总/明细分页/CSV 导出），loopback-only。

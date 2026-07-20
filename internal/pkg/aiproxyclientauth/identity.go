@@ -10,19 +10,9 @@ import (
 	"strings"
 )
 
-// DefaultKeyID 是未携带客户端 Key 时使用的内置统计 ID。
-// 不能由配置覆盖，也不能通过请求显式选择。
-const DefaultKeyID = "default"
-
 // ClientIdentity 是请求期只读调用方身份；只暴露稳定 KeyID，不含原始密钥。
 type ClientIdentity struct {
-	KeyID   string
-	Builtin bool
-}
-
-// DefaultIdentity 返回内置 default 身份。
-func DefaultIdentity() ClientIdentity {
-	return ClientIdentity{KeyID: DefaultKeyID, Builtin: true}
+	KeyID string
 }
 
 // KeyEntry 描述配置中的一个客户端 API Key（校验后视图）。
@@ -65,7 +55,7 @@ func BuildIndex(entries []KeyEntry) *Index {
 		} else if !parseHash(e.APIKeyHash, &d) {
 			continue
 		}
-		ident := ClientIdentity{KeyID: id, Builtin: false}
+		ident := ClientIdentity{KeyID: id}
 		idx.byDigest[d] = ident
 		if e.Enabled {
 			idx.enabled[d] = ident
@@ -110,7 +100,7 @@ func ResolveHeaders(header http.Header, idx *Index) (ClientIdentity, error) {
 	}
 
 	if len(creds) == 0 {
-		return DefaultIdentity(), nil
+		return ClientIdentity{}, ErrAuthenticationFailed
 	}
 
 	// 两个 Header 同时存在且值不同 → 401。
@@ -154,14 +144,14 @@ func WithClientIdentity(ctx context.Context, identity ClientIdentity) context.Co
 	return context.WithValue(ctx, identityContextKey{}, identity)
 }
 
-// ClientIdentityFromContext 读取 context 中的身份；缺失时返回 default。
-// 后续 Handler / UsageStore / 归档 / 日志只应消费此处身份，禁止再次读取 Header。
+// ClientIdentityFromContext 读取已认证身份。缺失身份表示调用方绕过了认证边界，
+// 仅用于防御性降级；业务请求在进入此处前必须已完成 Header 认证。
 func ClientIdentityFromContext(ctx context.Context) ClientIdentity {
 	if ctx == nil {
-		return DefaultIdentity()
+		return ClientIdentity{}
 	}
 	if v, ok := ctx.Value(identityContextKey{}).(ClientIdentity); ok && v.KeyID != "" {
 		return v
 	}
-	return DefaultIdentity()
+	return ClientIdentity{}
 }

@@ -48,7 +48,7 @@ type Config struct {
 	MetricsAllowedCIDRs  []string
 	SLO                  SLOConfig
 	// ClientAPIKeys 是客户端调用方识别与用量归属的唯一配置 authority。
-	// 可为空:未携带 Key 的请求归入内置 default 统计桶。
+	// 业务请求必须携带并匹配一个 enabled Key；配置可暂时为空，以便通过本地 Admin 创建首个 Key。
 	ClientAPIKeys map[string]ClientAPIKey
 	// UsageStore 描述进程内嵌 DuckDB 持久化统计存储。路径与资源参数变更需重启。
 	UsageStore UsageStoreConfig
@@ -1530,8 +1530,8 @@ func CatalogModelsSorted(catalog map[string]ModelInfo) []ModelInfo {
 // clientAPIKeyIDPattern: [a-z0-9][a-z0-9._-]{0,63}
 var clientAPIKeyIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
-// BuiltinDefaultAPIKeyID 是未携带客户端 Key 时的内置统计 ID,配置中禁止声明。
-const BuiltinDefaultAPIKeyID = "default"
+// ReservedClientAPIKeyID 保留给历史 usage 记录，配置中禁止声明。
+const ReservedClientAPIKeyID = "default"
 
 const (
 	defaultUsageStorePath              = "usage.duckdb"
@@ -1590,8 +1590,8 @@ func normalizeClientAPIKeys(cfg *Config) error {
 		if id == "" {
 			return fmt.Errorf("client_api_keys: empty id")
 		}
-		if id == BuiltinDefaultAPIKeyID {
-			return fmt.Errorf("client_api_keys: %q is a reserved builtin id", BuiltinDefaultAPIKeyID)
+		if id == ReservedClientAPIKeyID {
+			return fmt.Errorf("client_api_keys: %q is a reserved id", ReservedClientAPIKeyID)
 		}
 		if !clientAPIKeyIDPattern.MatchString(id) {
 			return fmt.Errorf("client_api_keys: invalid id %q (must match [a-z0-9][a-z0-9._-]{0,63})", id)
@@ -1612,8 +1612,8 @@ func validateClientAPIKeys(cfg Config) error {
 	// 用摘要做唯一性检查;错误信息不得包含密钥明文。
 	seenDigests := make(map[string]string, len(cfg.ClientAPIKeys))
 	for id, entry := range cfg.ClientAPIKeys {
-		if id == BuiltinDefaultAPIKeyID {
-			return fmt.Errorf("client_api_keys: %q is a reserved builtin id", BuiltinDefaultAPIKeyID)
+		if id == ReservedClientAPIKeyID {
+			return fmt.Errorf("client_api_keys: %q is a reserved id", ReservedClientAPIKeyID)
 		}
 		if !clientAPIKeyIDPattern.MatchString(id) {
 			return fmt.Errorf("client_api_keys: invalid id %q", id)

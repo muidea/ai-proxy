@@ -212,9 +212,6 @@ func parseUsageFilter(r *http.Request) (usage.UsageFilter, error) {
 }
 
 func keyStatus(cfg config.Config, id string) string {
-	if id == config.BuiltinDefaultAPIKeyID || id == "default" {
-		return "builtin"
-	}
 	if entry, ok := cfg.ClientAPIKeys[id]; ok {
 		if entry.Enabled {
 			return "active"
@@ -328,11 +325,6 @@ func mergeFilterOptions(cfg config.Config, usageRes usage.FilterOptionsResult) (
 		o := ensureKey(id)
 		o.InConfig = true
 		o.Status = keyStatus(cfg, id)
-	}
-	// 内置 default 始终出现。
-	def := ensureKey(config.BuiltinDefaultAPIKeyID)
-	if def.Status == "" {
-		def.Status = "builtin"
 	}
 	for _, id := range usageRes.APIKeyIDs {
 		if id == "" {

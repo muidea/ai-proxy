@@ -203,6 +203,12 @@ func matchingEnabled(providers map[string]config.Provider, modelID string) []str
 
 func newTestHandler(cfg config.Config, usageFile string) *Handler {
 	cfg = mustHandlerConfig(cfg)
+	if cfg.ClientAPIKeys == nil {
+		cfg.ClientAPIKeys = map[string]config.ClientAPIKey{}
+	}
+	if _, ok := cfg.ClientAPIKeys["test-client"]; !ok {
+		cfg.ClientAPIKeys["test-client"] = config.ClientAPIKey{ID: "test-client", APIKey: "test-client-key", Enabled: true}
+	}
 	if cfg.InteractionDir == "" {
 		cfg.InteractionDir = filepath.Join(filepath.Dir(usageFile), "interactions")
 	}

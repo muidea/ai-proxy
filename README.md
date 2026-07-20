@@ -25,7 +25,7 @@ OpenAI API base:    http://127.0.0.1:8080/v1
 Anthropic API base: http://127.0.0.1:8080
 ```
 
-如配置了 `client_api_keys`，OpenAI 客户端通过 `Authorization: Bearer <key>`、Anthropic 客户端通过 `X-API-Key: <key>` 提交身份。未携带 Key 的请求归入内置 `default` 统计桶。
+所有数据端点都要求客户端 API Key：OpenAI 客户端使用 `Authorization: Bearer <key>`，Anthropic 客户端使用 `X-API-Key: <key>`。缺失、未知或禁用的 Key 返回 401，且不产生用量记录。
 
 ## 常用命令
 

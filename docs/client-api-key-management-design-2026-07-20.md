@@ -17,7 +17,7 @@ Last Updated: 2026-07-20
 3. Admin 托管的 Key 在 YAML 中只保存不可逆 `api_key_hash`，不保存明文；现有 `api_key: ${ENV}` 形式继续兼容，标记为外部配置凭据。
 4. Key 的稳定 ID 是用量归属 ID，不能原地改名。轮换保持同一 ID，历史和未来用量继续聚合到同一 `api_key_id`。
 5. 禁用与删除都使携带该 Key 的新请求返回 401；二者均不删除 DuckDB 中的历史用量。日常暂停使用禁用，永久废弃才删除。
-6. `default` 仍是未携带客户端 Key 的内置身份，不是实际凭据，不能管理或显式选择。
+6. 每个数据请求必须提供已启用客户端 Key；`default` 仅是历史 usage 记录的保留 ID，不能配置或显式选择。
 7. 不新增 framework Module、Block 或 Initiator。HTTP 管理能力扩展既有 `application/adminapi`；配置激活继续走 `adminapi -> configruntime Block -> proxyapi` 的 EventHub 合同。
 
 本设计不改变 Provider 上游认证。`providers.<name>.api_key` 仅用于 ai-proxy 调用上游；这里管理的 Key 仅用于客户端调用 ai-proxy。
@@ -99,7 +99,7 @@ api_key_hash = "sha256:" + hex(sha256(api_key))
 
 必须继续满足：
 
-1. 无身份 Header 或空 Header返回内置 `default`；携带未知、禁用、格式错误或冲突 Header 返回 401。
+1. 缺失、空白、未知、禁用、格式错误或冲突身份 Header 均返回 401。
 2. `Authorization` 与 `X-API-Key` 均不转发给上游。
 3. 401 在 `UsageStore.Start` 之前返回，不产生 usage event。
 4. 所有持久化、指标、日志、归档和 Admin 查询只出现 `api_key_id`，不出现明文 Key、摘要或 Header 值。

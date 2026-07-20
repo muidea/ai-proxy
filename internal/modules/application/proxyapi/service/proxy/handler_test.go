@@ -357,6 +357,9 @@ func TestAnthropicNativeAvoidsDuplicateV1AndArchives(t *testing.T) {
 		ListenAddr:     ":0",
 		InteractionDir: filepath.Join(tmpDir, "interactions"),
 		DebugLog:       true,
+		ClientAPIKeys: map[string]config.ClientAPIKey{
+			"test-client": {ID: "test-client", APIKey: "test-client-key", Enabled: true},
+		},
 		Providers: map[string]config.Provider{
 			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://upstream.test/v1", APIKey: "test-key"},
 		},
@@ -1148,6 +1151,9 @@ func testHandler(baseURL, tmpDir, provider string) *Handler {
 		ListenAddr:     ":0",
 		InteractionDir: filepath.Join(tmpDir, "interactions"),
 		DebugLog:       true,
+		ClientAPIKeys: map[string]config.ClientAPIKey{
+			"test-client": {ID: "test-client", APIKey: "test-client-key", Enabled: true},
+		},
 		Providers: map[string]config.Provider{
 			provider: {Name: provider, Protocol: "openai", BaseURL: baseURL, APIKey: "test-key"},
 		},
@@ -1279,7 +1285,9 @@ func testResponse(status int, contentType, body string) *http.Response {
 }
 
 func newRequest(method, target, body string) *http.Request {
-	return httptest.NewRequest(method, target, strings.NewReader(body))
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-client-key")
+	return req
 }
 
 func newResponseRecorder() *httptest.ResponseRecorder {
@@ -1486,11 +1494,12 @@ func TestClientAPIKeyIdentity(t *testing.T) {
 		return jsonResponse(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`), nil
 	})
 
-	// 未携带 Key → default,允许访问。
+	// 未携带 Key → 401，不访问上游。
 	req := newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
+	req.Header.Del("Authorization")
 	rec := newResponseRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("no-key status = %d body=%s", rec.Code, rec.Body.String())
 	}
 
@@ -1524,6 +1533,7 @@ func TestClientAPIKeyIdentity(t *testing.T) {
 
 	// 已知 X-API-Key → 200
 	req = newRequest(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
+	req.Header.Del("Authorization")
 	req.Header.Set("X-API-Key", "secret")
 	rec = newResponseRecorder()
 	handler.ServeHTTP(rec, req)
@@ -1532,9 +1542,9 @@ func TestClientAPIKeyIdentity(t *testing.T) {
 	}
 
 	rows := readUsageFromStore(t, handler)
-	// 3 成功调用(未知 Key 不计)
-	if len(rows) != 4 { // header + 3
-		t.Fatalf("usage rows = %d want 4 (hdr+3)", len(rows))
+	// 2 成功调用；缺失和未知 Key 均不计 usage。
+	if len(rows) != 3 { // header + 2
+		t.Fatalf("usage rows = %d want 3 (hdr+2)", len(rows))
 	}
 }
 

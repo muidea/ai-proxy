@@ -122,7 +122,7 @@ func (h *Handler) clientAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 	rotate := strings.HasSuffix(rest, "/rotate")
 	id := strings.TrimSuffix(rest, "/rotate")
 	id = strings.ToLower(strings.TrimSpace(strings.Trim(id, "/")))
-	if id == "" || id == config.BuiltinDefaultAPIKeyID {
+	if id == "" || id == config.ReservedClientAPIKeyID {
 		writeError(w, http.StatusBadRequest, "invalid client API key id")
 		return
 	}

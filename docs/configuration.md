@@ -61,14 +61,14 @@ client_api_keys:
     enabled: false
 ```
 
-- Key ID 需匹配 `[a-z0-9][a-z0-9._-]{0,63}`，`default` 为内置保留 ID。
-- 未携带 Key 或空 Header 归入 `default`；未知、禁用、格式错误或两个身份 Header 冲突时返回 401。
+- Key ID 需匹配 `[a-z0-9][a-z0-9._-]{0,63}`，`default` 为历史用量保留 ID，不能配置。
+- 每个数据请求必须携带 Key；缺失、空 Header、未知、禁用、格式错误或两个身份 Header 冲突时均返回 401，且不产生用量记录。
 - OpenAI 使用 `Authorization: Bearer <key>`，Anthropic 使用 `X-API-Key: <key>`；两种 Header 可兼容，但同时出现时必须为同一 Key。
 - 原始客户端 Key 不写入日志、DuckDB、归档或管理 API，也不会转发给上游。
 - Admin 可创建、启停、轮换或删除客户端 Key。创建和轮换仅在成功响应中显示一次明文；托管 Key 的 YAML 使用 `api_key_hash`，不能与 `api_key` 同时配置。
 - `inbound_api_key`、`AI_PROXY_INBOUND_API_KEY`、`usage_file` 与 `AI_PROXY_USAGE_FILE` 已删除，配置中出现会启动失败。
 
-客户端 Key 是归属机制，不是非 loopback 监听的访问控制。若监听 `0.0.0.0:8080` 或 `:8080`，请在防火墙、反向代理或私有网络层实施访问控制。
+客户端 Key 是必需的应用层认证；若监听 `0.0.0.0:8080` 或 `:8080`，仍应在防火墙、反向代理或私有网络层实施额外访问控制。
 
 ## Server 配置
 

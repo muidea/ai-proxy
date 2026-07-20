@@ -43,7 +43,7 @@ server:
 # endpoint_capabilities 仅声明上游直连能力;客户端可服务 path 由 TransportPlan 矩阵决定
 # (含 OpenAI chat ↔ Anthropic messages 基础文本转换)。
 
-# 客户端 API Key(可选)。未携带 Key 的请求归入内置 default 统计桶。
+# 客户端 API Key。所有数据端点均需携带一个已启用的 Key。
 # client_api_keys:
 #   codex:
 #     api_key: ${CODEX_API_KEY}

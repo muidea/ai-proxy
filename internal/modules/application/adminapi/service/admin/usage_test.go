@@ -161,7 +161,7 @@ func TestUsageFilterOptionsMergeAndLoopback(t *testing.T) {
 			InUsage  bool
 		}{k.Status, k.InConfig, k.InUsage}
 	}
-	for _, id := range []string{"codex", "default", "unused-key", "retired"} {
+	for _, id := range []string{"codex", "unused-key", "retired"} {
 		if _, ok := keyByID[id]; !ok {
 			t.Fatalf("missing key %s in %#v", id, keyByID)
 		}
@@ -174,9 +174,6 @@ func TestUsageFilterOptionsMergeAndLoopback(t *testing.T) {
 	}
 	if keyByID["retired"].Status != "deleted" || keyByID["retired"].InConfig || !keyByID["retired"].InUsage {
 		t.Fatalf("retired = %#v", keyByID["retired"])
-	}
-	if keyByID["default"].Status != "builtin" {
-		t.Fatalf("default = %#v", keyByID["default"])
 	}
 
 	provByID := map[string]struct{ InConfig, InUsage bool }{}
@@ -270,7 +267,7 @@ func TestUsageFilterOptionsStoreFailureDegrades(t *testing.T) {
 	for _, k := range payload.APIKeyIDs {
 		ids[k.ID] = true
 	}
-	if !ids["codex"] || !ids["default"] {
+	if !ids["codex"] {
 		t.Fatalf("config keys missing on degrade: %#v", ids)
 	}
 }

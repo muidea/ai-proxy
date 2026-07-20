@@ -280,7 +280,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// 客户端身份解析:未携带 Key → default;未知/禁用/冲突 → 401(不计 usage)。
+	// 客户端身份解析:缺失、未知、禁用或冲突 Key 均返回 401(不计 usage)。
 	identity, err := clientauth.ResolveHeaders(r.Header, h.clientKeyIndex.Load())
 	if err != nil {
 		writeClientProtocolError(w, http.StatusUnauthorized, clientProtocolFromRequest(r), APIError{

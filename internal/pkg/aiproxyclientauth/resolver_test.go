@@ -24,7 +24,7 @@ func TestResolveOpenAIBearer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id.KeyID != "codex" || id.Builtin {
+	if id.KeyID != "codex" {
 		t.Fatalf("got %+v", id)
 	}
 }
@@ -60,25 +60,20 @@ func TestResolveCompatibleHeaders(t *testing.T) {
 	}
 }
 
-func TestResolveNoHeaderDefault(t *testing.T) {
+func TestResolveNoHeaderFailsAuthentication(t *testing.T) {
 	idx := testIndex(t)
-	id, err := ResolveHeaders(http.Header{}, idx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !id.Builtin || id.KeyID != DefaultKeyID {
-		t.Fatalf("got %+v", id)
+	if _, err := ResolveHeaders(http.Header{}, idx); err != ErrAuthenticationFailed {
+		t.Fatalf("err = %v", err)
 	}
 }
 
-func TestResolveEmptyHeaderDefault(t *testing.T) {
+func TestResolveEmptyHeaderFailsAuthentication(t *testing.T) {
 	idx := testIndex(t)
 	h := http.Header{}
 	h.Set("Authorization", "   ")
 	h.Set("X-API-Key", "")
-	id, err := ResolveHeaders(h, idx)
-	if err != nil || id.KeyID != DefaultKeyID {
-		t.Fatalf("got %+v %v", id, err)
+	if _, err := ResolveHeaders(h, idx); err != ErrAuthenticationFailed {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -136,11 +131,10 @@ func TestResolveConflictingHeaders(t *testing.T) {
 
 func TestResolveIgnoresQueryAndBody(t *testing.T) {
 	idx := testIndex(t)
-	// 仅 Header 参与；无 Header 即 default，即使“看起来像”有 key 的 query 也不读。
+	// 仅 Header 参与；query/body 中的伪 key 不得通过认证。
 	req, _ := http.NewRequest(http.MethodPost, "/v1/chat/completions?api_key=sk-codex-secret", strings.NewReader(`{"api_key":"sk-codex-secret"}`))
-	id, err := ResolveHeaders(req.Header, idx)
-	if err != nil || id.KeyID != DefaultKeyID {
-		t.Fatalf("got %+v %v", id, err)
+	if _, err := ResolveHeaders(req.Header, idx); err != ErrAuthenticationFailed {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -166,16 +160,15 @@ func TestContextRoundTrip(t *testing.T) {
 	if got.KeyID != "codex" {
 		t.Fatalf("got %+v", got)
 	}
-	if ClientIdentityFromContext(context.Background()).KeyID != DefaultKeyID {
-		t.Fatal("missing context should default")
+	if ClientIdentityFromContext(context.Background()).KeyID != "" {
+		t.Fatal("missing context should be empty")
 	}
 }
 
-func TestEmptyIndexAllDefault(t *testing.T) {
+func TestEmptyIndexRejectsAllCredentials(t *testing.T) {
 	idx := BuildIndex(nil)
-	id, err := ResolveHeaders(http.Header{}, idx)
-	if err != nil || id.KeyID != DefaultKeyID {
-		t.Fatalf("got %+v %v", id, err)
+	if _, err := ResolveHeaders(http.Header{}, idx); err != ErrAuthenticationFailed {
+		t.Fatalf("no header err = %v", err)
 	}
 	h := http.Header{}
 	h.Set("Authorization", "Bearer anything")
