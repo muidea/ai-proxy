@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -83,7 +84,7 @@ func Main() {
 	}
 }
 
-type probeResult struct {
+type Result struct {
 	OK           bool
 	Provider     string
 	Protocol     string
@@ -95,6 +96,35 @@ type probeResult struct {
 	Stream       bool
 	Summary      string
 	Conclusion   string
+}
+
+// Check 对已解析配置执行一次最小、非流式 direct probe。调用方只能使用配置中的
+// RouteOwner、已声明 capability 和归属该 Provider 的 catalog model。
+func Check(ctx context.Context, cfg config.Config, providerName string) (Result, error) {
+	provider, ok := cfg.Providers[providerName]
+	if !ok || provider.Disabled {
+		return Result{}, fmt.Errorf("provider %q missing or disabled", providerName)
+	}
+	if len(provider.EndpointCapabilities) == 0 {
+		return Result{}, fmt.Errorf("provider %q has no direct capability", providerName)
+	}
+	models := make([]string, 0)
+	for id, info := range cfg.ModelCatalog {
+		if info.RouteOwner == providerName {
+			models = append(models, id)
+		}
+	}
+	if len(models) == 0 {
+		return Result{}, fmt.Errorf("provider %q has no catalog model", providerName)
+	}
+	sort.Strings(models)
+	model := models[0]
+	capability := provider.EndpointCapabilities[0]
+	path, body, err := buildProbeRequest(capability, model, false)
+	if err != nil {
+		return Result{}, err
+	}
+	return runProbeContext(ctx, http.DefaultClient, providerName, capability, model, provider, path, body, 30*time.Second, false), nil
 }
 
 func buildProbeRequest(capability, model string, stream bool) (path string, body []byte, err error) {
@@ -154,8 +184,12 @@ func buildProbeRequest(capability, model string, stream bool) (path string, body
 	return
 }
 
-func runProbe(client *http.Client, providerName, capability, model string, provider config.Provider, path string, body []byte, timeout time.Duration, stream bool) probeResult {
-	res := probeResult{
+func runProbe(client *http.Client, providerName, capability, model string, provider config.Provider, path string, body []byte, timeout time.Duration, stream bool) Result {
+	return runProbeContext(context.Background(), client, providerName, capability, model, provider, path, body, timeout, stream)
+}
+
+func runProbeContext(parent context.Context, client *http.Client, providerName, capability, model string, provider config.Provider, path string, body []byte, timeout time.Duration, stream bool) Result {
+	res := Result{
 		Provider:     providerName,
 		Protocol:     provider.Protocol,
 		Capability:   capability,
@@ -166,7 +200,7 @@ func runProbe(client *http.Client, providerName, capability, model string, provi
 	// reconstruct full URL
 	base := strings.TrimRight(provider.BaseURL, "/")
 	url := joinURL(base, path)
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -274,11 +308,11 @@ func sanitizeSummary(s string) string {
 	return s
 }
 
-func printResult(r probeResult) {
+func printResult(r Result) {
 	printResultTo(os.Stdout, r)
 }
 
-func printResultTo(w io.Writer, r probeResult) {
+func printResultTo(w io.Writer, r Result) {
 	fmt.Fprintf(w, "provider=%s protocol=%s capability=%s model=%s path=%s stream=%t status=%d duration_ms=%d conclusion=%s\n",
 		r.Provider, r.Protocol, r.Capability, r.Model, r.UpstreamPath, r.Stream, r.Status, r.DurationMS, r.Conclusion)
 	if r.Summary != "" {

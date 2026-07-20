@@ -13,10 +13,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"ai-proxy/internal/pkg/aiproxyconfig"
 	"ai-proxy/internal/pkg/aiproxymetricsport"
 	"ai-proxy/internal/pkg/aiproxyusage"
+	"ai-proxy/internal/services/probe"
 	adminweb "ai-proxy/web"
 
 	"go.yaml.in/yaml/v4"
@@ -34,19 +36,31 @@ type Handler struct {
 	configPath      string
 	runtime         RuntimeConfig
 	usageStore      usage.Store
-	metricsRegistry metricsport.Reporter
+	metricsRegistry metricsport.Port
 	updateMu        sync.Mutex
 }
 
 type providerView struct {
-	Name                 string   `json:"name"`
-	Protocol             string   `json:"protocol"`
-	BaseURL              string   `json:"base_url"`
-	Models               []string `json:"models"`
-	EndpointCapabilities []string `json:"endpoint_capabilities"`
-	AllowUnauthenticated bool     `json:"allow_unauthenticated"`
-	Enabled              bool     `json:"enabled"`
-	APIKeyConfigured     bool     `json:"api_key_configured"`
+	Name                 string               `json:"name"`
+	Protocol             string               `json:"protocol"`
+	BaseURL              string               `json:"base_url"`
+	Models               []string             `json:"models"`
+	EndpointCapabilities []string             `json:"endpoint_capabilities"`
+	AllowUnauthenticated bool                 `json:"allow_unauthenticated"`
+	Enabled              bool                 `json:"enabled"`
+	APIKeyConfigured     bool                 `json:"api_key_configured"`
+	Availability         providerAvailability `json:"availability"`
+}
+
+type providerAvailability struct {
+	Status              string `json:"status"`
+	Successes           int64  `json:"successes"`
+	Failures            int64  `json:"failures"`
+	ConsecutiveFailures int64  `json:"consecutive_failures"`
+	LastSuccessAt       string `json:"last_success_at,omitempty"`
+	LastFailureAt       string `json:"last_failure_at,omitempty"`
+	LastStatus          int    `json:"last_status,omitempty"`
+	LastOutcome         string `json:"last_outcome,omitempty"`
 }
 
 type providerInput struct {
@@ -92,6 +106,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.updateProviders(w, r)
+	case strings.HasPrefix(r.URL.Path, "/admin/api/providers/") && strings.HasSuffix(r.URL.Path, "/probe") && r.Method == http.MethodPost:
+		if !requireAdminWrite(w, r) {
+			return
+		}
+		h.probeProvider(w, r)
 	case r.URL.Path == "/admin/api/client-api-keys" && r.Method == http.MethodGet:
 		h.listClientAPIKeys(w)
 	case r.URL.Path == "/admin/api/client-api-keys" && r.Method == http.MethodPost:
@@ -103,6 +122,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (h *Handler) probeProvider(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/admin/api/providers/"), "/probe")
+	name = strings.ToLower(strings.Trim(strings.TrimSpace(name), "/"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "provider name is required")
+		return
+	}
+	result, err := probe.Check(r.Context(), h.runtime.ConfigSnapshot(), name)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if h.metricsRegistry != nil {
+		h.metricsRegistry.RecordRequestPlan(name, result.Model, result.Capability, result.Status, time.Duration(result.DurationMS)*time.Millisecond, mapProbeOutcome(result.Conclusion), "", result.Protocol, result.UpstreamPath, "probe")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"provider": name, "status": result.Status, "duration_ms": result.DurationMS, "conclusion": result.Conclusion, "summary": result.Summary})
+}
+
+func mapProbeOutcome(conclusion string) string {
+	if conclusion == "success" {
+		return "success"
+	}
+	if conclusion == "capability_drift" {
+		return "capability_drift"
+	}
+	return "upstream_failed"
 }
 
 func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
@@ -117,6 +164,7 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) listProviders(w http.ResponseWriter) {
 	cfg := h.runtime.ConfigSnapshot()
+	health := h.providerHealth(cfg)
 	names := make([]string, 0, len(cfg.Providers))
 	for name := range cfg.Providers {
 		names = append(names, name)
@@ -135,6 +183,7 @@ func (h *Handler) listProviders(w http.ResponseWriter) {
 			AllowUnauthenticated: provider.AllowUnauthenticated,
 			Enabled:              !provider.Disabled,
 			APIKeyConfigured:     strings.TrimSpace(provider.APIKey) != "",
+			Availability:         health[name],
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -142,6 +191,60 @@ func (h *Handler) listProviders(w http.ResponseWriter) {
 		"writable":   strings.TrimSpace(h.configPath) != "",
 		"hot_reload": true,
 	})
+}
+
+func (h *Handler) providerHealth(cfg config.Config) map[string]providerAvailability {
+	result := map[string]providerAvailability{}
+	for name, provider := range cfg.Providers {
+		status := "unknown"
+		if provider.Disabled {
+			status = "disabled"
+		}
+		result[name] = providerAvailability{Status: status}
+	}
+	if h.metricsRegistry == nil {
+		return result
+	}
+	data, err := h.metricsRegistry.StatsJSON()
+	if err != nil {
+		return result
+	}
+	var snapshot struct {
+		ProviderHealth map[string]struct {
+			Successes           int64  `json:"successes"`
+			Failures            int64  `json:"failures"`
+			ConsecutiveFailures int64  `json:"consecutive_failures"`
+			LastSuccessAt       string `json:"last_success_at"`
+			LastFailureAt       string `json:"last_failure_at"`
+			LastStatus          int    `json:"last_status"`
+			LastOutcome         string `json:"last_outcome"`
+		} `json:"provider_health"`
+	}
+	if json.Unmarshal(data, &snapshot) != nil {
+		return result
+	}
+	for name, value := range snapshot.ProviderHealth {
+		status := "unknown"
+		switch {
+		case value.LastOutcome == "capability_drift":
+			status = "capability_drift"
+		case value.LastStatus == 401 || value.LastStatus == 403:
+			status = "credential_error"
+		case value.ConsecutiveFailures >= 3:
+			status = "unavailable"
+		case value.Failures > 0:
+			status = "degraded"
+		case value.Successes > 0:
+			status = "healthy"
+		}
+		result[name] = providerAvailability{Status: status, Successes: value.Successes, Failures: value.Failures, ConsecutiveFailures: value.ConsecutiveFailures, LastSuccessAt: value.LastSuccessAt, LastFailureAt: value.LastFailureAt, LastStatus: value.LastStatus, LastOutcome: value.LastOutcome}
+	}
+	for name, provider := range cfg.Providers {
+		if provider.Disabled {
+			result[name] = providerAvailability{Status: "disabled"}
+		}
+	}
+	return result
 }
 
 func (h *Handler) updateProviders(w http.ResponseWriter, r *http.Request) {

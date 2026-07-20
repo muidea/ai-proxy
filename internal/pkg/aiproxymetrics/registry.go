@@ -26,7 +26,7 @@ const otherModelLabel = "_other"
 // Outcome 描述业务结果(完整枚举):
 //
 //	success | client_canceled | idle_timeout | limit_exceeded |
-//	upstream_truncated | upstream_failed | incomplete |
+//	upstream_truncated | upstream_failed | incomplete | capability_drift |
 //	client_write | conversion | protocol | error
 //
 // 流式首包 200 后中途失败时 Status 仍可能是 2xx,Outcome 用于区分真实成败。
@@ -83,6 +83,7 @@ type Registry struct {
 
 	upstreamErrors   map[errorKey]uint64
 	upstreamAttempts map[string]uint64 // provider -> total attempts
+	providerHealth   map[string]providerHealth
 
 	clientRequests          map[clientUsageKey]uint64
 	clientInput             map[clientUsageKey]uint64
@@ -125,6 +126,7 @@ func NewRegistry() *Registry {
 		cachedTokenSumHits:        map[tokenKey]uint64{},
 		upstreamErrors:            map[errorKey]uint64{},
 		upstreamAttempts:          map[string]uint64{},
+		providerHealth:            map[string]providerHealth{},
 		clientRequests:            map[clientUsageKey]uint64{},
 		clientInput:               map[clientUsageKey]uint64{},
 		clientOutput:              map[clientUsageKey]uint64{},
@@ -317,6 +319,21 @@ func (r *Registry) RecordRequestPlan(provider, model, route string, status int, 
 		UpstreamEndpoint: boundEndpointLabel(upstreamEndpoint), ConversionMode: boundModeLabel(conversionMode),
 	}
 	r.requestCount[key]++
+	if provider != "" {
+		h := r.providerHealth[provider]
+		h.LastOutcome = outcome
+		if status >= 200 && status < 400 && outcome == "success" {
+			h.Successes++
+			h.ConsecutiveFailures = 0
+			h.LastSuccessAt = time.Now()
+		} else if outcome != "success" || status == 401 || status == 403 || status == 408 || status == 429 || status >= 500 {
+			h.Failures++
+			h.ConsecutiveFailures++
+			h.LastFailureAt = time.Now()
+			h.LastStatus = status
+		}
+		r.providerHealth[provider] = h
+	}
 	seconds := duration.Seconds()
 	r.requestDurationSum[key] += seconds
 	r.requestDurationCount[key]++

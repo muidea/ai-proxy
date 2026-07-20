@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"encoding/json"
+	"net/http"
 	"strconv"
 	"strings"
 	"testing"
@@ -47,6 +48,41 @@ func TestRegistryCounters(t *testing.T) {
 	mustContain(t, out, `ai_proxy_upstream_errors_total{provider="openai",status_code="502"} 1`)
 	mustContain(t, out, "# TYPE ai_proxy_requests_total counter")
 	mustContain(t, out, "# EOF")
+}
+
+func TestProviderHealthSnapshotTracksLatestOutcome(t *testing.T) {
+	r := NewRegistry()
+	r.RecordRequestPlan("healthy", "m", "chat_completions", http.StatusOK, time.Millisecond, "success", "", "", "", "")
+	r.RecordRequestPlan("degraded", "m", "chat_completions", http.StatusBadGateway, time.Millisecond, "upstream_failed", "", "", "", "")
+	for range 3 {
+		r.RecordRequestPlan("unavailable", "m", "chat_completions", http.StatusServiceUnavailable, time.Millisecond, "upstream_failed", "", "", "", "")
+	}
+	r.RecordRequestPlan("credential", "m", "chat_completions", http.StatusUnauthorized, time.Millisecond, "upstream_failed", "", "", "", "")
+	r.RecordRequestPlan("drift", "m", "chat_completions", http.StatusBadRequest, time.Millisecond, "capability_drift", "", "", "", "")
+
+	payload, err := r.StatsJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stats StatsJSON
+	if err := json.Unmarshal(payload, &stats); err != nil {
+		t.Fatal(err)
+	}
+	if got := stats.ProviderHealth["healthy"]; got.Successes != 1 || got.ConsecutiveFailures != 0 || got.LastOutcome != "success" {
+		t.Fatalf("healthy snapshot = %#v", got)
+	}
+	if got := stats.ProviderHealth["degraded"]; got.Failures != 1 || got.ConsecutiveFailures != 1 || got.LastStatus != http.StatusBadGateway {
+		t.Fatalf("degraded snapshot = %#v", got)
+	}
+	if got := stats.ProviderHealth["unavailable"]; got.Failures != 3 || got.ConsecutiveFailures != 3 {
+		t.Fatalf("unavailable snapshot = %#v", got)
+	}
+	if got := stats.ProviderHealth["credential"]; got.LastStatus != http.StatusUnauthorized {
+		t.Fatalf("credential snapshot = %#v", got)
+	}
+	if got := stats.ProviderHealth["drift"]; got.LastOutcome != "capability_drift" || got.Failures != 1 {
+		t.Fatalf("drift snapshot = %#v", got)
+	}
 }
 
 func TestClientUsageAndStoreMetrics(t *testing.T) {

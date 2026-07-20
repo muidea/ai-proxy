@@ -43,6 +43,7 @@ Prometheus 指标均以 `ai_proxy_` 为前缀：
 | `idle_timeout` | SSE 空闲超时。 |
 | `limit_exceeded` | 本地体或流限制。 |
 | `upstream_truncated`、`upstream_failed` | 上游中断或显式失败。 |
+| `capability_drift` | Provider 声明的直连端点或模型能力与上游响应不一致。 |
 | `incomplete` | 上游未完成。 |
 | `client_write`、`protocol`、`conversion`、`error` | 客户端写入、协议、转换或其它错误。 |
 
@@ -87,6 +88,19 @@ go run ./cmd/ai-proxy-probe -config config.yaml \
 ```
 
 输出会脱敏，结论为 `success`、`credential_issue`、`capability_drift` 或 `environment_undetermined`。现场审计记录放在 `docs/provider-capability-audit-*.md`。
+
+Admin 的 Provider 页面还会显示配置启用状态之外的运行期可用性，并提供“检查”按钮。该按钮只对当前
+Provider 执行一次最小非流式探测，记录结果但不会改写配置。状态含义如下：
+
+| 状态 | 含义 |
+| --- | --- |
+| `disabled` | 配置已禁用。 |
+| `unknown` | 尚无请求或手动检查结果。 |
+| `healthy` | 最近一次记录为成功。 |
+| `degraded` | 存在失败，但连续失败少于三次。 |
+| `unavailable` | 连续失败至少三次。 |
+| `credential_error` | 最近失败为 401 或 403。 |
+| `capability_drift` | 最近探测表明端点或模型能力与上游不一致。 |
 
 ## 构建与发布
 

@@ -10,8 +10,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"ai-proxy/internal/pkg/aiproxyconfig"
+	"ai-proxy/internal/pkg/aiproxymetrics"
 )
 
 type testRuntime struct {
@@ -100,6 +102,82 @@ func TestHandlerRejectsRemoteAdminAccess(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+}
+
+func TestHandlerProjectsProviderAvailability(t *testing.T) {
+	registry := metrics.NewRegistry()
+	registry.RecordRequest("healthy", "m", "chat_completions", http.StatusOK, time.Millisecond, "success")
+	registry.RecordRequest("degraded", "m", "chat_completions", http.StatusBadGateway, time.Millisecond, "upstream_failed")
+	for range 3 {
+		registry.RecordRequest("unavailable", "m", "chat_completions", http.StatusServiceUnavailable, time.Millisecond, "upstream_failed")
+	}
+	registry.RecordRequest("credential", "m", "chat_completions", http.StatusForbidden, time.Millisecond, "upstream_failed")
+	registry.RecordRequest("drift", "m", "chat_completions", http.StatusBadRequest, time.Millisecond, "capability_drift")
+	cfg := config.Config{Providers: map[string]config.Provider{
+		"healthy":     {},
+		"degraded":    {},
+		"unavailable": {},
+		"credential":  {},
+		"drift":       {},
+		"unknown":     {},
+		"disabled":    {Disabled: true},
+	}}
+	handler := NewHandler("", &testRuntime{cfg: cfg}).WithMetrics(registry)
+	availability := handler.providerHealth(cfg)
+	for name, want := range map[string]string{
+		"healthy": "healthy", "degraded": "degraded", "unavailable": "unavailable",
+		"credential": "credential_error", "drift": "capability_drift", "unknown": "unknown", "disabled": "disabled",
+	} {
+		if got := availability[name].Status; got != want {
+			t.Errorf("%s status = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestHandlerProbesProviderAndRecordsAvailability(t *testing.T) {
+	t.Setenv("ADMIN_TEST_API_KEY", "secret-value")
+	path := writeAdminTestConfig(t)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret-value" {
+			t.Errorf("authorization = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-probe"}`))
+	}))
+	defer upstream.Close()
+	provider := cfg.Providers["openai"]
+	provider.BaseURL = upstream.URL
+	cfg.Providers["openai"] = provider
+	registry := metrics.NewRegistry()
+	handler := NewHandler(path, &testRuntime{cfg: cfg}).WithMetrics(registry)
+
+	missingHeader := httptest.NewRequest(http.MethodPost, "/admin/api/providers/openai/probe", nil)
+	missingHeader.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, missingHeader)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("probe without header = %d, want 403", rec.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/providers/openai/probe", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-AI-Proxy-Admin", "1")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"conclusion":"success"`) {
+		t.Fatalf("probe = %d %s", rec.Code, rec.Body.String())
+	}
+	availability := handler.providerHealth(cfg)["openai"]
+	if availability.Status != "healthy" || availability.LastOutcome != "success" {
+		t.Fatalf("availability = %#v", availability)
 	}
 }
 

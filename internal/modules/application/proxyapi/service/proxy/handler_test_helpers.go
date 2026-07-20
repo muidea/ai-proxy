@@ -17,6 +17,14 @@ import (
 // 生产路径必须走 config.Load;Handler 不再 materialize。
 // operations 仅填 RouteOwner 实际可服务的集合,满足 operation×capability 交叉校验。
 func mustHandlerConfig(cfg config.Config) config.Config {
+	// 所有业务请求均需有效客户端 Key。未专门覆盖认证场景的测试统一使用此默认凭据；
+	// 认证测试可显式替换或删除它。
+	if cfg.ClientAPIKeys == nil {
+		cfg.ClientAPIKeys = map[string]config.ClientAPIKey{}
+	}
+	if _, ok := cfg.ClientAPIKeys["test-client"]; !ok {
+		cfg.ClientAPIKeys["test-client"] = config.ClientAPIKey{ID: "test-client", APIKey: "test-client-key", Enabled: true}
+	}
 	if cfg.Providers == nil {
 		cfg.Providers = map[string]config.Provider{}
 	}
@@ -203,12 +211,6 @@ func matchingEnabled(providers map[string]config.Provider, modelID string) []str
 
 func newTestHandler(cfg config.Config, usageFile string) *Handler {
 	cfg = mustHandlerConfig(cfg)
-	if cfg.ClientAPIKeys == nil {
-		cfg.ClientAPIKeys = map[string]config.ClientAPIKey{}
-	}
-	if _, ok := cfg.ClientAPIKeys["test-client"]; !ok {
-		cfg.ClientAPIKeys["test-client"] = config.ClientAPIKey{ID: "test-client", APIKey: "test-client-key", Enabled: true}
-	}
 	if cfg.InteractionDir == "" {
 		cfg.InteractionDir = filepath.Join(filepath.Dir(usageFile), "interactions")
 	}

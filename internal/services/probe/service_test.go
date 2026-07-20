@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -134,6 +135,38 @@ func TestRunProbePopulatesContractFieldsAndOutput(t *testing.T) {
 		if !strings.Contains(out.String(), field) {
 			t.Fatalf("output missing %q: %s", field, out.String())
 		}
+	}
+}
+
+func TestCheckUsesStableFirstCatalogModel(t *testing.T) {
+	var gotModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+		}
+		gotModel = request.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-probe"}`))
+	}))
+	defer upstream.Close()
+	cfg := config.Config{
+		Providers: map[string]config.Provider{
+			"route": {Protocol: "openai", BaseURL: upstream.URL, EndpointCapabilities: []string{config.EndpointCapabilityChatCompletions}},
+		},
+		ModelCatalog: map[string]config.ModelInfo{
+			"z-model": {RouteOwner: "route"},
+			"a-model": {RouteOwner: "route"},
+		},
+	}
+	result, err := Check(t.Context(), cfg, "route")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.OK || result.Model != "a-model" || gotModel != "a-model" {
+		t.Fatalf("result = %#v, request model = %q", result, gotModel)
 	}
 }
 

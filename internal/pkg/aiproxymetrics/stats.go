@@ -8,12 +8,13 @@ import (
 
 // StatsJSON 是 /stats 端点返回的 JSON 负载。
 type StatsJSON struct {
-	UptimeSeconds int64                      `json:"uptime_seconds"`
-	Requests      StatsRequests              `json:"requests"`
-	Cache         StatsCache                 `json:"cache"`
-	LatencyMS     map[string]quantileSummary `json:"latency_ms"`
-	Errors        StatsErrors                `json:"errors"`
-	Usage         StatsUsage                 `json:"usage"`
+	UptimeSeconds  int64                          `json:"uptime_seconds"`
+	Requests       StatsRequests                  `json:"requests"`
+	Cache          StatsCache                     `json:"cache"`
+	LatencyMS      map[string]quantileSummary     `json:"latency_ms"`
+	Errors         StatsErrors                    `json:"errors"`
+	Usage          StatsUsage                     `json:"usage"`
+	ProviderHealth map[string]StatsProviderHealth `json:"provider_health"`
 }
 
 // StatsUsage 是从 DuckDB 初始化、并随成功 Complete 更新的 all-time 用量镜像。
@@ -33,6 +34,22 @@ type StatsUsageTotals struct {
 	InputTokens  int64 `json:"input_tokens"`
 	OutputTokens int64 `json:"output_tokens"`
 	TotalTokens  int64 `json:"total_tokens"`
+}
+
+type providerHealth struct {
+	Successes, Failures, ConsecutiveFailures int64
+	LastSuccessAt, LastFailureAt             time.Time
+	LastStatus                               int
+	LastOutcome                              string
+}
+type StatsProviderHealth struct {
+	Successes           int64     `json:"successes"`
+	Failures            int64     `json:"failures"`
+	ConsecutiveFailures int64     `json:"consecutive_failures"`
+	LastSuccessAt       time.Time `json:"last_success_at,omitempty"`
+	LastFailureAt       time.Time `json:"last_failure_at,omitempty"`
+	LastStatus          int       `json:"last_status,omitempty"`
+	LastOutcome         string    `json:"last_outcome,omitempty"`
 }
 
 // StatsRequests 汇总请求计数。
@@ -184,13 +201,18 @@ func buildStatsLocked(r *Registry) StatsJSON {
 		usage.ByAPIKey[string(key)] = StatsUsageTotals{Requests: int64(r.clientRequests[key]), InputTokens: int64(r.clientInput[key]), OutputTokens: int64(r.clientOutput[key]), TotalTokens: int64(r.clientTokens[key])}
 	}
 
+	health := make(map[string]StatsProviderHealth, len(r.providerHealth))
+	for provider, value := range r.providerHealth {
+		health[provider] = StatsProviderHealth{Successes: value.Successes, Failures: value.Failures, ConsecutiveFailures: value.ConsecutiveFailures, LastSuccessAt: value.LastSuccessAt, LastFailureAt: value.LastFailureAt, LastStatus: value.LastStatus, LastOutcome: value.LastOutcome}
+	}
 	return StatsJSON{
-		UptimeSeconds: uptime,
-		Requests:      requests,
-		Cache:         cache,
-		LatencyMS:     latency,
-		Errors:        errors,
-		Usage:         usage,
+		UptimeSeconds:  uptime,
+		Requests:       requests,
+		Cache:          cache,
+		LatencyMS:      latency,
+		Errors:         errors,
+		Usage:          usage,
+		ProviderHealth: health,
 	}
 }
 

@@ -60,6 +60,7 @@ func assertGatewayRoutes(t *testing.T) {
 	} {
 		req := httptest.NewRequest(tc.method, tc.path, nil)
 		req.RemoteAddr = "127.0.0.1:3000"
+		req.Header.Set("Authorization", "Bearer test-client-key")
 		rec := httptest.NewRecorder()
 		routes.Handle(context.Background(), enginehttp.NewResponseWriter(rec), req)
 		if rec.Code != tc.status {
@@ -69,5 +70,5 @@ func assertGatewayRoutes(t *testing.T) {
 }
 
 func testConfig(dir string) config.Config {
-	return config.Config{ListenAddr: "127.0.0.1:0", UsageStore: config.UsageStoreConfig{Path: filepath.Join(dir, "usage.duckdb"), MemoryLimit: "256MB", Threads: 2}, InteractionDir: filepath.Join(dir, "interactions"), InteractionRetention: 2, Providers: map[string]config.Provider{}, ModelCatalog: map[string]config.ModelInfo{}}
+	return config.Config{ListenAddr: "127.0.0.1:0", UsageStore: config.UsageStoreConfig{Path: filepath.Join(dir, "usage.duckdb"), MemoryLimit: "256MB", Threads: 2}, InteractionDir: filepath.Join(dir, "interactions"), InteractionRetention: 2, ClientAPIKeys: map[string]config.ClientAPIKey{"test-client": {ID: "test-client", APIKey: "test-client-key", Enabled: true}}, Providers: map[string]config.Provider{}, ModelCatalog: map[string]config.ModelInfo{}}
 }
