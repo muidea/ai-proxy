@@ -228,7 +228,7 @@ func generateClientKey() (string, string, error) {
 	if _, err := rand.Read(raw); err != nil {
 		return "", "", err
 	}
-	key := "aip_" + base64.RawURLEncoding.EncodeToString(raw)
+	key := "sk_" + base64.RawURLEncoding.EncodeToString(raw)
 	sum := sha256.Sum256([]byte(key))
 	return key, "sha256:" + hex.EncodeToString(sum[:]), nil
 }

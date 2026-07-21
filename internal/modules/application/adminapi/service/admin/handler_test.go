@@ -251,7 +251,7 @@ func TestHandlerManagesHashedClientAPIKeys(t *testing.T) {
 	var created struct {
 		APIKey string `json:"api_key"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil || !strings.HasPrefix(created.APIKey, "aip_") {
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil || !strings.HasPrefix(created.APIKey, "sk_") {
 		t.Fatalf("created = %#v err=%v", created, err)
 	}
 	raw, err := os.ReadFile(path)
