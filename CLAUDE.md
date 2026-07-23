@@ -105,7 +105,7 @@ cmd/ai-proxy-usage-import  旧 usage.csv 一次性导入 DuckDB
 
 - 默认 `127.0.0.1:8080`。`client_api_keys` 是归属机制而非强制登录；非 loopback 需由网络层保护。**已删除** `inbound_api_key` / `AI_PROXY_INBOUND_API_KEY` / `usage_file`。
 - 客户端 Key 不转上游；上游鉴权只来自 provider 配置。原始客户端 Key 不进日志/DuckDB/Web。
-- `/admin` 与 admin API **固定 loopback-only**；Provider API Key 只显示“已配置”，不回显明文。
+- Admin 默认位于 `/admin` 且 loopback-only；启用 `admin_auth_enabled` 后可用 `admin_base_path` 设定入口，并以 HTTPS 登录方式远程访问。Provider API Key 只显示“已配置”，不回显明文。
 - `/metrics`、`/stats` 默认 loopback；`metrics_remote_access` 可放开。
 - 体/流/SSE 行大小与 stream idle timeout 有硬上限（见 config 默认值与 env）。
 - 日志与归档脱敏 `Authorization` / `X-API-Key` / `Cookie` 等。

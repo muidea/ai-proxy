@@ -11,6 +11,7 @@ require (
 	github.com/muidea/magicEngine v1.4.9
 	github.com/openai/openai-go v1.12.0
 	go.yaml.in/yaml/v4 v4.0.0-rc.2
+	golang.org/x/crypto v0.46.0
 )
 
 require (
@@ -45,7 +46,6 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
-	golang.org/x/crypto v0.46.0 // indirect
 	golang.org/x/exp v0.0.0-20260112195511-716be5621a96 // indirect
 	golang.org/x/mod v0.32.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect

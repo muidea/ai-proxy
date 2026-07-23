@@ -24,6 +24,19 @@ const (
 	DefaultMaxUpstreamResponseBytes int64 = 64 << 20
 	DefaultMaxStreamBytes           int64 = 64 << 20
 	DefaultMaxSSELineBytes          int64 = 1 << 20
+
+	// Admin 登录安全默认值与边界。
+	DefaultAdminBasePath                 = "/admin"
+	DefaultAdminSessionTTLSeconds        = 28800
+	MinAdminSessionTTLSeconds            = 300
+	MaxAdminSessionTTLSeconds            = 86400
+	MaxAdminBasePathLength               = 128
+	MaxAdminUsernameLength               = 64
+	AdminArgon2MemoryKiB          uint32 = 65536
+	AdminArgon2Time               uint32 = 3
+	AdminArgon2Parallelism        uint8  = 1
+	AdminArgon2MinSaltBytes              = 16
+	AdminArgon2MinKeyBytes               = 32
 )
 
 type Config struct {
@@ -47,6 +60,8 @@ type Config struct {
 	MetricsRemoteAccess  bool
 	MetricsAllowedCIDRs  []string
 	SLO                  SLOConfig
+	// AdminAuth 描述可选的 Admin 登录安全配置。默认关闭,保持 loopback-only 兼容行为。
+	AdminAuth AdminAuthConfig
 	// ClientAPIKeys 是客户端调用方识别与用量归属的唯一配置 authority。
 	// 业务请求必须携带并匹配一个 enabled Key；配置可暂时为空，以便通过本地 Admin 创建首个 Key。
 	ClientAPIKeys map[string]ClientAPIKey
@@ -55,6 +70,24 @@ type Config struct {
 	Providers  map[string]Provider
 	// ModelCatalog 是全局模型元数据目录,供 GET /v1/models 使用;是请求路由与 /v1/models 的共同 authority。
 	ModelCatalog map[string]ModelInfo
+}
+
+// AdminAuthConfig 描述 Admin 可选账号密码登录与 basePath。
+// 开关默认 false;开启后必须配置单管理员账号与 Argon2id PHC 密码哈希。
+// admin_base_path 是启动期路由配置,热更新变更后需重启才生效。
+type AdminAuthConfig struct {
+	// Enabled 为 true 时取消 Admin loopback 限制,强制先登录再访问。
+	Enabled bool
+	// BasePath 是 Admin 页面与 API 前缀,默认 /admin。
+	BasePath string
+	// Username 是单管理员账号,区分大小写。
+	Username string
+	// PasswordHash 是 Argon2id PHC 字符串;禁止明文。
+	PasswordHash string
+	// SessionCookieSecure 为 true 时会话 Cookie 仅随 HTTPS 请求发送；默认 false，兼容 HTTP Admin。
+	SessionCookieSecure bool
+	// SessionTTLSeconds 是会话绝对有效期,默认 28800(8h),范围 300~86400。
+	SessionTTLSeconds int
 }
 
 // ClientAPIKey 描述一个客户端调用方密钥条目。
@@ -145,7 +178,13 @@ func Load(path string) (Config, error) {
 		LogFormat:                "json",
 		RequestTimeout:           5 * time.Minute,
 		StreamIdleTimeout:        5 * time.Minute,
-		ClientAPIKeys:            map[string]ClientAPIKey{},
+		AdminAuth: AdminAuthConfig{
+			Enabled:             false,
+			BasePath:            DefaultAdminBasePath,
+			SessionCookieSecure: false,
+			SessionTTLSeconds:   DefaultAdminSessionTTLSeconds,
+		},
+		ClientAPIKeys: map[string]ClientAPIKey{},
 		UsageStore: UsageStoreConfig{
 			Path:              "usage.duckdb",
 			MemoryLimit:       "256MB",
@@ -231,9 +270,17 @@ func loadFile(path string, cfg *Config) error {
 			providerName = ""
 			modelName = ""
 			clientKeyID = ""
-			setErr = setTopLevel(cfg, key, expand(value))
+			if key == "admin_password_hash" {
+				setErr = setTopLevel(cfg, key, expandDollarBraceOnly(value))
+			} else {
+				setErr = setTopLevel(cfg, key, expand(value))
+			}
 		case section == "server" && indent >= 2:
-			setErr = setServer(cfg, key, expand(value))
+			if key == "admin_password_hash" {
+				setErr = setServer(cfg, key, expandDollarBraceOnly(value))
+			} else {
+				setErr = setServer(cfg, key, expand(value))
+			}
 		case section == "usage_store" && indent >= 2:
 			setErr = setUsageStore(cfg, key, expand(value))
 		case section == "client_api_keys" && indent == 2 && !hasValue:
@@ -374,6 +421,32 @@ func setTopLevel(cfg *Config, key, value string) error {
 		cfg.SLO.CheckIntervalSeconds = n
 	case "slo_violation_webhook":
 		cfg.SLO.ViolationWebhook = value
+	case "admin_auth_enabled":
+		b, err := parseStrictBool(value)
+		if err != nil {
+			return fmt.Errorf("admin_auth_enabled: %w", err)
+		}
+		cfg.AdminAuth.Enabled = b
+	case "admin_base_path":
+		cfg.AdminAuth.BasePath = strings.TrimSpace(value)
+	case "admin_username":
+		// 账号区分大小写；仅 trim 首尾空白以便配置友好。
+		cfg.AdminAuth.Username = strings.TrimSpace(value)
+	case "admin_password_hash":
+		// 不在错误中回显哈希原文。
+		cfg.AdminAuth.PasswordHash = strings.TrimSpace(value)
+	case "admin_session_cookie_secure":
+		b, err := parseStrictBool(value)
+		if err != nil {
+			return fmt.Errorf("admin_session_cookie_secure: %w", err)
+		}
+		cfg.AdminAuth.SessionCookieSecure = b
+	case "admin_session_ttl_seconds":
+		n, err := parseStrictPositiveInt(value)
+		if err != nil {
+			return fmt.Errorf("admin_session_ttl_seconds: %w", err)
+		}
+		cfg.AdminAuth.SessionTTLSeconds = n
 	default:
 		return fmt.Errorf("unknown config key %q", key)
 	}
@@ -628,6 +701,36 @@ func applyEnv(cfg *Config) error {
 	if value := os.Getenv("AI_PROXY_METRICS_ALLOWED_CIDRS"); value != "" {
 		cfg.MetricsAllowedCIDRs = parseList(value)
 	}
+	if value := os.Getenv("AI_PROXY_ADMIN_AUTH_ENABLED"); value != "" {
+		b, err := parseStrictBool(value)
+		if err != nil {
+			return fmt.Errorf("AI_PROXY_ADMIN_AUTH_ENABLED: %w", err)
+		}
+		cfg.AdminAuth.Enabled = b
+	}
+	if value := os.Getenv("AI_PROXY_ADMIN_BASE_PATH"); value != "" {
+		cfg.AdminAuth.BasePath = strings.TrimSpace(value)
+	}
+	if value := os.Getenv("AI_PROXY_ADMIN_USERNAME"); value != "" {
+		cfg.AdminAuth.Username = strings.TrimSpace(value)
+	}
+	if value := os.Getenv("AI_PROXY_ADMIN_PASSWORD_HASH"); value != "" {
+		cfg.AdminAuth.PasswordHash = strings.TrimSpace(value)
+	}
+	if value := os.Getenv("AI_PROXY_ADMIN_SESSION_COOKIE_SECURE"); value != "" {
+		b, err := parseStrictBool(value)
+		if err != nil {
+			return fmt.Errorf("AI_PROXY_ADMIN_SESSION_COOKIE_SECURE: %w", err)
+		}
+		cfg.AdminAuth.SessionCookieSecure = b
+	}
+	if value := os.Getenv("AI_PROXY_ADMIN_SESSION_TTL_SECONDS"); value != "" {
+		n, err := parseStrictPositiveInt(value)
+		if err != nil {
+			return fmt.Errorf("AI_PROXY_ADMIN_SESSION_TTL_SECONDS: %w", err)
+		}
+		cfg.AdminAuth.SessionTTLSeconds = n
+	}
 
 	// Provider 仅从 config 文件声明;不支持通过 env 注入/创建 provider。
 	// api_key 等字段仍可用 ${ENV} 在配置文件中展开。
@@ -730,6 +833,9 @@ func normalize(cfg *Config) error {
 		catalog[id] = info
 	}
 	cfg.ModelCatalog = catalog
+	if err := normalizeAdminAuth(&cfg.AdminAuth); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -776,6 +882,9 @@ func validate(cfg Config) error {
 		return err
 	}
 	if err := validateMetricsCIDRs(cfg.MetricsAllowedCIDRs); err != nil {
+		return err
+	}
+	if err := validateAdminAuth(cfg.AdminAuth); err != nil {
 		return err
 	}
 	return nil
@@ -991,6 +1100,29 @@ func unquote(value string) string {
 
 func expand(value string) string {
 	return os.ExpandEnv(value)
+}
+
+// expandDollarBraceOnly 仅展开 ${NAME}，保留裸 $ 片段。
+// Admin Argon2id PHC 哈希以 $ 分隔，不能走 os.ExpandEnv。
+func expandDollarBraceOnly(value string) string {
+	var b strings.Builder
+	b.Grow(len(value))
+	for i := 0; i < len(value); {
+		if value[i] == '$' && i+1 < len(value) && value[i+1] == '{' {
+			end := strings.IndexByte(value[i+2:], '}')
+			if end >= 0 {
+				name := value[i+2 : i+2+end]
+				if env, ok := os.LookupEnv(name); ok {
+					b.WriteString(env)
+				}
+				i += 3 + end
+				continue
+			}
+		}
+		b.WriteByte(value[i])
+		i++
+	}
+	return b.String()
 }
 
 // addrFromPort 将纯端口转为 loopback 地址,避免 AI_PROXY_PORT=8080 变成 :8080(全网卡)。

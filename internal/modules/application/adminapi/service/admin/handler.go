@@ -37,6 +37,7 @@ type Handler struct {
 	runtime         RuntimeConfig
 	usageStore      usage.Store
 	metricsRegistry metricsport.Port
+	auth            *authState
 	updateMu        sync.Mutex
 }
 
@@ -80,7 +81,13 @@ type updateRequest struct {
 }
 
 func NewHandler(configPath string, runtime RuntimeConfig) *Handler {
-	return &Handler{configPath: configPath, runtime: runtime}
+	h := &Handler{configPath: configPath, runtime: runtime}
+	if runtime != nil {
+		h.auth = newAuthState(runtime.ConfigSnapshot().AdminAuth)
+	} else {
+		h.auth = newAuthState(config.AdminAuthConfig{BasePath: config.DefaultAdminBasePath, SessionTTLSeconds: config.DefaultAdminSessionTTLSeconds})
+	}
+	return h
 }
 
 // WithMetrics 挂接 usage 查询的健康与错误观测；nil-safe，便于单测复用。
@@ -90,42 +97,97 @@ func (h *Handler) WithMetrics(source any) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !isLoopbackRequest(r) {
-		http.Error(w, "admin access is loopback-only", http.StatusForbidden)
+	base := h.adminBasePath()
+	path := r.URL.Path
+	if path != base && !strings.HasPrefix(path, base+"/") {
+		http.NotFound(w, r)
+		return
+	}
+	rel := "/"
+	if path != base {
+		rel = strings.TrimPrefix(path, base)
+		if rel == "" {
+			rel = "/"
+		}
+	}
+
+	authOn := h.authEnabled()
+	if !authOn {
+		if !isLoopbackRequest(r) {
+			http.Error(w, "admin access is loopback-only", http.StatusForbidden)
+			return
+		}
+	}
+
+	// 认证端点与登录页(开启认证时无需会话)。
+	switch {
+	case rel == "/login" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
+		h.serveLoginPage(w, r)
+		return
+	case rel == "/api/auth/login" && r.Method == http.MethodPost:
+		h.handleLogin(w, r)
+		return
+	case rel == "/api/auth/session" && r.Method == http.MethodGet:
+		h.handleSession(w, r)
+		return
+	case rel == "/api/auth/logout" && r.Method == http.MethodPost:
+		h.handleLogout(w, r)
 		return
 	}
 
+	// 认证开启时,其余路径需要会话。
+	if authOn {
+		isAPI := strings.HasPrefix(rel, "/api/")
+		isPage := rel == "/" || rel == ""
+		if isPage && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			if h.sessionFromRequest(r) == nil {
+				if r.Method == http.MethodHead {
+					writeAdminAuthError(w, http.StatusUnauthorized, "admin_authentication_required", "admin login is required")
+					return
+				}
+				http.Redirect(w, r, base+"/login", http.StatusSeeOther)
+				return
+			}
+		} else if h.sessionFromRequest(r) == nil {
+			if isAPI || strings.HasPrefix(rel, "/api") {
+				writeAdminAuthError(w, http.StatusUnauthorized, "admin_authentication_required", "admin login is required")
+				return
+			}
+			http.Redirect(w, r, base+"/login", http.StatusSeeOther)
+			return
+		}
+	}
+
 	switch {
-	case (r.URL.Path == "/admin" || r.URL.Path == "/admin/") && (r.Method == http.MethodGet || r.Method == http.MethodHead):
+	case (rel == "/" || rel == "") && (r.Method == http.MethodGet || r.Method == http.MethodHead):
 		h.serveIndex(w, r)
-	case r.URL.Path == "/admin/api/providers" && r.Method == http.MethodGet:
+	case rel == "/api/providers" && r.Method == http.MethodGet:
 		h.listProviders(w)
-	case r.URL.Path == "/admin/api/providers" && r.Method == http.MethodPut:
-		if r.Header.Get("X-AI-Proxy-Admin") != "1" {
-			writeError(w, http.StatusForbidden, "missing admin request header")
+	case rel == "/api/providers" && r.Method == http.MethodPut:
+		if !h.requireAdminMutation(w, r) {
 			return
 		}
 		h.updateProviders(w, r)
-	case strings.HasPrefix(r.URL.Path, "/admin/api/providers/") && strings.HasSuffix(r.URL.Path, "/probe") && r.Method == http.MethodPost:
-		if !requireAdminWrite(w, r) {
+	case strings.HasPrefix(rel, "/api/providers/") && strings.HasSuffix(rel, "/probe") && r.Method == http.MethodPost:
+		if !h.requireAdminMutation(w, r) {
 			return
 		}
-		h.probeProvider(w, r)
-	case r.URL.Path == "/admin/api/client-api-keys" && r.Method == http.MethodGet:
+		h.probeProvider(w, r, rel)
+	case rel == "/api/client-api-keys" && r.Method == http.MethodGet:
 		h.listClientAPIKeys(w)
-	case r.URL.Path == "/admin/api/client-api-keys" && r.Method == http.MethodPost:
+	case rel == "/api/client-api-keys" && r.Method == http.MethodPost:
 		h.createClientAPIKey(w, r)
-	case strings.HasPrefix(r.URL.Path, "/admin/api/client-api-keys/"):
-		h.clientAPIKeyAction(w, r)
-	case strings.HasPrefix(r.URL.Path, "/admin/api/usage/"):
-		h.usageAPI(w, r)
+	case strings.HasPrefix(rel, "/api/client-api-keys/"):
+		h.clientAPIKeyAction(w, r, rel)
+	case strings.HasPrefix(rel, "/api/usage/"):
+		h.usageAPI(w, r, rel)
 	default:
 		http.NotFound(w, r)
 	}
 }
 
-func (h *Handler) probeProvider(w http.ResponseWriter, r *http.Request) {
-	name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/admin/api/providers/"), "/probe")
+func (h *Handler) probeProvider(w http.ResponseWriter, r *http.Request, rel string) {
+	name := strings.TrimSuffix(strings.TrimPrefix(rel, "/api/providers/"), "/probe")
 	name = strings.ToLower(strings.Trim(strings.TrimSpace(name), "/"))
 	if name == "" {
 		writeError(w, http.StatusBadRequest, "provider name is required")
@@ -155,11 +217,33 @@ func mapProbeOutcome(conclusion string) string {
 func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
 	if r.Method == http.MethodHead {
 		return
 	}
-	_, _ = w.Write(adminweb.AdminIndexHTML)
+	_, _ = w.Write(injectAdminBasePath(adminweb.AdminIndexHTML, h.adminBasePath()))
+}
+
+// injectAdminBasePath 在 HTML 开头注入安全的 basePath JSON 字面量。
+func injectAdminBasePath(html []byte, basePath string) []byte {
+	bp, err := json.Marshal(basePath)
+	if err != nil {
+		bp = []byte(`"/admin"`)
+	}
+	injection := []byte("<script>window.__AI_PROXY_ADMIN_BASE_PATH__=" + string(bp) + ";</script>")
+	// 插在 <head> 后,保证脚本尽早可用。
+	lower := strings.ToLower(string(html))
+	idx := strings.Index(lower, "<head>")
+	if idx < 0 {
+		return append(injection, html...)
+	}
+	idx += len("<head>")
+	out := make([]byte, 0, len(html)+len(injection))
+	out = append(out, html[:idx]...)
+	out = append(out, injection...)
+	out = append(out, html[idx:]...)
+	return out
 }
 
 func (h *Handler) listProviders(w http.ResponseWriter) {
@@ -272,19 +356,19 @@ func (h *Handler) updateProviders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, err := writeProviders(h.configPath, request.Providers)
+	cfg, err := writeProviders(h.configPath, h.adminBasePath(), request.Providers)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := h.runtime.UpdateConfig(cfg); err != nil {
+	if err := h.activateConfig(cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, "activate config: "+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "message": "provider configuration saved and activated"})
 }
 
-func writeProviders(path string, providers []providerInput) (config.Config, error) {
+func writeProviders(path, expectedAdminBasePath string, providers []providerInput) (config.Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return config.Config{}, fmt.Errorf("read config: %w", err)
@@ -339,6 +423,9 @@ func writeProviders(path string, providers []providerInput) (config.Config, erro
 	cfg, err := config.Load(tempPath)
 	if err != nil {
 		return config.Config{}, fmt.Errorf("configuration rejected: %w", err)
+	}
+	if cfg.AdminAuth.BasePath != expectedAdminBasePath {
+		return config.Config{}, errAdminBasePathRestart
 	}
 	if err := os.Rename(tempPath, path); err != nil {
 		return config.Config{}, fmt.Errorf("replace config: %w", err)

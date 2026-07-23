@@ -14,7 +14,7 @@ make run
 
 默认地址为 `http://127.0.0.1:8080`。启动后可访问：
 
-- [Provider 管理与使用统计](http://127.0.0.1:8080/admin/)
+- [Provider 管理与使用统计](http://127.0.0.1:8080/admin/)（默认仅 loopback；可启用账号密码登录后远程访问，见配置参考）
 - `GET /healthz`
 - `GET /metrics`、`GET /stats`（默认仅 loopback）
 
@@ -34,6 +34,7 @@ make run                         # 使用 config.yaml 启动
 make check                       # 格式、vet、全量测试
 make build                       # 构建当前平台二进制
 make release-package VERSION=v1.2.3
+ai-proxy admin password-hash     # 交互式生成 Admin Argon2id 密码哈希
 ```
 
 完整多平台发布由推送 `vX.Y.Z` tag 的 GitHub Actions 完成；详情见[运维与发布说明](docs/operations.md#构建与发布)。
@@ -44,6 +45,7 @@ make release-package VERSION=v1.2.3
 | --- | --- |
 | 配置、客户端 Key、Provider 管理 | [配置参考](docs/configuration.md) |
 | 客户端 Key 管理收口 | [客户端 API Key 管理设计](docs/client-api-key-management-design-2026-07-20.md) |
+| Admin 账号密码登录 | [Admin 登录安全设计](docs/admin-login-security-design-2026-07-23.md) |
 | 协议端点、模型路由、转换与错误合同 | [Provider Capability Contract](docs/provider-capability-contract-design-2026-07-15.md) |
 | DuckDB 用量、Admin API、Web 统计 | [API Key 用量与 DuckDB 收口方案](docs/api-key-usage-duckdb-web-closure-plan-2026-07-17.md) |
 | 运行、监控、归档、探针、备份与发布 | [运维与发布](docs/operations.md) |

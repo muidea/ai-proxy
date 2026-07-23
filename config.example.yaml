@@ -35,6 +35,20 @@ server:
   slo_check_interval_seconds: 60
   slo_violation_webhook:
 
+  # Admin 登录安全（可选）。默认 false：Admin 仅 loopback 可访问。
+  # 设为 true 后取消来源限制，必须先登录；HTTP/HTTPS 均可访问。
+  # admin_auth_enabled: false
+  # Admin 页面/API 前缀，默认 /admin；启动期路由，变更需重启。
+  # admin_base_path: /admin
+  # 单管理员账号（区分大小写）。
+  # admin_username: ops-admin
+  # 仅接受 Argon2id PHC 哈希；用 `ai-proxy admin password-hash` 生成后注入。
+  # admin_password_hash: ${AI_PROXY_ADMIN_PASSWORD_HASH}
+  # true 时会话 Cookie 仅随 HTTPS 请求发送；默认 false，兼容 HTTP。
+  # admin_session_cookie_secure: false
+  # 会话绝对有效期（秒），默认 28800（8h），范围 300~86400。
+  # admin_session_ttl_seconds: 28800
+
 # 路由仅按 model_catalog exact model → 唯一 RouteOwner；请保证各 provider 的 models 互不重叠。
 # 客户端使用标准 path:
 #   OpenAI:  POST /v1/chat/completions|/v1/responses|/v1/completions|/v1/embeddings, GET/POST /v1/models

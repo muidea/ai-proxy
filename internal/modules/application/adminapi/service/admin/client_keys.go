@@ -65,7 +65,7 @@ func credentialSource(key config.ClientAPIKey) string {
 }
 
 func (h *Handler) createClientAPIKey(w http.ResponseWriter, r *http.Request) {
-	if !requireAdminWrite(w, r) {
+	if !h.requireAdminMutation(w, r) {
 		return
 	}
 	var input createClientKeyRequest
@@ -92,7 +92,7 @@ func (h *Handler) createClientAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "client API key id already exists")
 		return
 	}
-	cfg, err := mutateClientKeys(h.configPath, func(node *yaml.Node) error {
+	cfg, err := mutateClientKeys(h.configPath, h.adminBasePath(), func(node *yaml.Node) error {
 		if mappingValue(node, id) != nil {
 			return errors.New("client API key id already exists")
 		}
@@ -106,7 +106,7 @@ func (h *Handler) createClientAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := h.runtime.UpdateConfig(cfg); err != nil {
+	if err := h.activateConfig(cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, "activate config: "+err.Error())
 		return
 	}
@@ -114,11 +114,11 @@ func (h *Handler) createClientAPIKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "enabled": enabled, "api_key": secret, "message": "Copy this API key now. It cannot be displayed again."})
 }
 
-func (h *Handler) clientAPIKeyAction(w http.ResponseWriter, r *http.Request) {
-	if !requireAdminWrite(w, r) {
+func (h *Handler) clientAPIKeyAction(w http.ResponseWriter, r *http.Request, rel string) {
+	if !h.requireAdminMutation(w, r) {
 		return
 	}
-	rest := strings.TrimPrefix(r.URL.Path, "/admin/api/client-api-keys/")
+	rest := strings.TrimPrefix(rel, "/api/client-api-keys/")
 	rotate := strings.HasSuffix(rest, "/rotate")
 	id := strings.TrimSuffix(rest, "/rotate")
 	id = strings.ToLower(strings.TrimSpace(strings.Trim(id, "/")))
@@ -139,7 +139,7 @@ func (h *Handler) clientAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, "generate client API key")
 			return
 		}
-		cfg, err := mutateClientKeys(h.configPath, func(node *yaml.Node) error {
+		cfg, err := mutateClientKeys(h.configPath, h.adminBasePath(), func(node *yaml.Node) error {
 			entry := mappingValue(node, id)
 			if entry == nil {
 				return errors.New("client API key not found")
@@ -152,7 +152,7 @@ func (h *Handler) clientAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, err.Error())
 			return
 		}
-		if err := h.runtime.UpdateConfig(cfg); err != nil {
+		if err := h.activateConfig(cfg); err != nil {
 			writeError(w, 500, "activate config: "+err.Error())
 			return
 		}
@@ -167,7 +167,7 @@ func (h *Handler) clientAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "enabled is required")
 			return
 		}
-		cfg, err := mutateClientKeys(h.configPath, func(node *yaml.Node) error {
+		cfg, err := mutateClientKeys(h.configPath, h.adminBasePath(), func(node *yaml.Node) error {
 			entry := mappingValue(node, id)
 			if entry == nil {
 				return errors.New("client API key not found")
@@ -179,18 +179,18 @@ func (h *Handler) clientAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, err.Error())
 			return
 		}
-		if err := h.runtime.UpdateConfig(cfg); err != nil {
+		if err := h.activateConfig(cfg); err != nil {
 			writeError(w, 500, "activate config: "+err.Error())
 			return
 		}
 		writeJSON(w, 200, clientKeyView{ID: id, Enabled: *input.Enabled, CredentialSource: credentialSource(cfg.ClientAPIKeys[id]), KeyConfigured: cfg.ClientAPIKeys[id].APIKey != "" || cfg.ClientAPIKeys[id].APIKeyHash != ""})
 	case !rotate && r.Method == http.MethodDelete:
-		cfg, err := mutateClientKeys(h.configPath, func(node *yaml.Node) error { removeMappingValue(node, id); return nil })
+		cfg, err := mutateClientKeys(h.configPath, h.adminBasePath(), func(node *yaml.Node) error { removeMappingValue(node, id); return nil })
 		if err != nil {
 			writeError(w, 400, err.Error())
 			return
 		}
-		if err := h.runtime.UpdateConfig(cfg); err != nil {
+		if err := h.activateConfig(cfg); err != nil {
 			writeError(w, 500, "activate config: "+err.Error())
 			return
 		}
@@ -200,13 +200,6 @@ func (h *Handler) clientAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func requireAdminWrite(w http.ResponseWriter, r *http.Request) bool {
-	if r.Header.Get("X-AI-Proxy-Admin") != "1" {
-		writeError(w, http.StatusForbidden, "missing admin request header")
-		return false
-	}
-	return true
-}
 func decodeAdminJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	dec := json.NewDecoder(r.Body)
@@ -233,7 +226,7 @@ func generateClientKey() (string, string, error) {
 	return key, "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
-func mutateClientKeys(path string, mutate func(*yaml.Node) error) (config.Config, error) {
+func mutateClientKeys(path, expectedAdminBasePath string, mutate func(*yaml.Node) error) (config.Config, error) {
 	if strings.TrimSpace(path) == "" {
 		return config.Config{}, errors.New("no writable config file is active")
 	}
@@ -291,6 +284,9 @@ func mutateClientKeys(path string, mutate func(*yaml.Node) error) (config.Config
 	cfg, err := config.Load(tmpPath)
 	if err != nil {
 		return config.Config{}, fmt.Errorf("configuration rejected: %w", err)
+	}
+	if cfg.AdminAuth.BasePath != expectedAdminBasePath {
+		return config.Config{}, errAdminBasePathRestart
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return config.Config{}, err

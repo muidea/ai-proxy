@@ -16,7 +16,12 @@ import (
 
 // Run 是 ai-proxy 主进程的 service shell。cmd 入口只传入构建版本；
 // 配置加载、信号处理及 magicCommon lifecycle 编排均归 process service 所有。
+// 若 args 为 admin 子命令(如 password-hash)，则不启动 HTTP gateway。
 func Run(version string) int {
+	// 子命令优先于 flag 解析，避免 flag 吞掉 admin 参数。
+	if code, handled := tryAdminSubcommand(os.Args[1:]); handled {
+		return code
+	}
 	configPath := flag.String("config", os.Getenv("AI_PROXY_CONFIG"), "config file path")
 	flag.Parse()
 

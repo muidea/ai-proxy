@@ -38,22 +38,22 @@ func (h *Handler) WithUsageStore(store usage.Store) *Handler {
 
 // NewHandlerWithUsage 构造带 usage 查询能力的管理端。
 func NewHandlerWithUsage(configPath string, runtime RuntimeConfig, store usage.Store) *Handler {
-	return &Handler{configPath: configPath, runtime: runtime, usageStore: store}
+	return NewHandler(configPath, runtime).WithUsageStore(store)
 }
 
-func (h *Handler) usageAPI(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) usageAPI(w http.ResponseWriter, r *http.Request, rel string) {
 	if h.usageStore == nil {
 		writeError(w, http.StatusServiceUnavailable, "usage store unavailable")
 		return
 	}
 	switch {
-	case r.URL.Path == "/admin/api/usage/dashboard" && r.Method == http.MethodGet:
+	case rel == "/api/usage/dashboard" && r.Method == http.MethodGet:
 		h.usageDashboard(w, r)
-	case r.URL.Path == "/admin/api/usage/events" && r.Method == http.MethodGet:
+	case rel == "/api/usage/events" && r.Method == http.MethodGet:
 		h.usageEvents(w, r)
-	case r.URL.Path == "/admin/api/usage/export.csv" && r.Method == http.MethodGet:
+	case rel == "/api/usage/export.csv" && r.Method == http.MethodGet:
 		h.usageExport(w, r)
-	case r.URL.Path == "/admin/api/usage/filter-options" && r.Method == http.MethodGet:
+	case rel == "/api/usage/filter-options" && r.Method == http.MethodGet:
 		h.usageFilterOptions(w, r)
 	default:
 		http.NotFound(w, r)

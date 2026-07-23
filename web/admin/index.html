@@ -31,7 +31,7 @@
       <a href="#/client-keys" id="navClientKeys">客户端 Key</a>
       <a href="#/usage" id="navUsage">使用统计</a>
     </nav>
-    <div class="header-status"><i class="dot" id="storeDot"></i><span id="storeLabel">本地管理模式</span></div>
+    <div class="header-status"><i class="dot" id="storeDot"></i><span id="storeLabel">本地管理模式</span><button id="logoutBtn" class="btn hidden" type="button" style="margin-left:8px">退出登录</button></div>
   </header>
   <main>
     <section id="panelProviders" class="panel active">
@@ -133,23 +133,42 @@
 <div class="toast-wrap" id="toasts"></div>
 
 <script>
+
+const ADMIN_BASE = (typeof window.__AI_PROXY_ADMIN_BASE_PATH__ === "string" && window.__AI_PROXY_ADMIN_BASE_PATH__) || "/admin";
+function apiURL(path){return ADMIN_BASE + path;}
+const authState = {csrf:"", username:""};
+function authHeaders(extra={}){
+  const h = {"X-AI-Proxy-Admin":"1", ...extra};
+  if(authState.csrf) h["X-AI-Proxy-CSRF"] = authState.csrf;
+  return h;
+}
+function goLogin(){authState.csrf="";authState.username="";location.replace(ADMIN_BASE+"/login");}
+
 const capabilityOptions={openai:["chat_completions","responses","completions","embeddings"],anthropic:["messages"]};
 const state={providers:[],writable:false,editing:-1,query:"",tab:"providers",range:"today",usage:null,events:[],cursor:"",usageTimer:null,apiKeyFilter:"",providerFilter:"",modelFilter:"",outcomeFilter:"",estimatedFilter:"",from:"",to:"",filterOptions:null,filterOptionsKey:"",filterOptionsWarned:false};
 const $=id=>document.getElementById(id);
 const esc=v=>String(v??"").replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
 const splitList=v=>v.split(/[\n,]/).map(x=>x.trim()).filter(Boolean);
 function compact(n){n=Number(n)||0;const a=Math.abs(n);if(a>=1e9)return(n/1e9).toFixed(2)+"B";if(a>=1e6)return(n/1e6).toFixed(2)+"M";if(a>=1e3)return(n/1e3).toFixed(1)+"K";return String(Math.round(n*100)/100)}
-async function request(url,options={}){const r=await fetch(url,{cache:"no-store",...options});const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data?.error?.message||`请求失败 (${r.status})`);return data}
+async function request(url,options={}){
+  const opts={cache:"no-store",credentials:"same-origin",...options};
+  const r=await fetch(url,opts);
+  if(r.status===401){goLogin();throw new Error("需要登录");}
+  if(r.status===204)return null;
+  const data=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(data?.error?.message||`请求失败 (${r.status})`);
+  return data;
+}
 
 function parseHash(){const h=location.hash||"#/providers";const [path,qs]=h.replace(/^#\/?/,"").split("?");const p=new URLSearchParams(qs||"");const tab=path.startsWith("usage")?"usage":path.startsWith("client-keys")?"client-keys":"providers";return {tab,range:p.get("range")||"today",apiKeyFilter:p.get("api_key_id")||"",providerFilter:p.get("provider")||"",modelFilter:p.get("model")||"",outcomeFilter:p.get("outcome")||"",estimatedFilter:p.get("estimated")||"",from:p.get("from")||"",to:p.get("to")||""}}
 function setHash(){const q=new URLSearchParams();if(state.tab==="usage"){q.set("range",state.range);[["api_key_id",state.apiKeyFilter],["provider",state.providerFilter],["model",state.modelFilter],["outcome",state.outcomeFilter],["estimated",state.estimatedFilter],["from",state.from],["to",state.to]].forEach(([k,v])=>{if(v)q.set(k,v)});location.hash="#/usage?"+q.toString()}else location.hash="#/"+state.tab}
 function showTab(tab){state.tab=tab;$("panelProviders").classList.toggle("active",tab==="providers");$("panelClientKeys").classList.toggle("active",tab==="client-keys");$("panelUsage").classList.toggle("active",tab==="usage");$("navProviders").classList.toggle("active",tab==="providers");$("navClientKeys").classList.toggle("active",tab==="client-keys");$("navUsage").classList.toggle("active",tab==="usage");if(tab==="usage"){loadFilterOptions(false);loadUsage(true)}else if(tab==="client-keys")loadClientKeys();else loadProviders()}
-async function loadClientKeys(){try{const d=await request("/admin/api/client-api-keys");state.clientKeys=d.client_api_keys||[];$("addClientKey").disabled=!d.writable;const rows=state.clientKeys.map(k=>{const managed=k.credential_source==="managed";return `<tr><td class="key-id" title="${esc(k.id)}">${esc(k.id)}</td><td><span class="tag ${managed?"tag-key-managed":"tag-key-external"}">${managed?"托管密钥":"外部配置"}</span></td><td><span class="tag ${k.enabled?"tag-status-active":"tag-status-disabled"}">${k.enabled?"已启用":"已禁用"}</span></td><td class="key-actions"><div class="actions"><button class="link-btn" data-key-toggle="${esc(k.id)}" data-enabled="${!k.enabled}">${k.enabled?"禁用":"启用"}</button><button class="link-btn" data-key-rotate="${esc(k.id)}">轮换</button><button class="link-btn link-danger" data-key-delete="${esc(k.id)}">删除</button></div></td></tr>`}).join("");const table=$("clientKeyTable");table.className="";table.innerHTML=`<div class="table-wrap"><table class="client-key-table"><colgroup><col style="width:42%"><col style="width:18%"><col style="width:14%"><col style="width:26%"></colgroup><thead><tr><th>ID</th><th>凭据来源</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows||`<tr><td colspan="4" class="empty">尚未配置客户端 Key</td></tr>`}</tbody></table></div>`;document.querySelectorAll("[data-key-toggle]").forEach(b=>b.onclick=()=>keyRequest(`/admin/api/client-api-keys/${encodeURIComponent(b.dataset.keyToggle)}`,"PATCH",{enabled:b.dataset.enabled==="true"}));document.querySelectorAll("[data-key-rotate]").forEach(b=>b.onclick=()=>rotateClientKey(b.dataset.keyRotate));document.querySelectorAll("[data-key-delete]").forEach(b=>b.onclick=()=>{if(confirm(`删除 ${b.dataset.keyDelete}？`))keyRequest(`/admin/api/client-api-keys/${encodeURIComponent(b.dataset.keyDelete)}`,"DELETE")})}catch(e){$("clientKeyTable").textContent=e.message}}
-async function keyRequest(url,method,body){try{await request(url,{method,headers:{"Content-Type":"application/json","X-AI-Proxy-Admin":"1"},body:body?JSON.stringify(body):undefined});toast("客户端 Key 配置已保存");loadClientKeys()}catch(e){toast(e.message,"error")}}
-async function rotateClientKey(id){if(!confirm(`轮换 ${id}？旧 Key 将立即失效。`))return;try{const d=await request(`/admin/api/client-api-keys/${encodeURIComponent(id)}/rotate`,{method:"POST",headers:{"X-AI-Proxy-Admin":"1"}});showClientSecret(d.api_key);loadClientKeys()}catch(e){toast(e.message,"error")}}
+async function loadClientKeys(){try{const d=await request(apiURL("/api/client-api-keys"));state.clientKeys=d.client_api_keys||[];$("addClientKey").disabled=!d.writable;const rows=state.clientKeys.map(k=>{const managed=k.credential_source==="managed";return `<tr><td class="key-id" title="${esc(k.id)}">${esc(k.id)}</td><td><span class="tag ${managed?"tag-key-managed":"tag-key-external"}">${managed?"托管密钥":"外部配置"}</span></td><td><span class="tag ${k.enabled?"tag-status-active":"tag-status-disabled"}">${k.enabled?"已启用":"已禁用"}</span></td><td class="key-actions"><div class="actions"><button class="link-btn" data-key-toggle="${esc(k.id)}" data-enabled="${!k.enabled}">${k.enabled?"禁用":"启用"}</button><button class="link-btn" data-key-rotate="${esc(k.id)}">轮换</button><button class="link-btn link-danger" data-key-delete="${esc(k.id)}">删除</button></div></td></tr>`}).join("");const table=$("clientKeyTable");table.className="";table.innerHTML=`<div class="table-wrap"><table class="client-key-table"><colgroup><col style="width:42%"><col style="width:18%"><col style="width:14%"><col style="width:26%"></colgroup><thead><tr><th>ID</th><th>凭据来源</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows||`<tr><td colspan="4" class="empty">尚未配置客户端 Key</td></tr>`}</tbody></table></div>`;document.querySelectorAll("[data-key-toggle]").forEach(b=>b.onclick=()=>keyRequest(apiURL(`/api/client-api-keys/${encodeURIComponent(b.dataset.keyToggle)}`),"PATCH",{enabled:b.dataset.enabled==="true"}));document.querySelectorAll("[data-key-rotate]").forEach(b=>b.onclick=()=>rotateClientKey(b.dataset.keyRotate));document.querySelectorAll("[data-key-delete]").forEach(b=>b.onclick=()=>{if(confirm(`删除 ${b.dataset.keyDelete}？`))keyRequest(apiURL(`/api/client-api-keys/${encodeURIComponent(b.dataset.keyDelete)}`),"DELETE")})}catch(e){$("clientKeyTable").textContent=e.message}}
+async function keyRequest(url,method,body){try{await request(url,{method,headers:authHeaders({"Content-Type":"application/json"}),body:body?JSON.stringify(body):undefined});toast("客户端 Key 配置已保存");loadClientKeys()}catch(e){toast(e.message,"error")}}
+async function rotateClientKey(id){if(!confirm(`轮换 ${id}？旧 Key 将立即失效。`))return;try{const d=await request(apiURL(`/api/client-api-keys/${encodeURIComponent(id)}/rotate`),{method:"POST",headers:authHeaders()});showClientSecret(d.api_key);loadClientKeys()}catch(e){toast(e.message,"error")}}
 function showClientSecret(key){$("clientSecret").value=key;$("clientSecretDialog").showModal()}
 
-async function loadProviders(){try{const data=await request("/admin/api/providers");state.providers=data.providers||[];state.writable=Boolean(data.writable);$("readonlyNotice").style.display=state.writable?"none":"block";$("addButton").disabled=!state.writable;renderProviders()}catch(e){$("content").innerHTML=`<div class="empty">${esc(e.message)}</div>`}}
+async function loadProviders(){try{const data=await request(apiURL("/api/providers"));state.providers=data.providers||[];state.writable=Boolean(data.writable);$("readonlyNotice").style.display=state.writable?"none":"block";$("addButton").disabled=!state.writable;renderProviders()}catch(e){$("content").innerHTML=`<div class="empty">${esc(e.message)}</div>`}}
 function providerAvailabilityMeta(a){const status=a?.status||"unknown";const map={healthy:["正常","tag-status-active"],degraded:["降级","tag-purple"],unavailable:["不可用","tag-status-disabled"],credential_error:["凭据异常","tag-status-disabled"],capability_drift:["能力漂移","tag-purple"],disabled:["已禁用","tag-default"],unknown:["待观测","tag-default"]};const [label,cls]=map[status]||map.unknown;const detail=a?.last_success_at?`最近成功：${new Date(a.last_success_at).toLocaleString()}`:"尚无成功请求";return `<span class="tag ${cls}" title="${esc(detail)}">${label}</span>`}
 function renderProviders(){
   const q=state.query.trim().toLowerCase();
@@ -160,14 +179,14 @@ function renderProviders(){
   document.querySelectorAll("[data-edit]").forEach(el=>el.onclick=()=>openDialog(Number(el.dataset.edit)));
   document.querySelectorAll("[data-delete]").forEach(el=>el.onclick=()=>removeProvider(Number(el.dataset.delete)));
   document.querySelectorAll("[data-toggle]").forEach(el=>el.onchange=()=>toggleProvider(Number(el.dataset.toggle),el.checked));
-  document.querySelectorAll("[data-probe]").forEach(el=>el.onclick=async()=>{el.disabled=true;try{const d=await request(`/admin/api/providers/${encodeURIComponent(el.dataset.probe)}/probe`,{method:"POST",headers:{"X-AI-Proxy-Admin":"1"}});toast(d.conclusion==="success"?"Provider 检查成功":`检查结果：${d.conclusion}`,d.conclusion==="success"?"success":"error");await loadProviders()}catch(e){toast(e.message,"error")}finally{el.disabled=false}});
+  document.querySelectorAll("[data-probe]").forEach(el=>el.onclick=async()=>{el.disabled=true;try{const d=await request(apiURL(`/api/providers/${encodeURIComponent(el.dataset.probe)}/probe`),{method:"POST",headers:authHeaders()});toast(d.conclusion==="success"?"Provider 检查成功":`检查结果：${d.conclusion}`,d.conclusion==="success"?"success":"error");await loadProviders()}catch(e){toast(e.message,"error")}finally{el.disabled=false}});
 }
 function rowHTML(p,index){const models=(p.models||[]).slice(0,4).map(m=>`<span class="tag tag-default">${esc(m)}</span>`).join("")+((p.models||[]).length>4?`<span class="tag tag-default">+${p.models.length-4}</span>`:"");const caps=(p.endpoint_capabilities||[]).map(c=>`<span class="tag tag-purple">${esc(c)}</span>`).join("");return `<tr><td><div class="provider-name">${esc(p.name)}</div><div class="subtle">${p.api_key_configured?"API Key 已配置":p.allow_unauthenticated?"本地无认证":"未配置凭据"}</div></td><td><span class="tag ${p.protocol==="openai"?"":"tag-green"}">${esc(p.protocol)}</span></td><td><div class="url" title="${esc(p.base_url)}">${esc(p.base_url)}</div></td><td>${providerAvailabilityMeta(p.availability)}</td><td><div class="tags">${models}</div></td><td><div class="tags">${caps}</div></td><td><label class="switch"><input data-toggle="${index}" type="checkbox" ${p.enabled?"checked":""} ${state.writable?"":"disabled"}><span class="slider"></span></label></td><td><div class="actions"><button class="link-btn" data-probe="${esc(p.name)}" ${p.enabled?"":"disabled"}>检查</button><button class="link-btn" data-edit="${index}" ${state.writable?"":"disabled"}>编辑</button><button class="link-btn link-danger" data-delete="${index}" ${state.writable?"":"disabled"}>删除</button></div></td></tr>`}
 function renderCapabilities(selected=[]){const protocol=$("protocol").value;const opts=capabilityOptions[protocol]||[];$("capabilities").innerHTML=opts.map(c=>`<label class="check"><input type="checkbox" value="${c}" ${selected.includes(c)?"checked":""}>${c}</label>`).join("")}
 function openDialog(index=-1){if(!state.writable)return;state.editing=index;const editing=index>=0;const p=editing?state.providers[index]:null;$("modalTitle").textContent=editing?`编辑 ${p.name}`:"新增 Provider";$("name").value=p?.name||"";$("name").disabled=editing;$("protocol").value=p?.protocol||"openai";$("baseURL").value=p?.base_url||"";$("apiKey").value="";$("models").value=(p?.models||[]).join(", ");$("allowUnauthenticated").checked=Boolean(p?.allow_unauthenticated);$("enabled").checked=p?Boolean(p.enabled):true;renderCapabilities(p?.endpoint_capabilities||capabilityOptions[$("protocol").value]);$("providerDialog").showModal()}
 function closeDialog(){$("providerDialog").close();$("providerForm").reset()}
 async function submitForm(event){event.preventDefault();const caps=[...$("capabilities").querySelectorAll("input:checked")].map(i=>i.value);if(!caps.length){toast("请至少选择一个 endpoint capability","error");return}const item={name:$("name").value.trim(),protocol:$("protocol").value,base_url:$("baseURL").value.trim(),api_key:$("apiKey").value,models:splitList($("models").value),endpoint_capabilities:caps,allow_unauthenticated:$("allowUnauthenticated").checked,enabled:$("enabled").checked};const next=state.providers.map(p=>({...p}));if(state.editing>=0)next[state.editing]=item;else next.push(item);await save(next,"Provider 配置已保存并生效",true)}
-async function save(providers,message,close=false){try{$("saveButton").disabled=true;await request("/admin/api/providers",{method:"PUT",headers:{"Content-Type":"application/json","X-AI-Proxy-Admin":"1"},body:JSON.stringify({providers})});toast(message);if(close)closeDialog();await loadProviders()}catch(e){toast(e.message,"error")}finally{$("saveButton").disabled=false}}
+async function save(providers,message,close=false){try{$("saveButton").disabled=true;await request(apiURL("/api/providers"),{method:"PUT",headers:authHeaders({"Content-Type":"application/json"}),body:JSON.stringify({providers})});toast(message);if(close)closeDialog();await loadProviders()}catch(e){toast(e.message,"error")}finally{$("saveButton").disabled=false}}
 async function toggleProvider(index,enabled){const next=state.providers.map(p=>({...p}));next[index].enabled=enabled;await save(next,enabled?"Provider 已启用":"Provider 已禁用")}
 async function removeProvider(index){const p=state.providers[index];if(!confirm(`确认删除 Provider “${p.name}”？`))return;const next=state.providers.filter((_,i)=>i!==index);await save(next,"Provider 已删除")}
 function toast(message,type="success"){const el=document.createElement("div");el.className=`toast toast-${type}`;el.innerHTML=`<span>${type==="success"?"✓":"!"}</span><div>${esc(message)}</div>`;$("toasts").appendChild(el);setTimeout(()=>el.remove(),4200)}
@@ -206,7 +225,7 @@ async function loadFilterOptions(force=false){
   const key=filterOptionsCacheKey();
   if(!force&&state.filterOptions&&state.filterOptionsKey===key)return;
   try{
-    const data=await request(`/admin/api/usage/filter-options?${usageRangeParams().toString()}`);
+    const data=await request(apiURL(`/api/usage/filter-options?${usageRangeParams().toString()}`));
     // 时间范围变更后，过期请求不得覆盖当前下拉选项。
     if(key!==filterOptionsCacheKey())return;
     state.filterOptionsKey=key;
@@ -224,7 +243,7 @@ async function loadFilterOptions(force=false){
 }
 async function loadUsage(resetEvents=true){
   try{
-    const data=await request(`/admin/api/usage/dashboard?${usageParams().toString()}`);
+    const data=await request(apiURL(`/api/usage/dashboard?${usageParams().toString()}`));
     state.usage=data;
     const healthy=data?.store?.healthy!==false;
     $("storeDot").classList.toggle("bad",!healthy);
@@ -237,7 +256,7 @@ async function loadUsage(resetEvents=true){
     $("uSuccess").textContent=rate;$("uSuccess").title=`success ${s.success_requests||0} / ${s.requests||0}`;
     renderCharts(data.daily||[]);
     renderKeyTable(data.by_api_key||[]);
-    $("usageExport").href=`/admin/api/usage/export.csv?${usageParams().toString()}`;
+    $("usageExport").href=apiURL(`/api/usage/export.csv?${usageParams().toString()}`);
     if(resetEvents){state.events=[];state.cursor="";await loadEvents(true)}
   }catch(e){
     $("keyTable").innerHTML=`<div class="empty">${esc(e.message)}</div>`;
@@ -272,7 +291,7 @@ async function loadEvents(reset=false){
   try{
     const params=usageParams();params.set("page_size","50");
     if(state.cursor)params.set("cursor",state.cursor);
-    const page=await request(`/admin/api/usage/events?${params}`);
+    const page=await request(apiURL(`/api/usage/events?${params}`));
     const list=page.events||[];
     state.events=reset?list:state.events.concat(list);
     state.cursor=page.next_cursor||"";
@@ -294,7 +313,7 @@ $("search").oninput=e=>{state.query=e.target.value;renderProviders()};
 $("usageRefresh").onclick=()=>{loadFilterOptions(true);loadUsage(true)};
 $("addClientKey").onclick=()=>$("clientKeyDialog").showModal();
 $("closeClientKeyDialog").onclick=$("cancelClientKey").onclick=()=>$("clientKeyDialog").close();
-$("clientKeyForm").onsubmit=async e=>{e.preventDefault();try{const d=await request("/admin/api/client-api-keys",{method:"POST",headers:{"Content-Type":"application/json","X-AI-Proxy-Admin":"1"},body:JSON.stringify({id:$("clientKeyID").value.trim(),enabled:$("clientKeyEnabled").checked})});$("clientKeyDialog").close();showClientSecret(d.api_key);loadClientKeys()}catch(err){toast(err.message,"error")}};
+$("clientKeyForm").onsubmit=async e=>{e.preventDefault();try{const d=await request(apiURL("/api/client-api-keys"),{method:"POST",headers:authHeaders({"Content-Type":"application/json"}),body:JSON.stringify({id:$("clientKeyID").value.trim(),enabled:$("clientKeyEnabled").checked})});$("clientKeyDialog").close();showClientSecret(d.api_key);loadClientKeys()}catch(err){toast(err.message,"error")}};
 $("closeClientSecret").onclick=()=>$("clientSecretDialog").close();
 $("copyClientSecret").onclick=async()=>{try{await navigator.clipboard.writeText($("clientSecret").value);toast("已复制") }catch(e){$("clientSecret").select()}};
 $("loadMoreEvents").onclick=()=>loadEvents(false);
@@ -303,9 +322,30 @@ $("closeUsageEvent").onclick=()=>$("usageEventDialog").close();
 document.querySelectorAll("#rangeGroup .btn").forEach(btn=>btn.onclick=()=>{state.range=btn.dataset.range;if(state.range!=="custom"){state.from="";state.to=""}document.querySelectorAll("#rangeGroup .btn").forEach(b=>b.classList.toggle("active",b===btn));setHash();loadFilterOptions(true);loadUsage(true)});
 function applyUsageState(p){Object.assign(state,p);$("usageEstimatedFilter").value=state.estimatedFilter;$("usageFrom").value=state.from?state.from.slice(0,16):"";$("usageTo").value=state.to?state.to.slice(0,16):"";document.querySelectorAll("#rangeGroup .btn").forEach(b=>b.classList.toggle("active",b.dataset.range===state.range));if(state.filterOptions)fillFilterOptions(state.filterOptions);else{fillSelect($("usageKeyFilter"),"全部 API Key",[],state.apiKeyFilter);fillSelect($("usageProviderFilter"),"全部 Provider",[],state.providerFilter);fillSelect($("usageModelFilter"),"全部 Model",[],state.modelFilter);fillSelect($("usageOutcomeFilter"),"全部 Outcome",[],state.outcomeFilter)}}
 window.addEventListener("hashchange",()=>{const p=parseHash();applyUsageState(p);showTab(p.tab)});
+
+async function initAuthSession(){
+  try{
+    const s=await request(apiURL("/api/auth/session"));
+    if(s&&s.csrf_token){
+      authState.csrf=s.csrf_token;
+      authState.username=s.username||"";
+      const btn=$("logoutBtn");
+      if(btn)btn.classList.remove("hidden");
+    }
+  }catch(e){ /* auth disabled => 404 */ }
+}
+async function doLogout(){
+  try{await request(apiURL("/api/auth/logout"),{method:"POST",headers:authHeaders()});}catch(e){}
+  goLogin();
+}
+const logoutBtn=$("logoutBtn");if(logoutBtn)logoutBtn.onclick=()=>doLogout();
 // boot
+initAuthSession().finally(()=>{
 const boot=parseHash();applyUsageState(boot);showTab(boot.tab);
 state.usageTimer=setInterval(()=>{if(state.tab==="usage")loadUsage(false)},15000);
+});
+
+
 </script>
 </body>
 </html>

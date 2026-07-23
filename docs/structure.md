@@ -43,7 +43,7 @@ internal/modules/
     service/proxy/               入站鉴权、路由、转换、转发与归档钩子
   application/adminapi/         Provider 管理与 usage Application Module
     biz/                         EventHub-backed 配置、Usage 与 Metrics 依赖
-    service/admin/               loopback-only Provider 管理与 usage HTTP adapter
+    service/admin/               Admin 登录、Provider 管理与 usage HTTP adapter
     service/observability/       metrics、stats 与 stats SSE HTTP adapter
 
 internal/pkg/

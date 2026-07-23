@@ -22,6 +22,33 @@ curl http://127.0.0.1:8080/stats
 
 `/metrics` 与 `/stats` 默认仅允许 loopback。若启用远程访问，应同时设置 `metrics_allowed_cidrs` 限制采集端来源。
 
+## Admin 登录安全（可选）
+
+默认 Admin 仅 loopback 可访问。需要远程运维时，启用账号密码登录：
+
+```bash
+# 1. 交互式生成哈希（密码不进入 argv / 环境变量 / 日志）
+ai-proxy admin password-hash
+export AI_PROXY_ADMIN_PASSWORD_HASH='...'
+
+# 2. 配置 server.admin_auth_enabled=true 与账号，或使用环境变量
+#    AI_PROXY_ADMIN_AUTH_ENABLED / AI_PROXY_ADMIN_USERNAME / AI_PROXY_ADMIN_PASSWORD_HASH
+
+# 3. 通过 HTTP 或 HTTPS 对外暴露 <admin_base_path>（默认 /admin）
+#    生产环境推荐 HTTPS；若要浏览器仅在 HTTPS 携带会话，设置 admin_session_cookie_secure=true。
+#    代理应保留外部 Host；应用不信任 X-Forwarded-*。
+```
+
+运维注意：
+
+- 启用后任意来源都必须登录；不再保留 loopback 特权旁路。
+- 修改密码哈希、账号或开关并成功热更新后，全部内存会话立即失效。
+- `admin_base_path` 是启动期路由；变更后必须重启进程，并同步反向代理路径规则。
+- 连续 5 次登录失败会按对端 IP 锁定 15 分钟（不信任 forwarded IP）。
+- Provider Key、客户端 Key 哈希、Admin 密码哈希与 DuckDB 文件仍需主机权限保护。
+
+设计细节见 [Admin 登录安全设计](admin-login-security-design-2026-07-23.md)。
+
 ## 指标与统计
 
 Prometheus 指标均以 `ai_proxy_` 为前缀：
@@ -61,7 +88,7 @@ Prometheus 指标均以 `ai_proxy_` 为前缀：
 
 ## 用量、导出与归档
 
-每个已接受请求会先写入 DuckDB `started` 事件，随后结算为 `completed`。管理页或 `/admin/api/usage/export.csv` 可导出安全元数据；单次导出最大范围为 31 天、最大 100,000 行。
+每个已接受请求会先写入 DuckDB `started` 事件，随后结算为 `completed`。管理页或 `<admin_base_path>/api/usage/export.csv`（默认 `/admin/api/usage/export.csv`）可导出安全元数据；单次导出最大范围为 31 天、最大 100,000 行。
 
 旧 `usage.csv` 只可显式一次性导入：
 
