@@ -99,11 +99,16 @@ server:
 
 实现 `ai-proxy admin password-hash` 子命令。它只从交互式 TTY 两次读取密码（关闭回显），确认一致后输出一行 Argon2id PHC 字符串到 stdout；密码不得作为命令行参数、环境变量、日志或错误消息的一部分。
 
+同时实现 `ai-proxy admin set-credentials --username <username> [--config <config.yaml>]`。该命令同样从 TTY 两次读取密码，原子更新指定配置文件的 `server.admin_auth_enabled: true`、`admin_username` 与 `admin_password_hash`；因此既可创建首个登录账号，也可重置现有账号或密码。候选文件必须通过完整 `config.Load` 校验才会替换正式文件，并继承原文件权限；命令不输出密码或哈希，完成后需要重启进程生效。
+
 推荐操作方式：
 
 ```bash
 ai-proxy admin password-hash
 export AI_PROXY_ADMIN_PASSWORD_HASH='argon2id$v=19$m=65536,t=3,p=1$...'
+
+# 创建或重置凭据（无需手动复制哈希）
+ai-proxy admin set-credentials --username ops-admin --config config.yaml
 ```
 
 实现采用 `golang.org/x/crypto/argon2`，随机 salt 使用 `crypto/rand`。验证时解析 PHC 后使用 `subtle.ConstantTimeCompare` 比较派生结果。哈希参数将来如需升级，必须新增兼容校验和“登录成功后提示重新生成”的迁移方案，不能静默降低现有参数。
@@ -246,7 +251,7 @@ Content-Type: application/json
 | `internal/modules/application/adminapi/service/admin/client_keys.go` | `requireAdminWrite` 改为复用认证上下文与 CSRF gate，不能绕过全局认证。 |
 | `internal/modules/application/adminapi/service/admin/routes.go` | 基于启动快照注册 `<basePath>` 与 `<basePath>/**`，不再硬编码 `/admin`；basePath 变更要求重启。 |
 | `web/admin/index.html`、`web/embed.go` | 登录、会话初始化、CSRF header、401 跳转、登出和安全响应头。 |
-| `cmd/ai-proxy` / `internal/services/aiproxy` | 增加受限的交互式 `admin password-hash` 子命令，不启动 HTTP gateway。 |
+| `cmd/ai-proxy` / `internal/services/aiproxy` | 增加受限的交互式 `admin password-hash` 与 `admin set-credentials` 子命令，不启动 HTTP gateway。 |
 | `config.example.yaml`、`docs/configuration.md`、`docs/operations.md`、`README.md` | 补充开关、哈希生成、启用/禁用行为和本地边界说明。 |
 
 不新增 Module/Block 的理由：账号验证、会话和 Web 路由均是 Admin HTTP application service 的局部职责，没有独立启动资源或跨模块业务 owner。配置仍由既有 Config Runtime 统一校验并原子激活。

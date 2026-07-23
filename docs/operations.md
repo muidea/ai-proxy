@@ -31,6 +31,9 @@ curl http://127.0.0.1:8080/stats
 ai-proxy admin password-hash
 export AI_PROXY_ADMIN_PASSWORD_HASH='...'
 
+# 或直接创建/重置 Admin 登录凭据（自动启用 admin_auth_enabled）
+ai-proxy admin set-credentials --username ops-admin --config config.yaml
+
 # 2. 配置 server.admin_auth_enabled=true 与账号，或使用环境变量
 #    AI_PROXY_ADMIN_AUTH_ENABLED / AI_PROXY_ADMIN_USERNAME / AI_PROXY_ADMIN_PASSWORD_HASH
 

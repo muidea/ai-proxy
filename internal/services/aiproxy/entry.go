@@ -3,6 +3,7 @@ package aiproxy
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -21,6 +22,16 @@ func Run(version string) int {
 	// 子命令优先于 flag 解析，避免 flag 吞掉 admin 参数。
 	if code, handled := tryAdminSubcommand(os.Args[1:]); handled {
 		return code
+	}
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprintln(out, "Usage:")
+		fmt.Fprintln(out, "  ai-proxy [-config <config.yaml>]")
+		fmt.Fprintln(out, "  ai-proxy admin password-hash")
+		fmt.Fprintln(out, "  ai-proxy admin set-credentials --username <username> [--config <config.yaml>]")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Service options:")
+		flag.PrintDefaults()
 	}
 	configPath := flag.String("config", os.Getenv("AI_PROXY_CONFIG"), "config file path")
 	flag.Parse()

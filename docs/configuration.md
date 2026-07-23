@@ -125,6 +125,9 @@ usage_store:
 # 交互式生成 Argon2id 密码哈希（仅 TTY；密码不进参数/日志）
 ai-proxy admin password-hash
 export AI_PROXY_ADMIN_PASSWORD_HASH='...'
+
+# 或直接创建/重置账号密码：自动写入 admin_auth_enabled、账号与哈希，并要求重启生效。
+ai-proxy admin set-credentials --username ops-admin --config config.yaml
 ```
 
 ```yaml

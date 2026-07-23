@@ -35,6 +35,7 @@ make check                       # 格式、vet、全量测试
 make build                       # 构建当前平台二进制
 make release-package VERSION=v1.2.3
 ai-proxy admin password-hash     # 交互式生成 Admin Argon2id 密码哈希
+ai-proxy admin set-credentials --username ops-admin --config config.yaml # 创建或重置 Admin 登录凭据
 ```
 
 完整多平台发布由推送 `vX.Y.Z` tag 的 GitHub Actions 完成；详情见[运维与发布说明](docs/operations.md#构建与发布)。
