@@ -47,7 +47,7 @@
         <div class="stat"><div class="stat-label">Anthropic 协议</div><div class="stat-value" id="anthropicCount">—</div></div>
       </section>
       <section class="card">
-        <div class="toolbar"><span class="toolbar-title">Provider 列表</span><span class="toolbar-meta" id="listMeta"></span><input id="search" class="search" placeholder="搜索名称、协议或地址"></div>
+        <div class="toolbar"><span class="toolbar-title">Provider 列表</span><span class="toolbar-meta" id="listMeta"></span><input id="search" class="search" type="search" name="provider_filter" autocomplete="off" placeholder="搜索名称、协议或地址"></div>
         <div id="content" class="loading"><div class="spin"></div><div>正在读取配置…</div></div>
       </section>
     </section>
@@ -73,13 +73,13 @@
       </section>
       <section class="card" style="padding:14px 16px">
         <div class="usage-filters">
-          <select id="usageKeyFilter" class="control"><option value="">全部 API Key</option></select>
-          <select id="usageProviderFilter" class="control"><option value="">全部 Provider</option></select>
-          <select id="usageModelFilter" class="control"><option value="">全部 Model</option></select>
-          <select id="usageOutcomeFilter" class="control"><option value="">全部 Outcome</option></select>
-          <select id="usageEstimatedFilter" class="control"><option value="">精确与估算</option><option value="false">仅精确</option><option value="true">仅估算</option></select>
-          <input id="usageFrom" class="control" type="datetime-local" title="开始时间（UTC）">
-          <input id="usageTo" class="control" type="datetime-local" title="结束时间（UTC）">
+          <select id="usageKeyFilter" class="control" name="usage_api_key" autocomplete="off"><option value="">全部 API Key</option></select>
+          <select id="usageProviderFilter" class="control" name="usage_provider" autocomplete="off"><option value="">全部 Provider</option></select>
+          <select id="usageModelFilter" class="control" name="usage_model" autocomplete="off"><option value="">全部 Model</option></select>
+          <select id="usageOutcomeFilter" class="control" name="usage_outcome" autocomplete="off"><option value="">全部 Outcome</option></select>
+          <select id="usageEstimatedFilter" class="control" name="usage_estimated" autocomplete="off"><option value="">精确与估算</option><option value="false">仅精确</option><option value="true">仅估算</option></select>
+          <input id="usageFrom" class="control" type="datetime-local" name="usage_from" autocomplete="off" title="开始时间（UTC）">
+          <input id="usageTo" class="control" type="datetime-local" name="usage_to" autocomplete="off" title="结束时间（UTC）">
           <button class="btn" id="usageApply">应用筛选</button>
         </div>
         <div class="subtle" id="filterOptionsHint" style="margin:-8px 0 12px;min-height:18px"></div>
