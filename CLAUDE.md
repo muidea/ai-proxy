@@ -89,7 +89,7 @@ cmd/ai-proxy-usage-import  旧 usage.csv 一次性导入 DuckDB
 | `/v1/completions` | openai | `completions` | 同 path | native |
 | `/v1/embeddings` | openai | `embeddings` | 同 path | native |
 
-转换仅保证基础文本与基础 SSE。tools / function calling / 多模态 / `response_format` 等 → 访问上游前 `conversion_unsupported`。responses / completions / embeddings **不能**靠 chat/messages 转换派生。
+转换仅保证基础文本与基础 SSE。tools / function calling / 多模态 / `response_format` 等 → 访问上游前 `conversion_unsupported`。responses / completions / embeddings **不能**靠 chat/messages 转换派生。标准推理端点只认请求体 `stream: true` 开启 SSE；`Accept: text/event-stream` 不得隐式改变请求模式。SSE 统一响应头与边界见 `docs/unified-sse-streaming-design-2026-07-23.md`。
 
 本地 typed error（访问上游前）：`model_required`、`model_not_found`、`operation_unsupported`、`endpoint_unsupported`、`conversion_unsupported`、`authentication_failed`、`route_contract_invalid`、`provider_unavailable` 等；envelope 按入站协议（OpenAI vs Anthropic）输出。
 

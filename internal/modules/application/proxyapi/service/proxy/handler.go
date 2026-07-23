@@ -831,7 +831,9 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID s
 		headerSummary(sanitizeHeaders(r.Header)),
 	)
 	h.archiveAndLogTransportPlan(round, r, plan, provider, rawStream)
-	streamRequest := rawStream || acceptsEventStream(r.Header)
+	// 标准推理端点统一以请求体 stream=true 作为 SSE 开关。Accept 只描述客户端
+	// 可接受的响应类型，不能把原本的非流式请求隐式改成长连接。
+	streamRequest := rawStream
 	result, err := h.doUpstreamPath(r, round, providerName, provider, body, len(body), streamRequest, plan.UpstreamEndpoint, r.URL.RawQuery, r.Method)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, rawModel, rawStream, http.StatusBadGateway, err.Error())
@@ -855,6 +857,7 @@ func (h *Handler) forwardRaw(w http.ResponseWriter, r *http.Request, requestID s
 	responsePath := responseFileName(resp.Header.Get("Content-Type"), strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "event-stream"))
 	if strings.HasSuffix(responsePath, ".sse") {
 		copyResponseHeader(w.Header(), resp.Header)
+		prepareSSEHeaders(w.Header())
 		w.WriteHeader(resp.StatusCode)
 		usage, fullPath, streamErr := h.copyAndArchiveRawStream(w, resp, round, providerName, provider, rawModel, rawBody, r.Context(), result.Cancel, plan.UpstreamEndpoint)
 		duration := time.Since(start)
@@ -939,6 +942,7 @@ func (h *Handler) handleBufferedResponse(w http.ResponseWriter, resp *http.Respo
 
 func (h *Handler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any, requestContext context.Context, cancel context.CancelFunc, r *http.Request) {
 	copyResponseHeader(w.Header(), resp.Header)
+	prepareSSEHeaders(w.Header())
 	w.WriteHeader(resp.StatusCode)
 	flusher, _ := w.(http.Flusher)
 	archiveWriter, err := round.CreateResponseWriter("response.sse")
@@ -1440,7 +1444,7 @@ func applyUpstreamHeaders(req *http.Request, client *http.Request, provider conf
 			req.Header.Set("Accept", "text/event-stream")
 		} else if accept != "" && isSafeAccept(accept) {
 			req.Header.Set("Accept", accept)
-		} else if accept == "" {
+		} else {
 			req.Header.Set("Accept", "application/json")
 		}
 		if strings.TrimSpace(provider.APIKey) != "" {
@@ -1465,15 +1469,11 @@ func isSafeRequestID(id string) bool {
 }
 
 func isSafeAccept(accept string) bool {
-	// 仅允许常见 JSON/SSE accept,避免透传任意客户端值。
+	// 非流式请求只允许常见 JSON accept，避免 Accept:text/event-stream
+	// 绕过请求体 stream=true 的统一 SSE 开关。流式请求由调用方直接设置 SSE。
 	lower := strings.ToLower(accept)
 	return strings.Contains(lower, "application/json") ||
-		strings.Contains(lower, "text/event-stream") ||
 		strings.Contains(lower, "*/*")
-}
-
-func acceptsEventStream(header http.Header) bool {
-	return strings.Contains(strings.ToLower(header.Get("Accept")), "text/event-stream")
 }
 
 func buildUpstreamURL(base string, incoming *url.URL) (string, error) {
@@ -1613,6 +1613,20 @@ func removeHopByHop(header http.Header) {
 func copyResponseHeader(dst, src http.Header) {
 	copyHeader(dst, src)
 	removeHopByHop(dst)
+}
+
+// prepareSSEHeaders 统一所有模型流式响应的下游 HTTP 合同。
+// SSE 由 HTTP server 自行选择传输编码，不能继承上游 Content-Length 或连接级头；
+// no-transform 与 X-Accel-Buffering 避免常见反向代理缓存、压缩或聚合事件。
+func prepareSSEHeaders(header http.Header) {
+	if header == nil {
+		return
+	}
+	removeHopByHop(header)
+	header.Del("Content-Length")
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache, no-transform")
+	header.Set("X-Accel-Buffering", "no")
 }
 
 func (h *Handler) recordAndPrint(round *archive.Round, r *http.Request, provider, model string, stream bool, status int, duration time.Duration, tok tokenUsage, errMessage string) {

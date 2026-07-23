@@ -94,6 +94,17 @@ client_api_keys:
 
 环境变量与配置键的完整默认值、上限和校验以 [`config.example.yaml`](../config.example.yaml) 与 `internal/pkg/aiproxyconfig` 为准。
 
+## 模型流式 SSE
+
+文本生成统一通过 SSE 增量输出。标准推理端点仅在 JSON 请求体包含 `"stream": true` 时进入流式生命周期；`Accept: text/event-stream` 不能单独开启流式响应。
+
+- `/v1/chat/completions` 返回 OpenAI Chat Completions SSE，必要时转换 Anthropic 上游事件。
+- `/v1/messages` 返回 Anthropic Messages SSE，必要时转换 OpenAI 上游事件。
+- `/v1/responses` 仅支持 OpenAI 协议 Provider 的原生 Responses SSE。
+- 跨协议转换只保证基础文本，tools、thinking、多模态等未支持能力在访问上游前拒绝。
+
+浏览器客户端应使用 `fetch()` + `ReadableStream` 发送 POST 请求和认证 Header，不使用只支持 GET 语义的原生 `EventSource`。完整合同见[统一文本流式 SSE 收口设计](unified-sse-streaming-design-2026-07-23.md)。
+
 ## DuckDB 用量存储
 
 ```yaml

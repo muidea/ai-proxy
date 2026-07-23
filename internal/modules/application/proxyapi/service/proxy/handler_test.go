@@ -154,6 +154,7 @@ func TestOpenAICompatibleStreamingUsage(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "data: [DONE]") {
 		t.Fatalf("stream response was not forwarded: %s", response.Body.String())
 	}
+	assertUnifiedSSEHeaders(t, response.Header())
 	records := readUsageFromStore(t, handler)
 	if got := csvField(t, records, 1, "input_tokens"); got != "5" {
 		t.Fatalf("input tokens = %s", got)
@@ -1219,6 +1220,25 @@ func assertFileContains(t *testing.T, path, want string) {
 	}
 }
 
+func assertUnifiedSSEHeaders(t *testing.T, header http.Header) {
+	t.Helper()
+	if got := header.Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	if got := header.Get("Cache-Control"); got != "no-cache, no-transform" {
+		t.Fatalf("Cache-Control = %q, want no-cache, no-transform", got)
+	}
+	if got := header.Get("X-Accel-Buffering"); got != "no" {
+		t.Fatalf("X-Accel-Buffering = %q, want no", got)
+	}
+	if got := header.Get("Content-Length"); got != "" {
+		t.Fatalf("Content-Length must be empty for SSE, got %q", got)
+	}
+	if got := header.Get("Connection"); got != "" {
+		t.Fatalf("Connection is hop-by-hop and must be empty, got %q", got)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -1982,6 +2002,72 @@ func TestCopyResponseHeaderStripsHopByHop(t *testing.T) {
 	}
 }
 
+func TestPrepareSSEHeadersNormalizesDownstreamContract(t *testing.T) {
+	header := http.Header{}
+	header.Set("Content-Type", "application/octet-stream")
+	header.Set("Content-Length", "42")
+	header.Set("Cache-Control", "public, max-age=3600")
+	header.Set("Connection", "keep-alive")
+	prepareSSEHeaders(header)
+	assertUnifiedSSEHeaders(t, header)
+}
+
+func TestAcceptEventStreamDoesNotEnableRawSSEWithoutStreamFlag(t *testing.T) {
+	tmpDir := t.TempDir()
+	handler := testHandler("https://upstream.test", tmpDir, "openai")
+	upstreamAccept := ""
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		upstreamAccept = r.Header.Get("Accept")
+		return jsonResponse(`{"id":"resp_1","object":"response","model":"gpt-test","output":[]}`), nil
+	})
+	req := newRequest(http.MethodPost, "/v1/responses", `{"model":"gpt-test","input":"hi"}`)
+	req.Header.Set("Accept", "text/event-stream")
+	rec := newResponseRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if upstreamAccept != "application/json" {
+		t.Fatalf("upstream Accept = %q, want application/json", upstreamAccept)
+	}
+}
+
+func TestAcceptEventStreamDoesNotEnableAnthropicSSEWithoutStreamFlag(t *testing.T) {
+	tmpDir := t.TempDir()
+	handler := newTestHandler(config.Config{
+		ListenAddr:     ":0",
+		InteractionDir: filepath.Join(tmpDir, "interactions"),
+		Providers: map[string]config.Provider{
+			"anthropic": {Name: "anthropic", Protocol: "anthropic", BaseURL: "https://upstream.test", APIKey: "k", Models: []string{"claude*"}},
+		},
+	}, tmpDir)
+	upstreamAccept := ""
+	handler.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		upstreamAccept = r.Header.Get("Accept")
+		return jsonResponse(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`), nil
+	})
+	req := newRequest(http.MethodPost, "/v1/messages", `{"model":"claude-test","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`)
+	req.Header.Set("Accept", "text/event-stream")
+	rec := newResponseRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if upstreamAccept != "application/json" {
+		t.Fatalf("upstream Accept = %q, want application/json", upstreamAccept)
+	}
+}
+
 func TestConversionStreamReturnsAfterDONEWithoutWaitingEOF(t *testing.T) {
 	// OpenAI→Anthropic:上游在 [DONE] 后保持连接,处理器应立即结束并补发终止事件。
 	pr, pw := io.Pipe()
@@ -2044,6 +2130,7 @@ func TestConversionStreamReturnsAfterDONEWithoutWaitingEOF(t *testing.T) {
 	if rec == nil || rec.Code != http.StatusOK {
 		t.Fatalf("status = %v", rec)
 	}
+	assertUnifiedSSEHeaders(t, rec.Header())
 	body := rec.Body.String()
 	if !strings.Contains(body, "message_stop") {
 		t.Fatalf("expected anthropic message_stop in converted stream, got: %s", body)
@@ -2133,6 +2220,7 @@ func TestAnthropicToOpenAIStreamReturnsAfterMessageStop(t *testing.T) {
 	if rec == nil || rec.Code != http.StatusOK {
 		t.Fatalf("status = %v", rec)
 	}
+	assertUnifiedSSEHeaders(t, rec.Header())
 	body := rec.Body.String()
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("expected OpenAI [DONE] after conversion, got: %s", body)

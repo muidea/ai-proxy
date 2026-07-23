@@ -108,7 +108,8 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 
 func (h *Handler) forwardAnthropicNative(w http.ResponseWriter, r *http.Request, round *archive.Round, start time.Time, plan TransportPlan, provider config.Provider, bodyBytes []byte, body map[string]any, model string, stream bool) {
 	providerName := plan.RouteOwner
-	streamRequest := stream || acceptsEventStream(r.Header)
+	// 与其它标准推理端点保持一致：只有请求体 stream=true 才进入 SSE 生命周期。
+	streamRequest := stream
 	result, err := h.doUpstreamPath(r, round, providerName, provider, bodyBytes, len(bodyBytes), streamRequest, plan.UpstreamEndpoint, r.URL.RawQuery, r.Method)
 	if err != nil {
 		h.writeArchivedError(w, round, r, start, providerName, model, stream, http.StatusBadGateway, err.Error())
@@ -125,6 +126,7 @@ func (h *Handler) forwardAnthropicNative(w http.ResponseWriter, r *http.Request,
 	responsePath := responseFileName(resp.Header.Get("Content-Type"), strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "event-stream"))
 	if strings.HasSuffix(responsePath, ".sse") {
 		copyResponseHeader(w.Header(), resp.Header)
+		prepareSSEHeaders(w.Header())
 		w.WriteHeader(resp.StatusCode)
 		usage, fullPath, streamErr := h.copyAndArchiveRawStream(w, resp, round, providerName, provider, model, body, r.Context(), result.Cancel, plan.UpstreamEndpoint)
 		duration := time.Since(start)
@@ -873,9 +875,7 @@ func convertOpenAIChatToAnthropicResponse(body []byte, fallbackModel string) ([]
 }
 
 func (h *Handler) handleAnthropicStream(w http.ResponseWriter, r *http.Request, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any, requestContext context.Context, cancel context.CancelFunc) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	prepareSSEHeaders(w.Header())
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 	archiveWriter, err := round.CreateResponseWriter("response.sse")
@@ -1028,9 +1028,7 @@ func (h *Handler) handleAnthropicStream(w http.ResponseWriter, r *http.Request, 
 
 // handleOpenAIToAnthropicStream 将 OpenAI SSE 转成 Anthropic Messages SSE（基础文本）。
 func (h *Handler) handleOpenAIToAnthropicStream(w http.ResponseWriter, r *http.Request, resp *http.Response, round *archive.Round, start time.Time, providerName, model string, requestBody map[string]any, requestContext context.Context, cancel context.CancelFunc) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	prepareSSEHeaders(w.Header())
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 	archiveWriter, err := round.CreateResponseWriter("response.sse")
